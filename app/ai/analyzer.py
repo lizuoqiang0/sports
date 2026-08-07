@@ -181,7 +181,7 @@ def _devig_odds(odds_dict: dict[str, float]) -> dict[str, float]:
     return fair
 
 
-def _devig_ev(confidence: float, raw_odds: float, all_odds: dict[str, float]) -> float:
+def _devig_ev(confidence: float, raw_odds: float, all_odds: dict[str, float], selection: str = "") -> float:
     """用去 vig 后的公平赔率计算 EV。
 
     EV = confidence × fair_odds - 1
@@ -190,15 +190,13 @@ def _devig_ev(confidence: float, raw_odds: float, all_odds: dict[str, float]) ->
         # 无法去 vig 时回退到原始赔率
         return round(confidence * raw_odds - 1, 4) if raw_odds > 1.0 else 0.0
     fair_odds = _devig_odds(all_odds)
-    # 找到当前选择的公平赔率（匹配原始赔率最接近的选择）
+    # 优先按 selection 直接查找公平赔率；找不到时回退到原始赔率
     fair_od = 0.0
-    best_diff = float("inf")
-    for sel, fo in fair_odds.items():
-        orig = all_odds.get(sel, 0)
-        diff = abs(orig - raw_odds) if orig > 0 else float("inf")
-        if diff < best_diff:
-            best_diff = diff
-            fair_od = fo
+    if selection and selection in fair_odds:
+        fair_od = fair_odds[selection]
+    elif selection and selection in all_odds:
+        # all_odds 有此选择但 devig 结果缺失，用原始赔率
+        fair_od = all_odds[selection]
     if fair_od <= 1.0:
         return round(confidence * raw_odds - 1, 4)
     return round(confidence * fair_od - 1, 4)
@@ -616,7 +614,7 @@ class MatchAnalyzer:
             # 去 vig 计算 EV：仅用同市场的赔率去 vig（避免跨市场稀释）
             market_only_odds = self._extract_market_odds(market_odds, winning_bt)
             if market_only_odds and len(market_only_odds) >= 2:
-                analysis["expected_value"] = _devig_ev(analysis["confidence"], od, market_only_odds)
+                analysis["expected_value"] = _devig_ev(analysis["confidence"], od, market_only_odds, selection=winning_pred)
             else:
                 analysis["expected_value"] = round((analysis["confidence"] * od) - 1, 4)
             analysis["kelly_fraction"] = self._calc_kelly_fraction_raw(

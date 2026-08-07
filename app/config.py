@@ -103,7 +103,7 @@ class Settings(BaseSettings):
     GLM_MODEL: str = "glm-5.2"
 
     # Ensemble 共识过滤
-    ENSEMBLE_MIN_CONSENSUS: float = 0.67   # 同意占比门槛（2/3 多数）
+    ENSEMBLE_MIN_CONSENSUS: float = 0.60   # 同意占比门槛（2/3 多数: 2/3=0.667 > 0.60）
     ENSEMBLE_MIN_VOTES: int = 2            # 可用模型中最少同意票
     ENSEMBLE_CONCURRENCY: int = 6          # 批量同场分析并发（推荐页加速）
     ENSEMBLE_TIMEOUT_SEC: float = 30.0     # 单场 ensemble 总超时

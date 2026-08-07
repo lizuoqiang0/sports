@@ -476,7 +476,7 @@ ws://host:8000/ws/odds?token={JWT}
   ├─ 收到 ENSEMBLE_QUORUM(=2) 票即可早退，取消慢模型
   ├─ 共识门槛：
   │   ├─ 同意票数 ≥ ENSEMBLE_MIN_VOTES(=2)
-  │   └─ 同意占比 ≥ ENSEMBLE_MIN_CONSENSUS(=0.67)
+  │   └─ 同意占比 ≥ ENSEMBLE_MIN_CONSENSUS(=0.60)
   ├─ 单模型可用时：置信度 ≥ 0.70 方可放行
   ├─ 总超时 ENSEMBLE_TIMEOUT_SEC(=30s)
   ├─ 模型动态权重：从 Redis 读取历史命中率（60s 缓存）
@@ -513,7 +513,7 @@ ws://host:8000/ws/odds?token={JWT}
   │   └─ 球队排除/球类偏好检查
   │
   ├─ 5. Kelly 仓位计算
-  │   ├─ kelly_ratio = max(0.30, min(1.0, kelly × 4.0))
+  │   ├─ kelly_ratio = max(0.10, min(1.0, kelly × 4.0))
   │   └─ 仓位 ∈ [1, max_bet_amount]
   │
   ├─ 6. 最多选 3 场不同比赛 (AI_MAX_BETS_PER_CYCLE=3)
@@ -522,7 +522,7 @@ ws://host:8000/ws/odds?token={JWT}
   ├─ 7. 真实下单
   │   ├─ Redis 分布式锁防双发
   │   ├─ 赔率逆向变动检测（>0.05 上升 -> 放弃）
-  │   ├─ 异常高赔率校验（>3.5 拒绝）
+  │   ├─ 异常高赔率校验（> max_odds 拒绝）
   │   ├─ 站点余额充足检查
   │   ├─ OB 下单后验证 orderNo 真实存在
   │   ├─ 补单重试（BET_RETRY_COUNT=2）
@@ -552,7 +552,7 @@ ws://host:8000/ws/odds?token={JWT}
 | `AI_RECS_LIMIT` | 80 | 推荐分析上限 |
 | `ENSEMBLE_MAX_MODELS` | 3 | 单场并行模型数 |
 | `ENSEMBLE_QUORUM` | 2 | 早退票数 |
-| `ENSEMBLE_MIN_CONSENSUS` | 0.67 | 共识同意占比门槛 |
+| `ENSEMBLE_MIN_CONSENSUS` | 0.60 | 共识同意占比门槛（2/3=0.667 > 0.60） |
 | `ENSEMBLE_MIN_VOTES` | 2 | 最少同意票数 |
 | `ENSEMBLE_CONCURRENCY` | 8 | 批量分析并发 |
 | `ENSEMBLE_TIMEOUT_SEC` | 30 | 集成总超时 |

@@ -293,14 +293,14 @@ class StrategyEngine:
         kelly = analysis.get("kelly_fraction", 0)
         kelly = min(kelly, self.config.kelly_fraction_cap)
 
-        # 6. 投注金额：Kelly 动态仓位（最低 30%，最高 100% 单笔上限）
+        # 6. 投注金额：Kelly 动态仓位（最低 10%，最高 100% 单笔上限）
         max_amt = Decimal(str(self.config.max_bet_amount or 1))
         if max_amt < 1:
             return self._reject(match_info, analysis, f"单笔上限无效: {max_amt}")
-        # Kelly 分数映射到仓位比例：kelly=0 -> 30%, kelly=0.25 -> 100%
-        kelly_ratio = max(0.30, min(1.0, float(kelly) * 4.0))
+        # Kelly 分数映射到仓位比例：kelly=0 -> 10%, kelly=0.25 -> 100%
+        kelly_ratio = max(0.10, min(1.0, float(kelly) * 4.0))
         suggested_stake = (max_amt * Decimal(str(kelly_ratio))).quantize(Decimal("0.01"))
-        min_stake = (max_amt * Decimal("0.30")).quantize(Decimal("0.01"))
+        min_stake = (max_amt * Decimal("0.10")).quantize(Decimal("0.01"))
         if suggested_stake < min_stake:
             suggested_stake = min_stake
         if user_balance > 0 and user_balance < min_stake:

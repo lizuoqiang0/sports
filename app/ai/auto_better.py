@@ -121,7 +121,7 @@ class AIBettingEngine:
         logger.info(f"AI投注引擎停止: user={self.user_id}")
 
     async def _main_loop(self):
-        """主循环：分析/下单一轮后休眠（默认 30 分钟）"""
+        """主循环：分析/下单一轮后休眠（默认 10 分钟）"""
         while self.is_running:
             try:
                 await self._run_cycle()
@@ -932,15 +932,15 @@ class AIBettingEngine:
                 decision.match_id, decision_odds, current_odds,
             )
 
-        # 异常高赔率校验：避免数据错误导致异常下单
-        if current_odds > 3.5:
+        # 异常高赔率校验：超过策略 max_odds 上限时拒绝下单
+        if current_odds > float(strat_cfg.max_odds):
             logger.warning(
-                "⚠️ 下单拒绝 | match=%s | 门禁=异常高赔率 | type=%s sel=%s odds=%.2f > 3.5",
-                decision.match_id, bet_type, sel, current_odds,
+                "⚠️ 下单拒绝 | match=%s | 门禁=异常高赔率 | type=%s sel=%s odds=%.2f > %.1f",
+                decision.match_id, bet_type, sel, current_odds, float(strat_cfg.max_odds),
             )
             await self._notify(user.id, "bet_failed", {
                 "match_id": decision.match_id,
-                "message": f"赔率 {current_odds:.2f} 异常过高，跳过下单",
+                    "message": f"赔率 {current_odds:.2f} 超过策略上限 {strat_cfg.max_odds:.1f}，跳过下单",
             })
             return False
 
