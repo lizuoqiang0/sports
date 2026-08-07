@@ -1,0 +1,37 @@
+# 线上覆盖：去掉开发挂载、收紧端口与连接池
+# 用法：
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+#
+# 本机开发继续只用 docker-compose.yml（保留 ./app 热挂载）
+
+services:
+  backend:
+    environment:
+      ENVIRONMENT: production
+      DEBUG: "false"
+      LOG_LEVEL: ${LOG_LEVEL:-WARNING}
+      # 连接池：配合 workers≤4，避免打满 Postgres max_connections
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-8}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-12}
+      UVICORN_WORKERS: ${UVICORN_WORKERS:-4}
+      UVICORN_LIMIT_CONCURRENCY: ${UVICORN_LIMIT_CONCURRENCY:-200}
+      ALLOW_PUBLIC_REGISTER: ${ALLOW_PUBLIC_REGISTER:-false}
+      MIN_BET_AMOUNT: ${MIN_BET_AMOUNT:-100}
+      AI_SCAN_INTERVAL_SEC: ${AI_SCAN_INTERVAL_SEC:-1800}
+      AI_MAX_BETS_PER_CYCLE: ${AI_MAX_BETS_PER_CYCLE:-2}
+      EXPOSE_API_DOCS: ${EXPOSE_API_DOCS:-false}
+    volumes: !override
+      - ./logs:/app/logs
+      # 线上不挂 ./app、./scripts，使用镜像内构建产物
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  frontend:
+    ports: !override
+      - "127.0.0.1:${FRONTEND_PORT:-3000}:3000"
+    volumes: !override []
+    # 使用镜像内 nginx html，勿覆盖为宿主机 dist

@@ -1,0 +1,353 @@
+# 线上 / 本机统一编排（高性能 · 低延迟 · 多 worker）
+# 数据持久化: ./data/postgres ./data/redis ./logs
+# 快速启动: bash scripts/prod_up.sh
+# AI 引擎可选: bash scripts/prod_up.sh --with-ai
+#
+# 主机参考（12 核 / 16G）：backend 多 worker + uvloop；postgres/redis 多线程。
+# Browser Gate 在 Mac/GUI 宿主机运行（弹出可见 Chromium），后端经 host.docker.internal 调用。
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "3"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: ob-postgres
+    environment:
+      POSTGRES_USER: ob_user
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ob_password}
+      POSTGRES_DB: ob_sports
+      PGDATA: /var/lib/postgresql/data/pgdata
+    command:
+      - postgres
+      - -c
+      - max_connections=200
+      - -c
+      - shared_buffers=512MB
+      - -c
+      - effective_cache_size=1536MB
+      - -c
+      - maintenance_work_mem=128MB
+      - -c
+      - work_mem=8MB
+      - -c
+      - wal_buffers=16MB
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - effective_io_concurrency=200
+      - -c
+      - max_worker_processes=8
+      - -c
+      - max_parallel_workers_per_gather=4
+      - -c
+      - max_parallel_workers=8
+      - -c
+      - max_parallel_maintenance_workers=4
+      - -c
+      - idle_in_transaction_session_timeout=60000
+      - -c
+      - statement_timeout=60000
+      - -c
+      - tcp_keepalives_idle=60
+      - -c
+      - tcp_keepalives_interval=10
+      - -c
+      - tcp_keepalives_count=5
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    shm_size: "512mb"
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    cpus: ${PG_CPUS:-2.5}
+    mem_limit: ${PG_MEM:-2g}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ob_user -d ob_sports"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+    restart: unless-stopped
+    logging: *default-logging
+
+  redis:
+    image: redis:7-alpine
+    container_name: ob-redis
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --save
+      - "120"
+      - "100"
+      - --dir
+      - /data
+      - --maxmemory
+      - ${REDIS_MAXMEMORY:-512mb}
+      - --maxmemory-policy
+      - allkeys-lru
+      - --tcp-backlog
+      - "511"
+      - --timeout
+      - "0"
+      - --tcp-keepalive
+      - "60"
+      - --io-threads
+      - "4"
+      - --io-threads-do-reads
+      - "yes"
+      - --hz
+      - "20"
+      - --lazyfree-lazy-eviction
+      - "yes"
+      - --lazyfree-lazy-expire
+      - "yes"
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    volumes:
+      - ./data/redis:/data
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    cpus: ${REDIS_CPUS:-1.5}
+    mem_limit: ${REDIS_MEM:-768m}
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 3s
+    restart: unless-stopped
+    logging: *default-logging
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ob-sports-betting-backend:latest
+    container_name: ob-backend
+    env_file:
+      - .env
+    environment:
+      # 容器内主机名覆盖 .env 里的 localhost
+      DATABASE_URL: postgresql+asyncpg://ob_user:${POSTGRES_PASSWORD:-ob_password}@postgres:5432/ob_sports
+      REDIS_URL: redis://redis:6379/0
+      LOG_FILE: /app/logs/app.log
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      DEBUG: ${DEBUG:-false}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      FORCE_LIVE_MODE: ${FORCE_LIVE_MODE:-true}
+      RUN_BACKGROUND_JOBS: ${RUN_BACKGROUND_JOBS:-true}
+      SECRET_KEY: ${SECRET_KEY:-ob-prod-please-override-with-openssl-rand-hex-32}
+      WEAK_SECRET_BLOCK_IN_PROD: ${WEAK_SECRET_BLOCK_IN_PROD:-true}
+      ALGORITHM: ${ALGORITHM:-HS256}
+      ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-30}
+      REFRESH_TOKEN_EXPIRE_DAYS: ${REFRESH_TOKEN_EXPIRE_DAYS:-7}
+      BCRYPT_ROUNDS: ${BCRYPT_ROUNDS:-12}
+      # 逗号分隔，避免 Compose 剥掉 JSON 数组引号导致启动失败
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
+      ALLOWED_HOSTS: ${ALLOWED_HOSTS:-localhost,127.0.0.1,backend,ob-backend}
+      UVICORN_WORKERS: ${UVICORN_WORKERS:-0}
+      UVICORN_LIMIT_CONCURRENCY: ${UVICORN_LIMIT_CONCURRENCY:-400}
+      UVICORN_BACKLOG: ${UVICORN_BACKLOG:-2048}
+      UVICORN_KEEPALIVE: ${UVICORN_KEEPALIVE:-5}
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-32}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-64}
+      DB_POOL_TIMEOUT: ${DB_POOL_TIMEOUT:-20}
+      DB_POOL_RECYCLE: ${DB_POOL_RECYCLE:-1800}
+      REDIS_MAX_CONNECTIONS: ${REDIS_MAX_CONNECTIONS:-100}
+      # 七模型（与 .env 一致：各自 Key + Base URL + Model）
+      DOUBAO_API_KEY: ${DOUBAO_API_KEY:-}
+      DOUBAO_BASE_URL: ${DOUBAO_BASE_URL:-https://ark.cn-beijing.volces.com/api/plan/v3}
+      DOUBAO_MODEL: ${DOUBAO_MODEL:-doubao-seed-2.0-lite}
+      GPT_API_KEY: ${GPT_API_KEY:-}
+      GPT_BASE_URL: ${GPT_BASE_URL:-https://www.juaiapi.com/v1}
+      GPT_MODEL: ${GPT_MODEL:-gpt-5.4}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://ark.cn-beijing.volces.com/api/plan/v3}
+      DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-v4-pro}
+      KIMI_API_KEY: ${KIMI_API_KEY:-}
+      KIMI_BASE_URL: ${KIMI_BASE_URL:-https://ark.cn-beijing.volces.com/api/plan/v3}
+      KIMI_MODEL: ${KIMI_MODEL:-kimi-k2.6}
+      MINIMAX_API_KEY: ${MINIMAX_API_KEY:-}
+      MINIMAX_BASE_URL: ${MINIMAX_BASE_URL:-https://ark.cn-beijing.volces.com/api/plan/v3}
+      MINIMAX_MODEL: ${MINIMAX_MODEL:-minimax-m3}
+      GLM_API_KEY: ${GLM_API_KEY:-}
+      GLM_BASE_URL: ${GLM_BASE_URL:-https://ark.cn-beijing.volces.com/api/plan/v3}
+      GLM_MODEL: ${GLM_MODEL:-glm-5.2}
+      ENSEMBLE_MIN_CONSENSUS: ${ENSEMBLE_MIN_CONSENSUS:-0.60}
+      ENSEMBLE_MIN_VOTES: ${ENSEMBLE_MIN_VOTES:-2}
+      ENSEMBLE_CONCURRENCY: ${ENSEMBLE_CONCURRENCY:-8}
+      ENSEMBLE_TIMEOUT_SEC: ${ENSEMBLE_TIMEOUT_SEC:-45}
+      ENSEMBLE_QUORUM: ${ENSEMBLE_QUORUM:-2}
+      ENSEMBLE_MAX_MODELS: ${ENSEMBLE_MAX_MODELS:-3}
+      ENSEMBLE_MODEL_ORDER: ${ENSEMBLE_MODEL_ORDER:-deepseek,doubao,gpt,minimax,glm,kimi}
+      AI_RECS_LIMIT: ${AI_RECS_LIMIT:-80}
+      AI_LIVE_SCAN_LIMIT: ${AI_LIVE_SCAN_LIMIT:-120}
+      AI_MATCH_CONTEXT_IN_BATCH: ${AI_MATCH_CONTEXT_IN_BATCH:-true}
+      AI_SCAN_INTERVAL_SEC: ${AI_SCAN_INTERVAL_SEC:-1800}
+      AI_MAX_BETS_PER_CYCLE: ${AI_MAX_BETS_PER_CYCLE:-2}
+      AI_MATCH_CONTEXT_ENABLED: ${AI_MATCH_CONTEXT_ENABLED:-true}
+      AI_MATCH_CONTEXT_TTL_SEC: ${AI_MATCH_CONTEXT_TTL_SEC:-21600}
+      NOWSCORE_PROXY_URL: ${NOWSCORE_PROXY_URL:-http://host.docker.internal:7897}
+      AI_ENABLED: ${AI_ENABLED:-true}
+      AI_MAX_BET_PERCENTAGE: ${AI_MAX_BET_PERCENTAGE:-0.05}
+      AI_DAILY_LOSS_LIMIT: ${AI_DAILY_LOSS_LIMIT:-0.20}
+      AI_MIN_CONFIDENCE: ${AI_MIN_CONFIDENCE:-0.75}
+      AI_RISK_LEVEL: ${AI_RISK_LEVEL:-moderate}
+      DEFAULT_BET_MODE: ${DEFAULT_BET_MODE:-manual}
+      EXECUTION_GATEWAY_ENABLED: ${EXECUTION_GATEWAY_ENABLED:-true}
+      MAX_QUOTE_AGE_SEC: ${MAX_QUOTE_AGE_SEC:-30}
+      MONITORING_ENABLED: ${MONITORING_ENABLED:-true}
+      MIN_MATCH_CONFIDENCE: ${MIN_MATCH_CONFIDENCE:-0.90}
+      MIN_NET_PROFIT_RATE: ${MIN_NET_PROFIT_RATE:-0.005}
+      MIN_WORST_CASE_PROFIT: ${MIN_WORST_CASE_PROFIT:-1.0}
+      MAX_STAKE_PER_EVENT: ${MAX_STAKE_PER_EVENT:-5000.0}
+      MAX_EXPOSURE_PER_SOURCE: ${MAX_EXPOSURE_PER_SOURCE:-10000.0}
+      MAX_EXPOSURE_PER_ACCOUNT: ${MAX_EXPOSURE_PER_ACCOUNT:-20000.0}
+      MAX_DAILY_LOSS: ${MAX_DAILY_LOSS:-2000.0}
+      BOOKMAKER_BROWSER_GATE_URL: ${BOOKMAKER_BROWSER_GATE_URL:-http://host.docker.internal:9277}
+      BOOKMAKER_BROWSER_HEADLESS: ${BOOKMAKER_BROWSER_HEADLESS:-0}
+      BOOKMAKER_MANUAL_LOGIN: ${BOOKMAKER_MANUAL_LOGIN:-0}
+      BOOKMAKER_MANUAL_VENUE: ${BOOKMAKER_MANUAL_VENUE:-0}
+      BOOKMAKER_DISABLE_SITES: ${BOOKMAKER_DISABLE_SITES:-}
+      BOOKMAKER_BACKEND_URL: ${BOOKMAKER_BACKEND_URL:-http://127.0.0.1:8000}
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-}
+    ports:
+      - "127.0.0.1:${BACKEND_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      # 弹出浏览器：使用宿主机 Gate（host.docker.internal）
+      # Mac Docker Desktop 自带该 DNS，勿覆盖 host-gateway（会 Network unreachable）
+    volumes:
+      - ./logs:/app/logs
+      # 本机改代码后重启容器仍生效（勿再依赖 docker cp）
+      - ./app:/app/app
+      - ./scripts:/app/scripts
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    cpus: ${BACKEND_CPUS:-4.0}
+    mem_limit: ${BACKEND_MEM:-3g}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 25s
+    restart: unless-stopped
+    logging: *default-logging
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: ob-sports-betting-frontend:latest
+    container_name: ob-frontend
+    ports:
+      - "${FRONTEND_PORT:-3000}:3000"
+    depends_on:
+      backend:
+        condition: service_healthy
+    volumes:
+      # 本机构建的前端静态文件，改 UI 后 npm run build 即生效
+      - ./frontend/dist:/usr/share/nginx/html:ro
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    cpus: ${FRONTEND_CPUS:-1.0}
+    mem_limit: ${FRONTEND_MEM:-256m}
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/"]
+      interval: 5s
+      timeout: 3s
+      retries: 8
+      start_period: 5s
+    restart: unless-stopped
+    logging: *default-logging
+
+  ai-engine:
+    profiles: ["ai"]
+    image: ob-sports-betting-backend:latest
+    container_name: ob-ai-engine
+    command: ["python", "scripts/ai_betting_engine.py", "--all-users", "--live"]
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://ob_user:${POSTGRES_PASSWORD:-ob_password}@postgres:5432/ob_sports
+      REDIS_URL: redis://redis:6379/0
+      LOG_FILE: /app/logs/app.log
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      FORCE_LIVE_MODE: ${FORCE_LIVE_MODE:-true}
+      SECRET_KEY: ${SECRET_KEY:-ob-prod-please-override-with-openssl-rand-hex-32}
+      DOUBAO_API_KEY: ${DOUBAO_API_KEY:-}
+      DOUBAO_BASE_URL: ${DOUBAO_BASE_URL:-https://ark.cn-beijing.volces.com/api/plan/v3}
+      DOUBAO_MODEL: ${DOUBAO_MODEL:-doubao-seed-2.0-lite}
+      GPT_API_KEY: ${GPT_API_KEY:-}
+      GPT_BASE_URL: ${GPT_BASE_URL:-https://www.juaiapi.com/v1}
+      GPT_MODEL: ${GPT_MODEL:-gpt-5.4}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://ark.cn-beijing.volces.com/api/plan/v3}
+      DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-v4-pro}
+      KIMI_API_KEY: ${KIMI_API_KEY:-}
+      KIMI_BASE_URL: ${KIMI_BASE_URL:-https://ark.cn-beijing.volces.com/api/plan/v3}
+      KIMI_MODEL: ${KIMI_MODEL:-kimi-k2.6}
+      MINIMAX_API_KEY: ${MINIMAX_API_KEY:-}
+      MINIMAX_BASE_URL: ${MINIMAX_BASE_URL:-https://ark.cn-beijing.volces.com/api/plan/v3}
+      MINIMAX_MODEL: ${MINIMAX_MODEL:-minimax-m3}
+      GLM_API_KEY: ${GLM_API_KEY:-}
+      GLM_BASE_URL: ${GLM_BASE_URL:-https://ark.cn-beijing.volces.com/api/plan/v3}
+      GLM_MODEL: ${GLM_MODEL:-glm-5.2}
+      ENSEMBLE_MIN_CONSENSUS: ${ENSEMBLE_MIN_CONSENSUS:-0.60}
+      ENSEMBLE_MIN_VOTES: ${ENSEMBLE_MIN_VOTES:-2}
+      ENSEMBLE_CONCURRENCY: ${ENSEMBLE_CONCURRENCY:-8}
+      ENSEMBLE_TIMEOUT_SEC: ${ENSEMBLE_TIMEOUT_SEC:-45}
+      ENSEMBLE_QUORUM: ${ENSEMBLE_QUORUM:-2}
+      ENSEMBLE_MAX_MODELS: ${ENSEMBLE_MAX_MODELS:-3}
+      ENSEMBLE_MODEL_ORDER: ${ENSEMBLE_MODEL_ORDER:-deepseek,doubao,gpt,minimax,glm,kimi}
+      AI_RECS_LIMIT: ${AI_RECS_LIMIT:-80}
+      AI_LIVE_SCAN_LIMIT: ${AI_LIVE_SCAN_LIMIT:-120}
+      AI_MATCH_CONTEXT_IN_BATCH: ${AI_MATCH_CONTEXT_IN_BATCH:-true}
+      AI_SCAN_INTERVAL_SEC: ${AI_SCAN_INTERVAL_SEC:-1800}
+      AI_MAX_BETS_PER_CYCLE: ${AI_MAX_BETS_PER_CYCLE:-2}
+      AI_MATCH_CONTEXT_ENABLED: ${AI_MATCH_CONTEXT_ENABLED:-true}
+      AI_MATCH_CONTEXT_SEARCH: ${AI_MATCH_CONTEXT_SEARCH:-true}
+      AI_MATCH_CONTEXT_TTL_SEC: ${AI_MATCH_CONTEXT_TTL_SEC:-21600}
+      NOWSCORE_PROXY_URL: ${NOWSCORE_PROXY_URL:-http://host.docker.internal:7897}
+      AI_ENABLED: ${AI_ENABLED:-true}
+      AI_MAX_BET_PERCENTAGE: ${AI_MAX_BET_PERCENTAGE:-0.05}
+      AI_DAILY_LOSS_LIMIT: ${AI_DAILY_LOSS_LIMIT:-0.20}
+      AI_MIN_CONFIDENCE: ${AI_MIN_CONFIDENCE:-0.75}
+      AI_RISK_LEVEL: ${AI_RISK_LEVEL:-moderate}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    volumes:
+      - ./logs:/app/logs
+      - ./app:/app/app
+      - ./scripts:/app/scripts
+    cpus: ${AI_CPUS:-1.5}
+    mem_limit: ${AI_MEM:-1g}
+    restart: unless-stopped
+    logging: *default-logging
