@@ -754,17 +754,3 @@ uvicorn app.main:app
 | APScheduler | 3.10.4 | 定时任务 |
 | loguru | 0.7.2 | 日志 |
 | playwright | 1.48.0 | 浏览器自动化 |
-
-### D. 已删除功能（不再存在）
-
-| 功能 | 删除原因 |
-|------|---------|
-| 串关下注 (place_parlay) | 站点不支持 |
-| 撤单 (cancel_bet) | 真实站点不支持本地撤单 |
-| 提前兑现 (cash_out) | 真实站点不支持本地兑现 |
-| 自动结算 (settle_poller) | 盈亏走站点余额基线，不依赖结算 |
-| 钱包充值/提现 (wallet.*) | 无钱包体系 |
-| BetStatus: PENDING/WON/LOST/CANCELLED/CASHED_OUT | 简化为 SUCCESS/FAILED |
-| TransactionType: DEPOSIT/WITHDRAWAL/BET_WIN/BET_REFUND | 无钱包/结算流水 |
-| dry_run 参数链 | 已废弃，强制走真实下单 |
-| 测试文件 (tests/ + pytest.ini) | 仅保留正式环境代码 |
