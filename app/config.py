@@ -114,7 +114,7 @@ class Settings(BaseSettings):
     # 优先快模型，按速度排序
     ENSEMBLE_MODEL_ORDER: str = "deepseek,doubao,gpt,minimax,glm,kimi"
     AI_SCAN_INTERVAL_SEC: int = 600        # AI 引擎扫描间隔（秒），默认 10 分钟
-    AI_MAX_BETS_PER_CYCLE: int = 2         # 自动模式每轮最多下单笔数（须为不同比赛）
+    AI_MAX_BETS_PER_CYCLE: int = 3         # 自动模式每轮最多下单笔数（须为不同比赛）
     AI_RECS_LIMIT: int = 80                # 每批分析同场上限（尽量覆盖全部滚球）
     AI_LIVE_SCAN_LIMIT: int = 120          # 自动引擎每轮扫描同场上限
 

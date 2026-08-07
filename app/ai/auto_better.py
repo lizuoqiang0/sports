@@ -125,8 +125,8 @@ class AIBettingEngine:
         while self.is_running:
             try:
                 await self._run_cycle()
-                # 每轮间隔：默认 1800s=30 分钟（热读 settings，改 .env 后重启生效）
-                interval = max(60, int(getattr(settings, "AI_SCAN_INTERVAL_SEC", 1800) or 1800))
+                # 每轮间隔：默认 600s=10 分钟（热读 settings，改 .env 后重启生效）
+                interval = max(60, int(getattr(settings, "AI_SCAN_INTERVAL_SEC", 600) or 600))
                 logger.info("AI 引擎本轮结束，%s 秒后下一轮", interval)
                 await asyncio.sleep(interval)
             except asyncio.CancelledError:
@@ -397,7 +397,7 @@ class AIBettingEngine:
             return
 
         approved.sort(key=_decision_profit_score, reverse=True)
-        max_per_cycle = max(1, int(getattr(settings, "AI_MAX_BETS_PER_CYCLE", 2) or 2))
+        max_per_cycle = max(1, int(getattr(settings, "AI_MAX_BETS_PER_CYCLE", 3) or 3))
         cycle_cap = min(remaining_daily, max_per_cycle)
         seen_matches: set[int] = set()
         top_bets: list[BetDecision] = []

@@ -686,7 +686,7 @@ export default function AIPanelPage() {
           <span className="font-medium">
             {engineStatus?.running
               ? isAuto
-                ? '🟢 自动投注 - 每 10 分钟一轮，最多 2 场不同比赛真实下单'
+                ? '🟢 自动投注 - 每 10 分钟一轮，最多 3 场不同比赛真实下单'
                 : '🟡 人工投注 - 轮询分析全部滚球，只展示高胜率供手动确认'
               : engineStatus === null ? '⚪ 正在加载…' : '⚪ AI引擎未运行'}
           </span>
@@ -1152,7 +1152,7 @@ export default function AIPanelPage() {
         <ol className="panel-note space-y-1.5 list-decimal list-inside text-ink-600">
           <li>在「今日AI推荐」点「开始分析 / 停止分析」控制后台轮询</li>
           <li>人工与自动：全部按「配置」参数运行（置信度、赔率区间、单笔上限、每日笔数、止损/止盈、偏好球类、排除球队、是否 LLM）</li>
-          <li>自动投注还需点「启动 AI」：每 10 分钟一轮，最多下 2 单且为不同比赛</li>
+          <li>自动投注还需点「启动 AI」：每 10 分钟一轮，最多下 3 单且为不同比赛</li>
           <li>人工一键投注：同样校验策略，未通过配置则拒绝下单</li>
         </ol>
       </div>
