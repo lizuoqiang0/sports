@@ -107,8 +107,8 @@ export const aiAPI = {
     }),
   strategies: () => api.get('/ai/strategies'),
   history: (params) => api.get('/ai/history', { params }),
-  oneClickBet: (matchId, stake = 100, markets = []) =>
-    api.post(`/ai/one-click-bet/${matchId}`, { stake, markets }, { timeout: 30000 }),
+  oneClickBet: (matchId, stake = 100, markets = [], dryRun = false) =>
+    api.post(`/ai/one-click-bet/${matchId}`, { stake, markets, dry_run: dryRun }, { timeout: 30000 }),
 }
 
 export const bookmakersAPI = {
@@ -146,5 +146,4 @@ export const adminAPI = {
   triggerPrefetch: (sport = 'all') => api.post(`/admin/nowscore/prefetch?sport=${sport}`),
   getPrefetchProgress: () => api.get('/admin/nowscore/progress'),
 }
-
 

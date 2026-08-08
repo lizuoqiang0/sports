@@ -62,4 +62,5 @@ async def put_bet_mode(
     if not fresh:
         raise HTTPException(status_code=404, detail="用户不存在")
     mode = await set_user_bet_mode(db, fresh, body.bet_mode)
+    await db.commit()
     return APIResponse(data=mode_flags(mode), message=f"已切换为{mode_flags(mode)['label']}模式")

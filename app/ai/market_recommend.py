@@ -443,7 +443,7 @@ def _pick_single(
     min_odds: float = 1.1,
     max_odds: float | None = 10.0,
 ) -> Optional[dict]:
-    """主推胜率更高的一侧；仅配置赔率区间内选项参与。"""
+    """严格按模型方向主推；仅当该侧赔率在配置区间内时才返回。"""
     from app.ai.analysis_filters import odds_in_configured_range
 
     bt = _normalize_bet_type(market.get("bet_type") or "total")
@@ -461,26 +461,37 @@ def _pick_single(
     if not candidates:
         return None
 
-    # 若模型指定了本盘口方向且该侧可选，优先该侧；否则比胜率
     pred = normalize_prediction(prediction, bet_type=bt)
     probs = _side_probs(pred, confidence, sels, bet_type=bt)
+    if pred and pred in sels:
+        if pred not in candidates:
+            return None
+        prov, odds = best[pred]
+        win_prob = float(probs.get(pred, 0.0))
+        return {
+            "selection": pred,
+            "selection_label": SEL_LABELS.get(pred, pred),
+            "provider": prov,
+            "provider_code": code_by_provider(prov) or "",
+            "odds": float(odds),
+            "win_rate": round(win_prob * 100, 1),
+            "side_win_rates": {
+                s: round(float(probs.get(s, 0.0)) * 100, 1) for s in sels if s in best
+            },
+            "pick_reason": "model_pick",
+            "bet_type": bt,
+        }
+
+    # 未提供明确方向时，才允许按当前胜率最高的一侧回退
     scored: list[tuple[float, float, float, str]] = []
     for s in candidates:
         p = float(probs.get(s, 0.0))
-        # 非模型指定盘口：用置信度的温和衰减作为先验，避免乱推
         if pred and pred not in sels:
             p = min(p, max(0.45, float(confidence) * 0.85))
         o = float(best[s][1])
-        ev = _implied_edge(o, p)
-        scored.append((p, ev, o, s))
-    scored.sort(key=lambda t: (t[0], t[1], t[2]), reverse=True)
-    win_prob, ev, _, pick = scored[0]
-
-    # 模型点名了其它盘：本盘 single 仍可选最高边，但 win_rate 不虚高
-    if pred and pred in candidates:
-        pick = pred
-        win_prob = float(probs.get(pick, win_prob))
-        ev = _implied_edge(float(best[pick][1]), win_prob)
+        scored.append((p, o, s))
+    scored.sort(key=lambda t: (t[0], t[1]), reverse=True)
+    win_prob, _, pick = scored[0]
 
     prov, odds = best[pick]
     return {
@@ -490,7 +501,6 @@ def _pick_single(
         "provider_code": code_by_provider(prov) or "",
         "odds": float(odds),
         "win_rate": round(win_prob * 100, 1),
-        "expected_value": round(ev, 4),
         "side_win_rates": {
             s: round(float(probs.get(s, 0.0)) * 100, 1) for s in sels if s in best
         },

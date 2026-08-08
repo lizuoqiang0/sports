@@ -66,7 +66,8 @@ async def lifespan(app: FastAPI):
         await init_db()
         logger.info("✅ 数据库初始化完成")
     except Exception as e:
-        logger.error(f"数据库初始化失败: {e}")
+        logger.exception("数据库初始化失败，服务终止启动: %s", e)
+        raise
 
     # 启动WebSocket心跳 + 跨 worker 扇出
     import asyncio
@@ -341,4 +342,3 @@ async def root():
     if _expose_docs:
         payload["docs"] = "/docs"
     return payload
-

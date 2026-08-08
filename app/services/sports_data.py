@@ -12,21 +12,15 @@ def compute_quality(ctx: dict) -> dict:
     source = str(ctx.get("source") or "none")
     fields: list[str] = []
     weights = {
-        "h2h": 0.20,
-        "home_form": 0.15,
-        "away_form": 0.15,
-        "injuries": 0.15,
-        "player_stats": 0.12,
-        "motivation": 0.10,
-        "standings": 0.13,
+        "h2h": 0.30,
+        "home_form": 0.20,
+        "away_form": 0.20,
+        "standings": 0.30,
     }
     score = 0.0
     h2n = len((ctx.get("h2h") or {}).get("matches") or [])
     hf = len((ctx.get("home_form") or {}).get("matches") or [])
     af = len((ctx.get("away_form") or {}).get("matches") or [])
-    inj = len(ctx.get("news_injuries") or [])
-    ps = ctx.get("player_stats") or {}
-    mot = ctx.get("motivation") or {}
     standings = ctx.get("standings") or {}
 
     if h2n:
@@ -38,15 +32,6 @@ def compute_quality(ctx: dict) -> dict:
     if af:
         fields.append("away_form")
         score += weights["away_form"]
-    if inj:
-        fields.append("injuries")
-        score += weights["injuries"]
-    if (isinstance(ps, dict) and (ps.get("home") or ps.get("away"))) or len(ctx.get("player_status") or []) > 0:
-        fields.append("player_stats")
-        score += weights["player_stats"]
-    if isinstance(mot, dict) and (mot.get("home") or mot.get("away") or mot.get("notes")):
-        fields.append("motivation")
-        score += weights["motivation"]
     if standings.get("home") or standings.get("away"):
         fields.append("standings")
         score += weights["standings"]

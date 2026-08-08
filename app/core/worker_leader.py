@@ -29,6 +29,27 @@ def is_background_leader() -> bool:
     return _is_leader
 
 
+async def current_background_leader() -> str | None:
+    from app.core.cache import cache
+
+    try:
+        client = cache.client
+    except RuntimeError:
+        return None
+    try:
+        cur = await client.get(_LEADER_KEY)
+    except Exception:
+        return None
+    if cur is None:
+        return None
+    if isinstance(cur, bytes):
+        try:
+            return cur.decode()
+        except Exception:
+            return None
+    return str(cur)
+
+
 async def _try_acquire() -> bool:
     from app.core.cache import cache
 

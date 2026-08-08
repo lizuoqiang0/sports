@@ -1,10 +1,14 @@
 """
 数据库引擎与会话管理
 """
+import logging
+
+from sqlalchemy import inspect, text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
-from contextlib import asynccontextmanager
 from app.config import settings
+
+logger = logging.getLogger("ob.database")
 
 # 异步引擎
 engine = create_async_engine(
@@ -56,12 +60,11 @@ async def init_db():
 
 def _migrate_columns(sync_conn):
     """兼容已有库：补齐 bets 新列与枚举值"""
-    from sqlalchemy import text
-
     statements = [
         "ALTER TABLE bets ADD COLUMN IF NOT EXISTS provider VARCHAR(50) DEFAULT 'OB体育'",
         "ALTER TABLE bets ADD COLUMN IF NOT EXISTS line DOUBLE PRECISION",
         "ALTER TABLE bets ADD COLUMN IF NOT EXISTS external_bet_id VARCHAR(120)",
+        "ALTER TABLE bets ADD COLUMN IF NOT EXISTS actual_payout NUMERIC(18, 2) DEFAULT 0",
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_bets_user_provider_ext ON bets (user_id, provider, external_bet_id) WHERE external_bet_id IS NOT NULL AND external_bet_id <> ''",
         "ALTER TABLE bookmaker_accounts ADD COLUMN IF NOT EXISTS session_token_encrypted TEXT DEFAULT ''",
         "ALTER TABLE bookmaker_accounts ADD COLUMN IF NOT EXISTS profile_json JSONB DEFAULT '{}'::jsonb",
@@ -78,8 +81,58 @@ def _migrate_columns(sync_conn):
     for sql in statements:
         try:
             sync_conn.execute(text(sql))
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("跳过兼容迁移 SQL: %s (%s)", sql, exc)
+
+    _migrate_ai_config_strategy(sync_conn)
+
+
+def _migrate_ai_config_strategy(sync_conn) -> None:
+    """把历史 AI 策略值统一收敛到唯一的 high_win_rate。"""
+    inspector = inspect(sync_conn)
+    if "ai_configs" not in set(inspector.get_table_names()):
+        return
+
+    try:
+        sync_conn.execute(text(
+            """
+            UPDATE ai_configs
+            SET strategy = 'high_win_rate'
+            WHERE strategy IS NULL
+               OR TRIM(strategy) = ''
+               OR LOWER(TRIM(strategy)) <> 'high_win_rate'
+            """
+        ))
+    except Exception as exc:
+        logger.warning("清洗 ai_configs.strategy 失败: %s", exc)
+
+    if sync_conn.dialect.name != "postgresql":
+        return
+
+    postgres_statements = [
+        "ALTER TABLE ai_configs ALTER COLUMN strategy SET DEFAULT 'high_win_rate'",
+        "UPDATE ai_configs SET strategy = 'high_win_rate' WHERE strategy IS NULL",
+        "ALTER TABLE ai_configs ALTER COLUMN strategy SET NOT NULL",
+        """
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conname = 'ck_ai_configs_strategy_high_win_rate'
+            ) THEN
+                ALTER TABLE ai_configs
+                ADD CONSTRAINT ck_ai_configs_strategy_high_win_rate
+                CHECK (strategy = 'high_win_rate');
+            END IF;
+        END $$;
+        """,
+    ]
+    for sql in postgres_statements:
+        try:
+            sync_conn.execute(text(sql))
+        except Exception as exc:
+            logger.warning("执行 ai_configs.strategy 线上迁移失败: %s", exc)
 
 
 async def close_db():

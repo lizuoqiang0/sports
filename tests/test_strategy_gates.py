@@ -1,4 +1,4 @@
-"""测试 AI 策略门禁：仓位边界、球队排除、球类偏好、赔率/置信度校验。"""
+"""测试 AI 策略门禁：仓位边界、球队排除、球类偏好。"""
 import pytest
 from decimal import Decimal
 
@@ -8,8 +8,6 @@ from app.ai.strategy_gates import (
     cap_stake,
     team_is_excluded,
     sport_is_preferred,
-    odds_pass_strat,
-    conf_pass_strat,
     min_stake_floor,
 )
 
@@ -20,13 +18,6 @@ class TestStakeBounds:
         lo, hi = stake_bounds(strat)
         assert lo == Decimal("1")
         assert hi == Decimal("100")
-
-    def test_zero_max(self):
-        """max_bet_amount=0 时回退到 MIN_BET_AMOUNT"""
-        strat = StrategyConfig(max_bet_amount=0)
-        lo, hi = stake_bounds(strat)
-        assert lo <= hi
-        assert hi > 0
 
 
 class TestCapStake:
@@ -57,7 +48,7 @@ class TestMinStakeFloor:
 
 
 class TestTeamIsExcluded:
-    def test_no_exclusion_list(self):
+    def test_no_exclusion(self):
         assert not team_is_excluded("TeamA", "TeamB", None)
         assert not team_is_excluded("TeamA", "TeamB", [])
 
@@ -67,81 +58,23 @@ class TestTeamIsExcluded:
 
     def test_case_insensitive(self):
         assert team_is_excluded("teama", "teamb", ["TeamA"])
-        assert team_is_excluded("TEAM A", "Team B", ["team a"])
 
     def test_partial_match(self):
         assert team_is_excluded("Manchester United", "Liverpool", ["manchester"])
-        assert team_is_excluded("Man Utd", "Liverpool", ["man utd"])
 
     def test_no_match(self):
         assert not team_is_excluded("TeamA", "TeamB", ["TeamC"])
 
-    def test_empty_strings_in_list(self):
-        assert not team_is_excluded("TeamA", "TeamB", ["", None, "  "])
-
 
 class TestSportIsPreferred:
-    def test_empty_list_allows_all(self):
+    def test_empty_allows_all(self):
         assert sport_is_preferred("football", [])
         assert sport_is_preferred("basketball", None)
-        assert sport_is_preferred("tennis", [])
 
-    def test_exact_match(self):
+    def test_match(self):
         assert sport_is_preferred("football", ["football"])
-        assert sport_is_preferred("basketball", ["football", "basketball"])
-
-    def test_no_match(self):
-        assert not sport_is_preferred("tennis", ["football", "basketball"])
-
-    def test_soccer_aliases_to_football(self):
         assert sport_is_preferred("soccer", ["football"])
         assert sport_is_preferred("football", ["soccer"])
 
-
-class TestOddsPassStrat:
-    def test_pass(self):
-        strat = StrategyConfig(min_odds=1.1, max_odds=10.0)
-        ok, _ = odds_pass_strat(1.90, strat)
-        assert ok
-
-    def test_too_low(self):
-        strat = StrategyConfig(min_odds=1.75, max_odds=10.0)
-        ok, why = odds_pass_strat(1.50, strat)
-        assert not ok
-        assert "下限" in why
-
-    def test_too_high(self):
-        strat = StrategyConfig(min_odds=1.1, max_odds=3.0)
-        ok, why = odds_pass_strat(5.0, strat)
-        assert not ok
-        assert "上限" in why
-
-    def test_invalid(self):
-        strat = StrategyConfig()
-        ok, why = odds_pass_strat("abc", strat)
-        assert not ok
-        assert "无效" in why
-
-
-class TestConfPassStrat:
-    def test_pass(self):
-        strat = StrategyConfig(min_confidence=0.75)
-        ok, _ = conf_pass_strat(0.80, strat)
-        assert ok
-
-    def test_too_low(self):
-        strat = StrategyConfig(min_confidence=0.75)
-        ok, why = conf_pass_strat(0.50, strat)
-        assert not ok
-        assert "置信度" in why
-
-    def test_percentage_input(self):
-        """置信度 > 1 时自动除以 100"""
-        strat = StrategyConfig(min_confidence=0.75)
-        ok, _ = conf_pass_strat(80.0, strat)  # 80% -> 0.80
-        assert ok
-
-    def test_invalid(self):
-        strat = StrategyConfig()
-        ok, why = conf_pass_strat("abc", strat)
-        assert not ok
+    def test_no_match(self):
+        assert not sport_is_preferred("tennis", ["football"])

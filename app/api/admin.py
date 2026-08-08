@@ -27,20 +27,34 @@ async def _get_switch() -> bool:
     return bool(getattr(settings, "NOWSCORE_PREFETCH_ENABLED", False))
 
 
+async def _get_prefetch_status() -> dict:
+    from app.services.nowscore_prefetcher import get_prefetch_status
+
+    try:
+        return await get_prefetch_status()
+    except Exception:
+        enabled = await _get_switch()
+        return {
+            "enabled": enabled,
+            "interval_sec": int(getattr(settings, "NOWSCORE_PREFETCH_INTERVAL_SEC", 3600)),
+            "concurrency": int(getattr(settings, "NOWSCORE_PREFETCH_CONCURRENCY", 10)),
+            "leader": False,
+            "tick_sec": None,
+            "last_result": None,
+            "next_due_at": None,
+        }
+
+
 # === 数据源开关 ===
 @router.get("/nowscore/switch", response_model=APIResponse)
 async def get_nowscore_switch(
     _: object = Depends(get_current_user),
 ):
     """获取数据源开关状态。"""
-    enabled = await _get_switch()
+    status = await _get_prefetch_status()
     return APIResponse(
         message="数据源开关状态",
-        data={
-            "enabled": enabled,
-            "interval_sec": int(getattr(settings, "NOWSCORE_PREFETCH_INTERVAL_SEC", 3600)),
-            "concurrency": int(getattr(settings, "NOWSCORE_PREFETCH_CONCURRENCY", 10)),
-        },
+        data=status,
     )
 
 
@@ -52,9 +66,10 @@ async def toggle_nowscore_switch(
     """设置数据源开关。打开=自动预取，关闭=停止预取。"""
     from app.core.cache import cache
     await cache.set(_SWITCH_KEY, "1" if enabled else "0", ttl=0)
+    status = await _get_prefetch_status()
     return APIResponse(
         message=f"数据源已{'开启' if enabled else '关闭'}",
-        data={"enabled": enabled},
+        data={**status, "enabled": enabled},
     )
 
 
@@ -74,12 +89,35 @@ async def trigger_nowscore_prefetch(
     sports = ["football", "basketball"] if sport == "all" else [sport]
 
     async def _run():
+        started_at = int(__import__("time").time())
+        counts = {"football": 0, "basketball": 0}
+        ok = True
+        error_msg = None
         for s in sports:
             try:
                 count = await prefetch_today_all_contexts(sport=s, concurrency=10)
+                counts[s] = int(count or 0)
                 logger.info("prefetch triggered: sport=%s cached=%d", s, count)
             except Exception as e:
+                ok = False
+                error_msg = str(e)
                 logger.error("prefetch triggered error: sport=%s %s", s, e)
+        try:
+            finished_at = int(__import__("time").time())
+            await cache.set_json(
+                "nowscore:prefetch:last_result",
+                {
+                    "started_at": started_at,
+                    "finished_at": finished_at,
+                    "football_cached": int(counts.get("football") or 0),
+                    "basketball_cached": int(counts.get("basketball") or 0),
+                    "ok": ok,
+                    "error": error_msg,
+                },
+                ttl=0,
+            )
+        except Exception:
+            pass
 
     asyncio.create_task(_run())
     return APIResponse(
@@ -101,4 +139,5 @@ async def get_prefetch_progress(
             return APIResponse(message="预取进行中", data=data)
     except Exception:
         pass
-    return APIResponse(message="无进行中的预取任务", data=None)
+    status = await _get_prefetch_status()
+    return APIResponse(message="无进行中的预取任务", data={"running": False, **status})

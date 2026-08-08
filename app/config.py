@@ -30,6 +30,22 @@ def _parse_str_list(v: Any) -> Any:
     return [p.strip().strip("\"'") for p in s.split(",") if p.strip()]
 
 
+def _parse_debug_flag(v: Any) -> Any:
+    """兼容部署环境里常见的 DEBUG 写法，如 release/debug。"""
+    if isinstance(v, bool) or v is None:
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    if not isinstance(v, str):
+        return v
+    s = v.strip().lower()
+    if s in {"1", "true", "yes", "on", "debug", "dev", "development"}:
+        return True
+    if s in {"0", "false", "no", "off", "release", "prod", "production", "staging"}:
+        return False
+    return v
+
+
 class Settings(BaseSettings):
     # === 应用基础配置 ===
     APP_NAME: str = "OB Sports Betting Platform"
@@ -113,7 +129,7 @@ class Settings(BaseSettings):
     ENSEMBLE_MAX_MODELS: int = 3           # 单场最多并行调用的模型数
     # 优先快模型，按速度排序
     ENSEMBLE_MODEL_ORDER: str = "deepseek,doubao,gpt,minimax,glm,kimi"
-    AI_SCAN_INTERVAL_SEC: int = 600        # AI 引擎扫描间隔（秒），默认 10 分钟
+    AI_SCAN_INTERVAL_SEC: int = 30         # AI 引擎扫描间隔（秒），默认 30 秒
     AI_MAX_BETS_PER_CYCLE: int = 3         # 自动模式每轮最多下单笔数（须为不同比赛）
     AI_RECS_LIMIT: int = 80                # 每批分析同场上限（尽量覆盖全部滚球）
     AI_LIVE_SCAN_LIMIT: int = 120          # 自动引擎每轮扫描同场上限
@@ -144,41 +160,22 @@ class Settings(BaseSettings):
 
     # === AI自动投注配置 ===
     AI_ENABLED: bool = True
-    AI_MAX_BET_PERCENTAGE: float = 0.05  # 单次最多用5%余额
-    AI_DAILY_LOSS_LIMIT: float = 0.20     # 日亏损上限20%
-    AI_MIN_CONFIDENCE: float = 0.75       # 最低置信度
-    AI_RISK_LEVEL: str = "moderate"        # conservative / moderate / aggressive
     # 策略默认参数（用户 AIConfig 未设置时的回退值）
-    AI_MAX_ODDS: float = 10.0             # 策略赔率上限
-    AI_MIN_ODDS: float = 1.1              # 策略赔率下限
     AI_STRATEGY_MAX_BET_AMOUNT: float = 100.0   # 策略单笔最大金额
     AI_STRATEGY_MAX_DAILY_BETS: int = 10        # 策略每日注数
     AI_STOP_LOSS: float = 500.0           # 日止损绝对金额
     AI_TAKE_PROFIT: float = 1000.0        # 日止盈绝对金额
-    AI_KELLY_FRACTION_CAP: float = 0.25   # 凯利值上限
-    AI_MAX_CONCURRENT_BETS: int = 10      # 最大同时持仓数
     # 下单失败补单（重试）
     BET_RETRY_COUNT: int = 2              # 下单失败重试次数
     BET_RETRY_DELAY: float = 3.0          # 重试间隔（秒）
-    AI_TAKE_PROFIT_PCT: float = 0.50      # 止盈百分比
-    AI_SINGLE_MODEL_MIN_CONFIDENCE: float = 0.70  # 单模型共识放行阈值
-    # conservative 预设
-    AI_CONS_MAX_BET_PCT: float = 0.02
-    AI_CONS_DAILY_LOSS: float = 0.10
-    AI_CONS_MAX_CONCURRENT: int = 5
-    AI_CONS_MIN_CONFIDENCE: float = 0.80
-    AI_CONS_KELLY_CAP: float = 0.10
-    # aggressive 预设
-    AI_AGG_MAX_BET_PCT: float = 0.10
-    AI_AGG_DAILY_LOSS: float = 0.35
-    AI_AGG_MAX_CONCURRENT: int = 20
-    AI_AGG_MIN_CONFIDENCE: float = 0.70
-    AI_AGG_KELLY_CAP: float = 0.30
+    OB_BET_VERIFY_INITIAL_DELAY_SEC: float = 4.0  # OB 下单后首次验证等待
+    OB_BET_VERIFY_RETRIES: int = 8               # OB 下单后最多验证次数
+    OB_BET_VERIFY_INTERVAL_SEC: float = 2.0      # OB 下单后每次验证间隔
+    OB_BET_VERIFY_HISTORY_DAYS: int = 1          # OB 注单历史查询天数
     # LLM 调用参数
     LLM_TEMPERATURE: float = 0.2              # LLM 采样温度
     LLM_MAX_TOKENS: int = 2048               # LLM 最大输出 token
     LLM_DEFAULT_CONFIDENCE: float = 0.33     # 模型未返回置信度时的默认值
-    LLM_NO_DATA_CONFIDENCE_CAP: float = 0.55 # 无真实数据时 LLM 置信度上限
     AI_RETRY_SLEEP_SEC: int = 60             # 引擎异常后重试休眠
     AI_MIN_BALANCE: float = 10.0             # 最低可用余额阈值
     # 捷报比分
@@ -201,8 +198,6 @@ class Settings(BaseSettings):
     AI_RISK_HIGH_ODDS_PENALTY: float = 0.3   # 高赔率风险增量
     AI_RISK_MID_ODDS_THRESHOLD: float = 3.0  # 中赔率风险阈值
     AI_RISK_MID_ODDS_PENALTY: float = 0.15   # 中赔率风险增量
-    AI_RISK_LOW_EV_THRESHOLD: float = 0.05   # 低 EV 风险阈值
-    AI_RISK_LOW_EV_PENALTY: float = 0.2      # 低 EV 风险增量
     AI_RISK_ACTIVE_PENALTY: float = 0.02     # 每笔持仓风险系数
     AI_RISK_ACTIVE_CAP: float = 0.1          # 持仓风险上限
     AI_DIVERSIFY_MAX_PER_LEAGUE: int = 3     # 同一联赛最多注数
@@ -249,6 +244,11 @@ class Settings(BaseSettings):
     @classmethod
     def _coerce_str_lists(cls, v: Any) -> Any:
         return _parse_str_list(v)
+
+    @field_validator("DEBUG", mode="before")
+    @classmethod
+    def _coerce_debug_flag(cls, v: Any) -> Any:
+        return _parse_debug_flag(v)
 
     model_config = {
         "env_file": ".env",

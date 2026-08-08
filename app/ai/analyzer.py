@@ -1,8 +1,7 @@
 """
 AI 赛事分析引擎 - 多模型 Ensemble（gpt/deepseek/doubao/kimi/minimax）
 
-足球：在胜负 / 让球 / 大小中选 1 个最佳方向；
-篮球：仅全场大小。
+仅做大小球(total)分析。
 """
 from __future__ import annotations
 
@@ -11,6 +10,7 @@ import json
 import logging
 from collections import Counter
 from datetime import datetime, timezone
+import time
 from typing import Optional, Any
 
 from openai import AsyncOpenAI
@@ -20,8 +20,8 @@ from app.core.cache import cache
 
 logger = logging.getLogger(__name__)
 
-VALID_PREDICTIONS = {"over", "under", "home", "away", "draw"}
-VALID_BET_TYPES = {"total", "moneyline", "spread"}
+VALID_PREDICTIONS = {"over", "under"}
+VALID_BET_TYPES = {"total"}
 
 _PRED_ALIASES = {
     "over": "over",
@@ -32,21 +32,6 @@ _PRED_ALIASES = {
     "小": "under",
     "大球": "over",
     "小球": "under",
-    "home": "home",
-    "away": "away",
-    "draw": "draw",
-    "主": "home",
-    "客": "away",
-    "平": "draw",
-    "主胜": "home",
-    "客胜": "away",
-    "平局": "draw",
-    "h": "home",
-    "a": "away",
-    "d": "draw",
-    "x": "draw",
-    "1": "home",
-    "2": "away",
 }
 
 _BT_ALIASES = {
@@ -55,17 +40,6 @@ _BT_ALIASES = {
     "totals": "total",
     "大小": "total",
     "大小球": "total",
-    "moneyline": "moneyline",
-    "1x2": "moneyline",
-    "ml": "moneyline",
-    "胜负": "moneyline",
-    "独赢": "moneyline",
-    "spread": "spread",
-    "ah": "spread",
-    "handicap": "spread",
-    "asian_handicap": "spread",
-    "让球": "spread",
-    "让分": "spread",
 }
 
 
@@ -73,10 +47,6 @@ def normalize_bet_type(raw) -> str:
     s = str(raw or "").strip().lower()
     if s in _BT_ALIASES:
         return _BT_ALIASES[s]
-    if "让" in s:
-        return "spread"
-    if "胜负" in s or "独赢" in s or "1x2" in s:
-        return "moneyline"
     if "大小" in s or "total" in s:
         return "total"
     return ""
@@ -90,21 +60,11 @@ def normalize_prediction(raw, *, bet_type: str = "") -> str:
         pred = "over"
     elif "小球" in s or s == "小" or "under" in s:
         pred = "under"
-    elif "主胜" in s or "home" in s:
-        pred = "home"
-    elif "客胜" in s or "away" in s:
-        pred = "away"
-    elif "平" in s or "draw" in s:
-        pred = "draw"
     else:
         pred = ""
 
     bt = normalize_bet_type(bet_type)
     if bt == "total" and pred not in ("over", "under"):
-        return ""
-    if bt == "moneyline" and pred not in ("home", "away", "draw"):
-        return ""
-    if bt == "spread" and pred not in ("home", "away"):
         return ""
     if pred not in VALID_PREDICTIONS:
         return ""
@@ -112,16 +72,6 @@ def normalize_prediction(raw, *, bet_type: str = "") -> str:
 
 
 def _infer_bet_type(prediction: str, declared: str = "") -> str:
-    bt = normalize_bet_type(declared)
-    if bt:
-        return bt
-    pred = normalize_prediction(prediction)
-    if pred in ("over", "under"):
-        return "total"
-    if pred == "draw":
-        return "moneyline"
-    if pred in ("home", "away"):
-        return ""  # 歧义：胜负或让球，需模型声明
     return "total"
 
 
@@ -156,50 +106,6 @@ def _flatten_market_odds(market_odds: Optional[dict]) -> dict[str, float]:
                 if f > 1.0:
                     flat[str(sel)] = f
     return flat
-
-
-def _devig_odds(odds_dict: dict[str, float]) -> dict[str, float]:
-    """去除博彩公司 margin（vig），返回公平赔率。
-
-    原理：1/odds_A + 1/odds_B + ... = 1 + vig
-    归一化后 fair_prob_i = (1/odds_i) / sum(1/odds_all)
-    fair_odds_i = 1 / fair_prob_i
-    """
-    inv_sum = 0.0
-    invs: dict[str, float] = {}
-    for sel, od in odds_dict.items():
-        if od and od > 1.0:
-            inv = 1.0 / od
-            invs[sel] = inv
-            inv_sum += inv
-    if inv_sum <= 0:
-        return odds_dict
-    fair: dict[str, float] = {}
-    for sel, inv in invs.items():
-        fair_prob = inv / inv_sum
-        fair[sel] = round(1.0 / fair_prob, 4) if fair_prob > 0 else 0.0
-    return fair
-
-
-def _devig_ev(confidence: float, raw_odds: float, all_odds: dict[str, float], selection: str = "") -> float:
-    """用去 vig 后的公平赔率计算 EV。
-
-    EV = confidence × fair_odds - 1
-    """
-    if not all_odds or raw_odds <= 1.0:
-        # 无法去 vig 时回退到原始赔率
-        return round(confidence * raw_odds - 1, 4) if raw_odds > 1.0 else 0.0
-    fair_odds = _devig_odds(all_odds)
-    # 优先按 selection 直接查找公平赔率；找不到时回退到原始赔率
-    fair_od = 0.0
-    if selection and selection in fair_odds:
-        fair_od = fair_odds[selection]
-    elif selection and selection in all_odds:
-        # all_odds 有此选择但 devig 结果缺失，用原始赔率
-        fair_od = all_odds[selection]
-    if fair_od <= 1.0:
-        return round(confidence * raw_odds - 1, 4)
-    return round(confidence * fair_od - 1, 4)
 
 
 def _odds_for_pick(market_odds: Optional[dict], bet_type: str, prediction: str) -> float:
@@ -237,6 +143,42 @@ def _line_for_pick(market_odds: Optional[dict], match_info: Optional[dict], bet_
     if bet_type == "spread":
         return info.get("spread_line") or info.get("handicap_line")
     return None
+
+
+def _to_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _parse_percent(value: Any) -> Optional[float]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    raw = raw.replace("%", "").strip()
+    try:
+        num = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if num > 1:
+        num /= 100.0
+    if num < 0:
+        return None
+    return min(num, 1.0)
+
+
+def _recent_matches(bucket: Optional[dict], limit: int = 6) -> list[dict]:
+    if not isinstance(bucket, dict):
+        return []
+    rows = bucket.get("matches") or []
+    if not isinstance(rows, list):
+        return []
+    out: list[dict] = []
+    for row in rows[:limit]:
+        if isinstance(row, dict):
+            out.append(row)
+    return out
 
 
 # (短名, KEY 字段, BASE_URL 字段, MODEL 字段)
@@ -334,7 +276,6 @@ class MatchAnalyzer:
             timeout = float(settings.ENSEMBLE_TIMEOUT_SEC)
             votes = await asyncio.wait_for(self._run_ensemble(prompt), timeout=timeout)
             analysis = self._aggregate_consensus(votes, market_odds, match_info=match_info)
-            analysis = self._apply_context_quality_cap(analysis, historical_data)
 
             if analysis.get("consensus_reached") and analysis.get("models_used"):
                 try:
@@ -358,14 +299,35 @@ class MatchAnalyzer:
         for key in order:
             if key in self.clients and (self.models.get(key) or "") and key not in selected:
                 selected.append(key)
-            if len(selected) >= max_n:
-                return selected
         for key in self.clients:
             if key not in selected and (self.models.get(key) or ""):
                 selected.append(key)
-            if len(selected) >= max_n:
-                break
-        return selected
+        if not selected:
+            return []
+
+        latency_stats = self._get_model_latency_stats()
+        if isinstance(latency_stats, dict) and latency_stats:
+            order_index = {key: idx for idx, key in enumerate(selected)}
+
+            def _sort_key(model_key: str):
+                row = latency_stats.get(model_key) or {}
+                try:
+                    samples = int(row.get("count") or 0)
+                except (TypeError, ValueError):
+                    samples = 0
+                try:
+                    avg_ms = float(row.get("avg_ms") or 0)
+                except (TypeError, ValueError):
+                    avg_ms = 0.0
+                return (
+                    0 if samples > 0 else 1,
+                    avg_ms if samples > 0 else 0.0,
+                    order_index.get(model_key, 999),
+                )
+
+            selected = sorted(selected, key=_sort_key)
+
+        return selected[:max_n]
 
     def _vote_from_raw(self, name: str, raw) -> dict:
         if isinstance(raw, Exception):
@@ -377,13 +339,17 @@ class MatchAnalyzer:
                 "prediction": None,
                 "bet_type": None,
                 "confidence": 0.0,
+                "latency_ms": 0.0,
             }
-        parsed = self._parse_analysis_result(raw)
+        meta = raw.get("_meta") if isinstance(raw, dict) else {}
+        raw_text = raw.get("content", "") if isinstance(raw, dict) else raw
+        parsed = self._parse_analysis_result(raw_text)
         bt = normalize_bet_type(parsed.get("bet_type"))
         pred = normalize_prediction(parsed.get("prediction"), bet_type=bt)
         if not bt:
             bt = _infer_bet_type(pred, "")
-        if not bt or pred not in VALID_PREDICTIONS:
+        # 仅做大小球：bet_type 必须为 total，prediction 必须为 over/under
+        if bt != "total" or pred not in ("over", "under"):
             return {
                 "model": name,
                 "ok": False,
@@ -391,18 +357,7 @@ class MatchAnalyzer:
                 "prediction": None,
                 "bet_type": None,
                 "confidence": 0.0,
-            }
-        # home/away 未声明盘口时默认胜负（更常见）
-        if not normalize_bet_type(parsed.get("bet_type")) and pred in ("home", "away"):
-            bt = "moneyline"
-        if bt == "spread" and pred == "draw":
-            return {
-                "model": name,
-                "ok": False,
-                "error": "spread cannot be draw",
-                "prediction": None,
-                "bet_type": None,
-                "confidence": 0.0,
+                "latency_ms": float((meta or {}).get("latency_ms") or 0),
             }
         try:
             conf = float(parsed.get("confidence", settings.LLM_DEFAULT_CONFIDENCE))
@@ -422,6 +377,7 @@ class MatchAnalyzer:
             "bet_type": bt,
             "line": line_f,
             "confidence": conf,
+            "latency_ms": float((meta or {}).get("latency_ms") or 0),
             "reasoning": parsed.get("reasoning", ""),
             "key_factors": parsed.get("key_factors", []) or [],
             "risk_level": parsed.get("risk_level", "medium"),
@@ -440,6 +396,19 @@ class MatchAnalyzer:
         model_names = self._select_ensemble_models()
         if not model_names:
             raise RuntimeError("未配置任何可用模型名（*_MODEL）")
+        speed_meta = self._get_model_latency_stats()
+        logger.info(
+            "ensemble select models=%s max_models=%s speed_meta=%s",
+            model_names,
+            int(getattr(settings, "ENSEMBLE_MAX_MODELS", 3) or 3),
+            {
+                k: {
+                    "avg_ms": round(float((speed_meta.get(k) or {}).get("avg_ms") or 0), 1),
+                    "count": int((speed_meta.get(k) or {}).get("count") or 0),
+                }
+                for k in model_names
+            } if isinstance(speed_meta, dict) else {},
+        )
 
         quorum = max(1, int(getattr(settings, "ENSEMBLE_QUORUM", 3) or 3))
         quorum = min(quorum, len(model_names))
@@ -466,6 +435,13 @@ class MatchAnalyzer:
                     except Exception as e:
                         raw = e
                     votes.append(self._vote_from_raw(name, raw))
+                    last_vote = votes[-1]
+                    logger.info(
+                        "ensemble vote model=%s ok=%s latency_ms=%s",
+                        name,
+                        bool(last_vote.get("ok")),
+                        int(last_vote.get("latency_ms") or 0),
+                    )
                 ok_n = sum(1 for v in votes if v.get("ok"))
                 if ok_n >= quorum:
                     for t in pending:
@@ -523,14 +499,27 @@ class MatchAnalyzer:
         consensus_ratio = win_count / len(ok_votes)
         min_ratio = settings.ENSEMBLE_MIN_CONSENSUS
         min_votes = min(max(1, settings.ENSEMBLE_MIN_VOTES), len(ok_votes))
-        consensus_reached = (
-            win_count >= min_votes
-            and consensus_ratio + 1e-9 >= min(min_ratio, 1.0 if len(ok_votes) == 1 else min_ratio)
-        )
-        # 单模型可用时：置信度够高才放行（提高胜率）
-        if len(ok_votes) == 1 and ok_votes[0]["confidence"] >= settings.AI_SINGLE_MODEL_MIN_CONFIDENCE:
-            consensus_reached = True
-            consensus_ratio = 1.0
+        single_model_min_conf = float(0.70)
+        if isinstance(match_info, dict):
+            raw_conf = match_info.get("strategy_min_confidence", match_info.get("min_confidence"))
+            try:
+                cfg_conf = float(raw_conf)
+                if cfg_conf > 1:
+                    cfg_conf /= 100.0
+                if 0.0 <= cfg_conf <= 0.99:
+                    single_model_min_conf = cfg_conf
+            except (TypeError, ValueError):
+                pass
+        if len(ok_votes) == 1:
+            # 单模型场景不能天然视为“已达共识”，必须额外过当前生效置信度门槛
+            consensus_reached = ok_votes[0]["confidence"] >= single_model_min_conf
+            if consensus_reached:
+                consensus_ratio = 1.0
+        else:
+            consensus_reached = (
+                win_count >= min_votes
+                and consensus_ratio + 1e-9 >= min_ratio
+            )
 
         agreeing = [
             v for v in ok_votes
@@ -602,6 +591,7 @@ class MatchAnalyzer:
                     "prediction": v.get("prediction"),
                     "bet_type": v.get("bet_type"),
                     "confidence": v.get("confidence", 0),
+                    "latency_ms": v.get("latency_ms", 0),
                     "error": v.get("error"),
                 }
                 for v in votes
@@ -611,19 +601,7 @@ class MatchAnalyzer:
 
         od = _odds_for_pick(market_odds, winning_bt, winning_pred)
         if od > 1:
-            # 去 vig 计算 EV：仅用同市场的赔率去 vig（避免跨市场稀释）
-            market_only_odds = self._extract_market_odds(market_odds, winning_bt)
-            if market_only_odds and len(market_only_odds) >= 2:
-                analysis["expected_value"] = _devig_ev(analysis["confidence"], od, market_only_odds, selection=winning_pred)
-            else:
-                analysis["expected_value"] = round((analysis["confidence"] * od) - 1, 4)
-            analysis["kelly_fraction"] = self._calc_kelly_fraction_raw(
-                od, analysis["confidence"]
-            )
             analysis["odds"] = od
-        else:
-            analysis["expected_value"] = 0.0
-            analysis["kelly_fraction"] = 0.0
 
         if not consensus_reached:
             analysis["risk_level"] = "high"
@@ -675,17 +653,395 @@ class MatchAnalyzer:
                 f"source={quality.get('source')} 置信度封顶≤{cap}] "
                 + str(analysis.get("reasoning") or "")
             )
-            # 更新参考字段（EV/Kelly 仅展示，不参与决策）
-            try:
-                od = float(analysis.get("odds") or 0)
-                if od > 1:
-                    analysis["expected_value"] = round((cap * od) - 1, 4)
-                    analysis["kelly_fraction"] = self._calc_kelly_fraction_raw(od, cap)
-            except Exception:
-                pass
         else:
             analysis["quality_cap"] = cap
         return analysis
+
+    def _apply_signal_review(
+        self,
+        analysis: dict,
+        *,
+        match_info: Optional[dict],
+        historical_data: Optional[dict],
+        market_odds: Optional[dict],
+    ) -> dict:
+        """用盘口 + 基本面的结构化信号二次校准置信度。"""
+        review = self._build_signal_review(
+            match_info=match_info,
+            historical_data=historical_data,
+            market_odds=market_odds,
+            analysis=analysis,
+        )
+        analysis["signal_review"] = review
+        if not review:
+            return analysis
+
+        conf_before = _to_float(analysis.get("confidence"), 0.0)
+        adjusted = conf_before + _to_float(review.get("confidence_delta"), 0.0)
+        cap = review.get("confidence_cap")
+        floor = review.get("confidence_floor")
+        if cap is not None:
+            adjusted = min(adjusted, _to_float(cap, adjusted))
+        if floor is not None:
+            adjusted = max(adjusted, _to_float(floor, adjusted))
+        adjusted = max(0.0, min(0.99, adjusted))
+        analysis["confidence_before_signal_review"] = round(conf_before, 4)
+        analysis["confidence"] = round(adjusted, 4)
+
+        summary = str(review.get("summary") or "").strip()
+        if summary:
+            analysis["reasoning"] = f"[结构化复核] {summary} | {str(analysis.get('reasoning') or '')}"[:900]
+        return analysis
+
+    def _build_signal_review(
+        self,
+        *,
+        match_info: Optional[dict],
+        historical_data: Optional[dict],
+        market_odds: Optional[dict],
+        analysis: Optional[dict],
+    ) -> dict[str, Any]:
+        info = match_info if isinstance(match_info, dict) else {}
+        ctx = historical_data if isinstance(historical_data, dict) else {}
+        ana = analysis if isinstance(analysis, dict) else {}
+        bet_type = str(ana.get("bet_type") or info.get("bet_type") or "total").strip().lower()
+        selection = str(ana.get("prediction") or "").strip().lower()
+        confidence = _to_float(ana.get("confidence"), 0.0)
+        line = _line_for_pick(market_odds, info, bet_type)
+        quality = ana.get("context_quality") if isinstance(ana.get("context_quality"), dict) else {}
+        fields_present = {
+            str(x).strip().lower()
+            for x in (quality.get("fields_present") or [])
+            if str(x).strip()
+        }
+        completeness = _to_float(quality.get("completeness"), 0.0)
+        source = str(quality.get("source") or ctx.get("source") or "none").strip().lower()
+        stat_signals = self._build_statistical_signals(ctx, market_odds, info, ctx.get("h2h") if isinstance(ctx.get("h2h"), dict) else None)
+
+        market_points = 0
+        fundamental_points = 0
+        conflict_points = 0
+        support_reasons: list[str] = []
+        conflict_reasons: list[str] = []
+
+        move = None
+        if isinstance(market_odds, dict):
+            moves = market_odds.get("line_movements") if isinstance(market_odds.get("line_movements"), dict) else {}
+            move = moves.get(bet_type) if isinstance(moves.get(bet_type), dict) else None
+            if move is None:
+                markets = market_odds.get("markets") if isinstance(market_odds.get("markets"), dict) else {}
+                mkt = markets.get(bet_type) if isinstance(markets.get(bet_type), dict) else {}
+                if isinstance(mkt.get("line_movement"), dict):
+                    move = mkt.get("line_movement")
+        move_alignment = self._movement_alignment(bet_type=bet_type, selection=selection, movement=move)
+        if move_alignment == "supportive":
+            market_points += 2
+            support_reasons.append("盘口变动支持当前方向")
+        elif move_alignment == "neutral":
+            market_points += 1
+        elif move_alignment in ("adverse", "conflict"):
+            conflict_points += 2 if move_alignment == "conflict" else 1
+            conflict_reasons.append("盘口变动与当前方向不一致")
+
+        if move and isinstance(move.get("change_count"), (int, float)):
+            market_points += 1
+
+        if source not in ("", "none"):
+            if completeness >= 0.65:
+                fundamental_points += 3
+                support_reasons.append("基本面维度较完整")
+            elif completeness >= 0.50:
+                fundamental_points += 2
+            elif completeness >= 0.30:
+                fundamental_points += 1
+
+        form_signal = self._recent_form_signal(ctx, selection=selection, bet_type=bet_type, line=line)
+        if form_signal["supportive"]:
+            fundamental_points += 2
+            support_reasons.append(form_signal["reason"])
+        elif form_signal["conflict"]:
+            conflict_points += 1
+            conflict_reasons.append(form_signal["reason"])
+
+        h2h_signal = self._h2h_signal(ctx.get("h2h"), selection=selection, bet_type=bet_type, line=line)
+        if h2h_signal["supportive"]:
+            fundamental_points += 1
+            support_reasons.append(h2h_signal["reason"])
+        elif h2h_signal["conflict"]:
+            conflict_points += 1
+            conflict_reasons.append(h2h_signal["reason"])
+
+        standings_signal = self._standings_signal(ctx.get("standings"), selection=selection, bet_type=bet_type)
+        if standings_signal["supportive"]:
+            fundamental_points += 1
+            support_reasons.append(standings_signal["reason"])
+        elif standings_signal["conflict"]:
+            conflict_points += 1
+            conflict_reasons.append(standings_signal["reason"])
+
+        stage_signal = self._stage_signal(info, selection=selection, bet_type=bet_type)
+        if stage_signal["supportive"]:
+            market_points += 1
+            support_reasons.append(stage_signal["reason"])
+        elif stage_signal["conflict"]:
+            conflict_points += 1
+            conflict_reasons.append(stage_signal["reason"])
+
+        if stat_signals:
+            stat_signal = self._statistical_alignment_signal(stat_signals, selection=selection, bet_type=bet_type, line=line)
+            if stat_signal["supportive"]:
+                fundamental_points += 2
+                support_reasons.append(stat_signal["reason"])
+            elif stat_signal["conflict"]:
+                conflict_points += 2
+                conflict_reasons.append(stat_signal["reason"])
+
+        if {"home_form", "away_form"}.issubset(fields_present):
+            fundamental_points += 1
+        if fields_present.intersection({"h2h", "standings"}):
+            fundamental_points += 1
+
+        confidence_delta = 0.0
+        confidence_cap = None
+        confidence_floor = None
+        if market_points >= 4 and fundamental_points >= 5 and conflict_points == 0:
+            confidence_delta += 0.05
+            confidence_floor = max(confidence, 0.60)
+        elif market_points >= 3 and fundamental_points >= 3 and conflict_points <= 1:
+            confidence_delta += 0.02
+        elif conflict_points >= 3:
+            confidence_delta -= 0.12
+            confidence_cap = 0.52
+        elif conflict_points == 2:
+            confidence_delta -= 0.08
+            confidence_cap = 0.58
+        elif market_points <= 1 or fundamental_points <= 1:
+            confidence_delta -= 0.05
+            confidence_cap = 0.60
+
+        if completeness < 0.40 and confidence_cap is None:
+            confidence_cap = 0.62
+        if source in ("", "none"):
+            confidence_cap = min(0.58, confidence_cap) if confidence_cap is not None else 0.58
+
+        verdict = "supportive"
+        if conflict_points >= 3:
+            verdict = "conflict"
+        elif conflict_points > market_points:
+            verdict = "mixed"
+        elif market_points + fundamental_points < 4:
+            verdict = "weak"
+
+        summary_bits = []
+        if support_reasons:
+            summary_bits.append("支持:" + " / ".join(support_reasons[:3]))
+        if conflict_reasons:
+            summary_bits.append("冲突:" + " / ".join(conflict_reasons[:3]))
+        summary = "；".join(summary_bits)
+
+        return {
+            "verdict": verdict,
+            "market_points": int(market_points),
+            "fundamental_points": int(fundamental_points),
+            "conflict_points": int(conflict_points),
+            "move_alignment": move_alignment,
+            "support_reasons": support_reasons[:6],
+            "conflict_reasons": conflict_reasons[:6],
+            "confidence_delta": round(confidence_delta, 4),
+            "confidence_cap": confidence_cap,
+            "confidence_floor": confidence_floor,
+            "summary": summary,
+        }
+
+    @staticmethod
+    def _movement_alignment(*, bet_type: str, selection: str, movement: Optional[dict]) -> str:
+        if not isinstance(movement, dict):
+            return "unknown"
+        signals: list[str] = []
+        direction = str(movement.get("direction") or "").strip().lower()
+        odds_delta = movement.get("odds_delta") if isinstance(movement.get("odds_delta"), dict) else {}
+        if bet_type == "total":
+            if selection == "over":
+                if direction == "line_up":
+                    signals.append("supportive")
+                elif direction == "line_down":
+                    signals.append("adverse")
+            elif selection == "under":
+                if direction == "line_down":
+                    signals.append("supportive")
+                elif direction == "line_up":
+                    signals.append("adverse")
+        try:
+            sel_delta = float(odds_delta.get(selection)) if selection in odds_delta else None
+        except (TypeError, ValueError):
+            sel_delta = None
+        if sel_delta is not None:
+            if sel_delta <= -0.01:
+                signals.append("supportive")
+            elif sel_delta >= 0.01:
+                signals.append("adverse")
+        if "supportive" in signals and "adverse" in signals:
+            return "conflict"
+        if "adverse" in signals:
+            return "adverse"
+        if "supportive" in signals:
+            return "supportive"
+        return "neutral"
+
+    @staticmethod
+    def _recent_form_signal(
+        ctx: dict[str, Any],
+        *,
+        selection: str,
+        bet_type: str,
+        line: Optional[float],
+    ) -> dict[str, Any]:
+        home_rows = _recent_matches(ctx.get("home_form"))
+        away_rows = _recent_matches(ctx.get("away_form"))
+        home_totals = [
+            _to_float(r.get("home_goals"), -1) + _to_float(r.get("away_goals"), -1)
+            for r in home_rows
+            if r.get("home_goals") is not None and r.get("away_goals") is not None
+        ]
+        away_totals = [
+            _to_float(r.get("home_goals"), -1) + _to_float(r.get("away_goals"), -1)
+            for r in away_rows
+            if r.get("home_goals") is not None and r.get("away_goals") is not None
+        ]
+        avg_total = 0.0
+        if home_totals or away_totals:
+            vals = [v for v in home_totals + away_totals if v >= 0]
+            if vals:
+                avg_total = sum(vals) / len(vals)
+
+        supportive = False
+        conflict = False
+        reason = ""
+        if bet_type == "total" and line is not None and avg_total > 0:
+            if selection == "over" and avg_total >= float(line) + 0.35:
+                supportive = True
+                reason = f"近况总进球均值 {avg_total:.2f} 高于盘口 {float(line):.2f}"
+            elif selection == "under" and avg_total <= float(line) - 0.35:
+                supportive = True
+                reason = f"近况总进球均值 {avg_total:.2f} 低于盘口 {float(line):.2f}"
+            elif selection == "over" and avg_total <= float(line) - 0.25:
+                conflict = True
+                reason = f"近况总进球均值 {avg_total:.2f} 偏低"
+            elif selection == "under" and avg_total >= float(line) + 0.25:
+                conflict = True
+                reason = f"近况总进球均值 {avg_total:.2f} 偏高"
+        return {"supportive": supportive, "conflict": conflict, "reason": reason}
+
+    @staticmethod
+    def _h2h_signal(
+        h2h: Any,
+        *,
+        selection: str,
+        bet_type: str,
+        line: Optional[float],
+    ) -> dict[str, Any]:
+        if not isinstance(h2h, dict):
+            return {"supportive": False, "conflict": False, "reason": ""}
+        summary = h2h.get("summary") or {}
+        played = int(_to_float(summary.get("played"), 0))
+        if played <= 0:
+            return {"supportive": False, "conflict": False, "reason": ""}
+        supportive = False
+        conflict = False
+        reason = ""
+        if bet_type == "total" and line is not None:
+            avg_total = _to_float(summary.get("avg_total_goals"), 0.0)
+            if avg_total > 0:
+                if selection == "over" and avg_total >= float(line) + 0.25:
+                    supportive = True
+                    reason = f"交锋总进球均值 {avg_total:.2f} 偏大"
+                elif selection == "under" and avg_total <= float(line) - 0.25:
+                    supportive = True
+                    reason = f"交锋总进球均值 {avg_total:.2f} 偏小"
+        return {"supportive": supportive, "conflict": conflict, "reason": reason}
+
+    @staticmethod
+    def _standings_signal(
+        standings: Any,
+        *,
+        selection: str,
+        bet_type: str,
+    ) -> dict[str, Any]:
+        if not isinstance(standings, dict):
+            return {"supportive": False, "conflict": False, "reason": ""}
+        home = standings.get("home") if isinstance(standings.get("home"), dict) else {}
+        away = standings.get("away") if isinstance(standings.get("away"), dict) else {}
+        supportive = False
+        conflict = False
+        reason = ""
+        if bet_type == "total":
+            home_gf = _to_float(home.get("goals_for"), 0.0)
+            away_gf = _to_float(away.get("goals_for"), 0.0)
+            home_ga = _to_float(home.get("goals_against"), 0.0)
+            away_ga = _to_float(away.get("goals_against"), 0.0)
+            attack_sum = home_gf + away_gf
+            concede_sum = home_ga + away_ga
+            if selection == "over" and attack_sum > 0 and concede_sum > 0 and (attack_sum + concede_sum) >= 4.2:
+                supportive = True
+                reason = "双方联赛攻防数据偏大球"
+            elif selection == "under" and attack_sum > 0 and concede_sum > 0 and (attack_sum + concede_sum) <= 3.0:
+                supportive = True
+                reason = "双方联赛攻防数据偏小球"
+        return {"supportive": supportive, "conflict": conflict, "reason": reason}
+
+    @staticmethod
+    def _stage_signal(
+        match_info: dict[str, Any],
+        *,
+        selection: str,
+        bet_type: str,
+    ) -> dict[str, Any]:
+        if bet_type != "total":
+            return {"supportive": False, "conflict": False, "reason": ""}
+        from app.services.bookmakers.match_live import parse_match_clock_minutes
+
+        sport = str(match_info.get("sport") or "").strip().lower()
+        clock = str(match_info.get("clock") or "").strip()
+        mins = parse_match_clock_minutes(clock, allow_countdown=(sport == "basketball"))
+        supportive = False
+        conflict = False
+        reason = ""
+        if mins is None:
+            return {"supportive": False, "conflict": False, "reason": ""}
+        if sport in ("football", "soccer"):
+            if selection == "over" and 60 <= mins <= 75:
+                supportive = True
+                reason = "足球 60-75 分钟通常更适合追大球"
+            elif selection == "under" and mins < 25:
+                supportive = True
+                reason = "比赛早段节奏通常更谨慎"
+        elif sport == "basketball":
+            if selection == "over" and mins >= 36:
+                supportive = True
+                reason = "篮球末节通常更适合大分"
+        return {"supportive": supportive, "conflict": conflict, "reason": reason}
+
+    @staticmethod
+    def _statistical_alignment_signal(
+        stat_signals: dict[str, Any],
+        *,
+        selection: str,
+        bet_type: str,
+        line: Optional[float],
+    ) -> dict[str, Any]:
+        supportive = False
+        conflict = False
+        reason = ""
+        if bet_type in {"moneyline", "spread"}:
+            xg = stat_signals.get("standings_xg_diff") if isinstance(stat_signals.get("standings_xg_diff"), dict) else {}
+            edge = _to_float(xg.get("edge"), 0.0)
+            if selection == "home" and edge >= 0.35:
+                supportive = True
+                reason = f"xG/积分边际偏向主队 ({edge:.2f})"
+            elif selection == "away" and edge <= -0.35:
+                supportive = True
+                reason = f"xG/积分边际偏向客队 ({edge:.2f})"
+        return {"supportive": supportive, "conflict": conflict, "reason": reason}
 
     @staticmethod
     def _merge_risk(levels: list[str]) -> str:
@@ -703,7 +1059,6 @@ class MatchAnalyzer:
         news: Optional[list],
     ) -> str:
         sport = str(match_info.get("sport") or "football").lower()
-        is_football = sport in ("football", "soccer")
 
         prompt = f"""你是一位顶级体育赛事分析师，拥有20年从业经验。请分析以下赛事并给出专业预测。
 
@@ -719,7 +1074,7 @@ class MatchAnalyzer:
         home_form = None
         away_form = None
         ctx_source = ""
-        # 8 大维度数据收集
+        # 核心维度数据收集
         dim_data: dict[str, Any] = {}
         if isinstance(historical_data, dict):
             ctx_source = str(historical_data.get("source") or match_info.get("context_source") or "")
@@ -737,9 +1092,6 @@ class MatchAnalyzer:
             # 收集 8 大分析维度
             dim_data["历史交锋"] = h2h_block
             dim_data["球队近期状态"] = {"home": home_form, "away": away_form} if (home_form or away_form) else None
-            dim_data["球员伤病"] = historical_data.get("player_status") or historical_data.get("news_injuries") or None
-            dim_data["球员级别数据"] = historical_data.get("player_stats") or None
-            dim_data["战意/轮换"] = historical_data.get("motivation") or None
             dim_data["联赛积分排名"] = historical_data.get("standings") or None
 
         # 盘口维度
@@ -750,12 +1102,11 @@ class MatchAnalyzer:
         dim_data["亚洲盘"] = has_markets
         dim_data["盘口变化"] = has_line_moves
 
-        # 构建维度分析框架（始终列出全部 8 维度，标注有无数据）
+        # 构建维度分析框架（始终列出核心维度，标注有无数据）
         dim_lines = []
         dim_available = 0
         dim_names = [
-            "历史交锋", "球队近期状态", "球员伤病", "球员级别数据",
-            "战意/轮换", "联赛积分排名", "亚洲盘", "盘口变化",
+            "历史交锋", "球队近期状态", "联赛积分排名", "亚洲盘", "盘口变化",
         ]
         for dn in dim_names:
             dv = dim_data.get(dn)
@@ -764,7 +1115,7 @@ class MatchAnalyzer:
                 dim_lines.append(f"  [{dn}] 有数据")
             else:
                 dim_lines.append(f"  [{dn}] 数据缺失")
-        dim_summary = f"（{dim_available}/8 维度有数据）"
+        dim_summary = f"（{dim_available}/5 维度有数据）"
 
         if h2h_block:
             prompt += f"\n## 历史交锋记录\n{json.dumps(h2h_block, ensure_ascii=False, separators=(',', ':'))}\n"
@@ -781,27 +1132,10 @@ class MatchAnalyzer:
         if isinstance(historical_data, dict):
             standings = historical_data.get("standings") or {}
             quality = historical_data.get("quality") or {}
-            player_status = historical_data.get("player_status") or historical_data.get("news_injuries") or []
-            player_stats = historical_data.get("player_stats") or {}
-            motivation = historical_data.get("motivation") or {}
             dims_present = historical_data.get("dimensions_present") or []
             dims_missing = historical_data.get("dimensions_missing") or []
-            if player_status:
-                prompt += "\n## 球员伤病/伤停\n" + "\n".join(f"- {x}" for x in (player_status[:8] if isinstance(player_status, list) else [str(player_status)]) ) + "\n"
-            if isinstance(player_stats, dict) and (player_stats.get("home") or player_stats.get("away")):
-                prompt += f"\n## 球员级别数据\n{json.dumps(player_stats, ensure_ascii=False, separators=(',', ':'))}\n"
-            if isinstance(motivation, dict) and (
-                motivation.get("home") or motivation.get("away") or motivation.get("notes")
-            ):
-                prompt += f"\n## 战意/轮换\n{json.dumps(motivation, ensure_ascii=False, separators=(',', ':'))}\n"
             if standings.get("home") or standings.get("away"):
                 prompt += f"\n## 联赛积分排名\n{json.dumps(standings, ensure_ascii=False, separators=(',', ':'))}\n"
-
-            # 泊松统计模型：用球员场均进失球计算预期比分概率
-            if is_football and isinstance(player_stats, dict):
-                poisson_block = self._calc_poisson_expected(player_stats)
-                if poisson_block:
-                    prompt += f"\n## 泊松统计模型（量化基线，非主观判断）\n{json.dumps(poisson_block, ensure_ascii=False, separators=(',', ':'))}\n"
 
             if quality or dims_present or dims_missing:
                 prompt += (
@@ -810,6 +1144,18 @@ class MatchAnalyzer:
                     f"present={dims_present or (quality or {}).get('fields_present')} "
                     f"missing={dims_missing}\n"
                 )
+
+        # 分析页 / 直播页 / 走势页额外数据
+        if isinstance(historical_data, dict):
+            analysis_data = historical_data.get("analysis")
+            if analysis_data:
+                prompt += f"\n## 分析页额外数据\n{json.dumps(analysis_data, ensure_ascii=False, separators=(',', ':'))}\n"
+            live_data = historical_data.get("live")
+            if live_data:
+                prompt += f"\n## 直播页数据（首发/概率/统计）\n{json.dumps(live_data, ensure_ascii=False, separators=(',', ':'))}\n"
+            trend_data = historical_data.get("trend")
+            if trend_data:
+                prompt += f"\n## 走势页数据（各公司初指）\n{json.dumps(trend_data, ensure_ascii=False, separators=(',', ':'))}\n"
 
         # 统计信号汇总：预计算量化指标注入 prompt，减少 LLM 主观偏差
         stat_signals = self._build_statistical_signals(
@@ -836,77 +1182,29 @@ class MatchAnalyzer:
                 if k in market_odds
             }
 
-        if is_football:
-            prompt += f"\n## 投注市场（亚洲盘：独赢/亚洲让球/亚洲大小，只选 1 个最佳）{score_hint}\n"
-            if markets_block:
-                prompt += f"- 可用盘口（含 opening / 盘口变化 line_movement）: {json.dumps(markets_block, ensure_ascii=False)}\n"
-            else:
-                flat = _flatten_market_odds(market_odds)
-                if flat:
-                    prompt += f"- 当前赔率: {json.dumps(flat, ensure_ascii=False)}\n"
-            line_moves = None
-            if isinstance(market_odds, dict):
-                line_moves = market_odds.get("line_movements")
-            if line_moves:
-                prompt += f"- 盘口变化摘要: {json.dumps(line_moves, ensure_ascii=False)}\n"
-            prompt += (
-                "请在可用盘口中只选择 **一个** 置信最高的方向：\n"
-                "- moneyline(独赢): prediction=home/draw/away\n"
-                "- spread(亚洲让球): prediction=home/away（主队让球线视角；结合 opening 与升/降水）\n"
-                "- total(亚洲大小): prediction=over/under（结合 opening 总分与升/降水）\n"
-            )
-            prompt += f"""
+        total_line = match_info.get("total_line") or match_info.get("line")
+        prompt += (
+            "\n## 投注市场（亚洲大小：仅分析全场大小球）\n"
+            f"- 盘口线 total_line: {total_line if total_line is not None else '未知'}"
+            f"{score_hint}\n"
+        )
+        flat = _flatten_market_odds(market_odds)
+        if markets_block and "total" in markets_block:
+            prompt += f"- 当前大小球（含 opening/变盘）: {json.dumps(markets_block['total'], ensure_ascii=False)}\n"
+        elif flat:
+            prompt += f"- 当前大小球赔率: {json.dumps(flat, ensure_ascii=False)}\n"
+        line_moves = None
+        if isinstance(market_odds, dict):
+            line_moves = market_odds.get("line_movements")
+        if line_moves:
+            prompt += f"- 盘口变化摘要: {json.dumps(line_moves, ensure_ascii=False)}\n"
+        prompt += f"""
 ## 分析框架 {dim_summary}
 {chr(10).join(dim_lines)}
 
 ## 量化分析指引（必须严格遵循）
 
 ### 1. 统计信号优先级
-- **泊松模型**给出预期比分和大小球概率，是量化基线。若你的判断与泊松概率偏差 >15%，必须在 reasoning 中解释原因。
-- **xG diff（积分榜期望进球差）**：edge>0.5 表示明显实力差距，可提高 confidence；edge<0.2 表示实力接近，应降低 confidence。
-- **交锋胜率基线**：若交锋胜率与泊松概率方向一致，confidence 可上浮；方向矛盾时 confidence 必须下调 0.1。
-- **攻防效率比**：效率比>1.5 表示进攻强于防守，倾向大球；<1.0 表示防守强于进攻，倾向小球。
-- **水位变化信号**：direction="下降(有利-买方)"时可适度提高 confidence；"上升(不利-买方)"时必须降低 confidence 且 risk_level 标为 high。
-- **比赛阶段权重**：足球 60-75 分钟是进球高发期，此阶段大球概率应上浮；75 分钟+是大小球突变期，谨慎判断。
-
-### 2. 信号一致性校准
-- 多数信号（泊松/xG/交锋/效率比）方向一致 -> confidence 可达 0.65-0.75
-- 信号方向分歧 -> confidence 必须 ≤ 0.55
-- 水位变化与基本面矛盾 -> confidence 必须 ≤ 0.50，risk_level=high
-
-### 3. 数据质量约束
-- 维度<4/8时confidence<{settings.LLM_NO_DATA_CONFIDENCE_CAP}。
-- 不得编造缺失数据；缺失维度标注"数据缺失"。
-- 泊松模型和统计信号是预计算值，不得质疑或修改，只能在此基础上做调整。
-
-## 输出（严格JSON）
-{{"bet_type":"moneyline/spread/total","prediction":"home/draw/away或home/away或over/under","line":null,"confidence":0.0-1.0,"reasoning":"1.泊松基线:预期比分X-Y,大小球概率...2.统计信号:xG diff=...,交锋胜率=...,效率比=...,水位变化=...3.历史交锋:...4.近期状态:...5.伤病:...6.球员数据:...7.战意:...8.排名:...9.亚洲盘:...10.盘口变化:...综合:信号一致性分析+最终判断","key_factors":["因素1","因素2"],"risk_level":"low/medium/high","value_bets":[]}}
-"""
-        else:
-            total_line = match_info.get("total_line") or match_info.get("line")
-            prompt += (
-                "\n## 投注市场（亚洲大小：仅分析全场大小球）\n"
-                f"- 盘口线 total_line: {total_line if total_line is not None else '未知'}"
-                f"{score_hint}\n"
-            )
-            flat = _flatten_market_odds(market_odds)
-            if markets_block and "total" in markets_block:
-                prompt += f"- 当前大小球（含 opening/变盘）: {json.dumps(markets_block['total'], ensure_ascii=False)}\n"
-            elif flat:
-                prompt += f"- 当前大小球赔率: {json.dumps(flat, ensure_ascii=False)}\n"
-            line_moves = None
-            if isinstance(market_odds, dict):
-                line_moves = market_odds.get("line_movements")
-            if line_moves:
-                prompt += f"- 盘口变化摘要: {json.dumps(line_moves, ensure_ascii=False)}\n"
-            prompt += f"""
-## 分析框架 {dim_summary}
-{chr(10).join(dim_lines)}
-
-## 量化分析指引（必须严格遵循）
-
-### 1. 统计信号优先级
-- **攻防效率比**：效率比>1.5 倾向大球；<1.0 倾向小球。edge>0.5 表示双方节奏差异大。
 - **交锋胜率基线**：若交锋历史多高分场次，倾向大球；多低分场次，倾向小球。
 - **xG diff（积分榜期望分差）**：edge 绝对值大表示实力悬殊，弱队可能刷分倾向大球。
 - **水位变化信号**：direction="下降(有利-买方)"时大球赔率下降=市场看好大球，可提高 confidence；"上升"时反之。
@@ -918,7 +1216,7 @@ class MatchAnalyzer:
 - 水位变化与基本面矛盾 -> confidence 必须 ≤ 0.45，risk_level=high
 
 ### 3. 数据质量约束
-- 数据维度 < 4/8 时 confidence 必须 < {settings.LLM_NO_DATA_CONFIDENCE_CAP}。
+- 核心维度 < 3/4 时 confidence 必须 < {0.55}。
 - 不得编造缺失数据；缺失维度标注"数据缺失"。
 - 统计信号是预计算值，不得质疑或修改，只能在此基础上做调整。
 - 须结合盘口升/降水；变盘与基本面冲突时降低 confidence。
@@ -929,7 +1227,7 @@ class MatchAnalyzer:
     "prediction": "over 或 under",
     "line": null,
     "confidence": 0.0-1.0,
-    "reasoning": "1.统计信号:效率比=...,交锋胜率=...,xG diff=...,水位变化=...,比赛阶段=...2.历史交锋:...3.近期状态:...4.伤病:...5.球员数据:...6.战意:...7.排名:...8.亚洲盘:...9.盘口变化:...综合:信号一致性分析+最终判断",
+    "reasoning": "1.统计信号:xG diff=...,交锋胜率=...,水位变化=...,比赛阶段=...2.历史交锋:...3.近期状态:...4.排名:...5.亚洲盘:...6.盘口变化:...综合:信号一致性分析+最终判断",
     "key_factors": ["因素1", "因素2", "因素3"],
     "risk_level": "low/medium/high",
     "value_bets": [
@@ -939,11 +1237,6 @@ class MatchAnalyzer:
 
 注意：prediction 只能是 over 或 under；reasoning 必须先分析统计信号再分析各维度；只输出JSON。
 """
-
-        if news:
-            prompt += "\n## 相关新闻/伤病\n"
-            for n in news[:8]:
-                prompt += f"- {n}\n"
 
         try:
             from app.services.sports_data import confidence_cap_for_quality, compute_quality
@@ -963,13 +1256,13 @@ class MatchAnalyzer:
             elif ctx_source == "none":
                 prompt += (
                     f"\n> 注意：无真实交锋/近况/伤病数据，请仅基于盘口赔率分析，"
-                    f"confidence 必须低于 {settings.LLM_NO_DATA_CONFIDENCE_CAP}。\n"
+                    f"confidence 必须低于 {0.55}。\n"
                 )
         except Exception:
             if ctx_source == "none":
                 prompt += (
                     f"\n> 注意：无真实交锋/近况/伤病数据，请仅基于盘口赔率分析，"
-                    f"confidence 必须低于 {settings.LLM_NO_DATA_CONFIDENCE_CAP}。\n"
+                    f"confidence 必须低于 {0.55}。\n"
                 )
         return prompt
 
@@ -979,11 +1272,13 @@ class MatchAnalyzer:
         model_key: str,
         model_name: str,
         client: AsyncOpenAI,
-    ) -> str:
+    ) -> dict:
         messages = [
             {"role": "system", "content": "你是专业体育赛事分析师。只输出JSON。"},
             {"role": "user", "content": prompt},
         ]
+        started = time.perf_counter()
+        ok = False
 
         def _is_transient(err: Exception) -> bool:
             """连接错误/DNS失败等网络问题不重试；仅超时/429/500/502/503 重试"""
@@ -1028,7 +1323,10 @@ class MatchAnalyzer:
                 content = response.choices[0].message.content or ""
             except Exception:
                 pass
-        return content
+        ok = bool(content)
+        elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
+        self._record_model_latency(model_key, elapsed_ms, ok=ok)
+        return {"content": content, "_meta": {"latency_ms": elapsed_ms, "model": model_key}}
 
     def _parse_analysis_result(self, raw: str) -> dict:
         try:
@@ -1059,12 +1357,9 @@ class MatchAnalyzer:
             "key_factors": [],
             "value_bets": [],
             "risk_level": "high",
-            "expected_value": 0.0,
-            "kelly_fraction": 0.0,
             "consensus_reached": False,
             "consensus_votes": {},
             "consensus_ratio": 0.0,
-            "ev_passed": True,
             "ensemble": [],
             "models_used": [],
             "models_failed": [],
@@ -1072,58 +1367,6 @@ class MatchAnalyzer:
         if error:
             result["error"] = error
         return result
-
-    @staticmethod
-    def _extract_market_odds(market_odds: Optional[dict], bet_type: str) -> dict[str, float]:
-        """提取指定市场的赔率（仅同类选择，避免跨市场去 vig 稀释）。
-
-        total -> {over, under}
-        moneyline -> {home, draw, away}
-        spread -> {home, away}
-        """
-        if not market_odds:
-            return {}
-        # 合法选择按市场类型
-        valid_sel = {
-            "total": {"over", "under"},
-            "moneyline": {"home", "draw", "away"},
-            "spread": {"home", "away"},
-        }.get(bet_type, set())
-
-        markets = market_odds.get("markets") if isinstance(market_odds, dict) else None
-        if isinstance(markets, dict) and bet_type in markets:
-            entry = markets[bet_type] or {}
-            if isinstance(entry, dict):
-                # 格式1: odds 在子键 "odds" 中
-                if "odds" in entry and isinstance(entry["odds"], dict):
-                    result = {}
-                    for k, v in entry["odds"].items():
-                        if k in valid_sel:
-                            try:
-                                fv = float(v) if v else 0
-                                if fv > 1.0:
-                                    result[k] = fv
-                            except (TypeError, ValueError):
-                                pass
-                    if result:
-                        return result
-                # 格式2: odds 直接在 entry 上（如 {line: 2.5, over: 1.85, under: 1.95}）
-                result = {}
-                for k, v in entry.items():
-                    if k in valid_sel:
-                        try:
-                            fv = float(v)
-                            if fv > 1.0:
-                                result[k] = fv
-                        except (TypeError, ValueError):
-                            pass
-                if result:
-                    return result
-        # 回退：从 flat 中按 bet_type 筛选
-        flat = _flatten_market_odds(market_odds)
-        if valid_sel:
-            return {k: v for k, v in flat.items() if k in valid_sel}
-        return flat
 
     @staticmethod
     def _build_statistical_signals(
@@ -1181,32 +1424,7 @@ class MatchAnalyzer:
                     "away_win_rate": round(aw / played, 3),
                 }
 
-        # --- 3. 球员攻防效率比 ---
-        if isinstance(historical_data, dict):
-            ps = historical_data.get("player_stats") or {}
-            if isinstance(ps, dict):
-                h_list = ps.get("home") or []
-                a_list = ps.get("away") or []
-                h = h_list[0] if isinstance(h_list, list) and h_list else (h_list if isinstance(h_list, dict) else {})
-                a = a_list[0] if isinstance(a_list, list) and a_list else (a_list if isinstance(a_list, dict) else {})
-                if isinstance(h, dict) and isinstance(a, dict):
-                    try:
-                        h_att = float(h.get("avg_goals") or 0)
-                        h_def = float(h.get("avg_conceded") or 0)
-                        a_att = float(a.get("avg_goals") or 0)
-                        a_def = float(a.get("avg_conceded") or 0)
-                        if h_att > 0 and a_att > 0:
-                            h_eff = round(h_att / max(h_def, 0.1), 2)
-                            a_eff = round(a_att / max(a_def, 0.1), 2)
-                            signals["efficiency_ratio"] = {
-                                "home_attack_defense": h_eff,
-                                "away_attack_defense": a_eff,
-                                "edge": round(h_eff - a_eff, 2),
-                            }
-                    except (TypeError, ValueError):
-                        pass
-
-        # --- 4. 盘口水位变化信号 ---
+        # --- 3. 盘口水位变化信号 ---
         if isinstance(market_odds, dict):
             line_moves = market_odds.get("line_movements")
             if isinstance(line_moves, list) and len(line_moves) >= 2:
@@ -1226,7 +1444,7 @@ class MatchAnalyzer:
                 except (TypeError, ValueError):
                     pass
 
-        # --- 5. 比赛阶段权重 ---
+        # --- 4. 比赛阶段权重 ---
         period = str(match_info.get("period") or "").lower()
         clock = str(match_info.get("clock") or "")
         if period or clock:
@@ -1263,6 +1481,8 @@ class MatchAnalyzer:
 
     _model_weights_cache: dict[str, float] = {}
     _model_weights_ts: float = 0.0
+    _model_latency_cache: dict[str, dict[str, float]] = {}
+    _model_latency_ts: float = 0.0
 
     @classmethod
     def _get_model_weights(cls) -> dict[str, float]:
@@ -1287,6 +1507,28 @@ class MatchAnalyzer:
                 cls._model_weights_cache = weights
                 cls._model_weights_ts = now
                 return weights
+        except Exception:
+            pass
+        return {}
+
+    @classmethod
+    def _get_model_latency_stats(cls) -> dict[str, dict[str, float]]:
+        """从 Redis 读取模型耗时统计，供下次优先选择更快模型。"""
+        now = time.time()
+        if cls._model_latency_cache and (now - cls._model_latency_ts) < 30:
+            return cls._model_latency_cache
+        try:
+            import redis
+            r = redis.Redis(host="ob-redis", port=6379, socket_timeout=1.0, socket_connect_timeout=1.0)
+            data = r.get("ai:model_latency_stats")
+            r.close()
+            if data:
+                import json as _json
+                stats = _json.loads(data)
+                if isinstance(stats, dict):
+                    cls._model_latency_cache = stats
+                    cls._model_latency_ts = now
+                    return stats
         except Exception:
             pass
         return {}
@@ -1342,95 +1584,67 @@ class MatchAnalyzer:
         except Exception:
             pass
 
-    @staticmethod
-    def _calc_kelly_fraction_raw(pred_odds: float, confidence: float) -> float:
-        if pred_odds <= 1:
-            return 0.0
-        p = confidence
-        q = 1 - p
-        b = pred_odds - 1
-        kelly = (p * b - q) / b if b > 0 else 0
-        return round(max(0.0, min(kelly, settings.AI_KELLY_FRACTION_CAP)), 4)
+    @classmethod
+    def _record_model_latency(cls, model_key: str, elapsed_ms: float, ok: bool) -> None:
+        """记录模型真实耗时，按 EWMA 更新平均耗时。"""
+        try:
+            elapsed_ms = max(1.0, float(elapsed_ms or 0))
+        except (TypeError, ValueError):
+            return
+        model = str(model_key or "").strip().lower()
+        if not model:
+            return
 
-    @staticmethod
-    def _calc_poisson_expected(player_stats: dict) -> Optional[dict]:
-        """用球员场均进失球计算泊松分布预期比分概率。
-
-        输入: {"home": [{"avg_goals": 2.0, "avg_conceded": 1.0, ...}], "away": [...]}
-        输出: {"expected_home_goals": 1.5, "expected_away_goals": 1.0,
-               "over_2_5_prob": 0.54, "under_2_5_prob": 0.46,
-               "home_win_prob": 0.42, "draw_prob": 0.28, "away_win_prob": 0.30}
-        """
-        import math
-
-        home_list = player_stats.get("home") or []
-        away_list = player_stats.get("away") or []
-        if not home_list or not away_list:
-            return None
-        h = home_list[0] if isinstance(home_list, list) else home_list
-        a = away_list[0] if isinstance(away_list, list) else away_list
-        if not isinstance(h, dict) or not isinstance(a, dict):
-            return None
+        async def _save():
+            import redis.asyncio as aioredis
+            r = aioredis.Redis(host="ob-redis", port=6379, socket_timeout=1.0)
+            try:
+                raw = await r.get("ai:model_latency_stats")
+                stats = json.loads(raw) if raw else {}
+                if not isinstance(stats, dict):
+                    stats = {}
+                row = stats.get(model) or {}
+                try:
+                    prev_avg = float(row.get("avg_ms") or elapsed_ms)
+                except (TypeError, ValueError):
+                    prev_avg = elapsed_ms
+                try:
+                    prev_count = int(row.get("count") or 0)
+                except (TypeError, ValueError):
+                    prev_count = 0
+                try:
+                    ok_count = int(row.get("ok_count") or 0)
+                except (TypeError, ValueError):
+                    ok_count = 0
+                try:
+                    fail_count = int(row.get("fail_count") or 0)
+                except (TypeError, ValueError):
+                    fail_count = 0
+                alpha = 0.35
+                avg_ms = elapsed_ms if prev_count <= 0 else round(prev_avg * (1 - alpha) + elapsed_ms * alpha, 2)
+                stats[model] = {
+                    "avg_ms": avg_ms,
+                    "last_ms": round(elapsed_ms, 2),
+                    "count": prev_count + 1,
+                    "ok_count": ok_count + (1 if ok else 0),
+                    "fail_count": fail_count + (0 if ok else 1),
+                    "last_ok": bool(ok),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+                await r.setex("ai:model_latency_stats", 86400 * 7, json.dumps(stats, ensure_ascii=False))
+                cls._model_latency_cache = stats
+                cls._model_latency_ts = time.time()
+            except Exception:
+                pass
+            finally:
+                await r.aclose()
 
         try:
-            h_attack = float(h.get("avg_goals") or h.get("goals_per_game") or 0)
-            h_defense = float(h.get("avg_conceded") or h.get("conceded_per_game") or 0)
-            a_attack = float(a.get("avg_goals") or a.get("goals_per_game") or 0)
-            a_defense = float(a.get("avg_conceded") or a.get("conceded_per_game") or 0)
-        except (TypeError, ValueError):
-            return None
-
-        if h_attack <= 0 or a_attack <= 0:
-            return None
-
-        # 预期进球：主队攻击力 × 客队防守力（取几何平均归一化）
-        exp_home = (h_attack * a_defense) / 2.0
-        exp_away = (a_attack * h_defense) / 2.0
-        # 限制在合理范围
-        exp_home = max(0.1, min(exp_home, 5.0))
-        exp_away = max(0.1, min(exp_away, 5.0))
-
-        # 泊松分布计算各比分概率
-        max_goals = 7
-        home_probs = [math.exp(-exp_home) * (exp_home ** i) / math.factorial(i) for i in range(max_goals + 1)]
-        away_probs = [math.exp(-exp_away) * (exp_away ** i) / math.factorial(i) for i in range(max_goals + 1)]
-
-        home_win = draw = away_win = over_25 = under_25 = 0.0
-        for hg in range(max_goals + 1):
-            for ag in range(max_goals + 1):
-                p = home_probs[hg] * away_probs[ag]
-                if hg > ag:
-                    home_win += p
-                elif hg == ag:
-                    draw += p
-                else:
-                    away_win += p
-                if hg + ag > 2:
-                    over_25 += p
-                else:
-                    under_25 += p
-
-        # 归一化（修正截断误差）
-        total_wdl = home_win + draw + away_win
-        if total_wdl > 0:
-            home_win /= total_wdl
-            draw /= total_wdl
-            away_win /= total_wdl
-        total_ou = over_25 + under_25
-        if total_ou > 0:
-            over_25 /= total_ou
-            under_25 /= total_ou
-
-        return {
-            "expected_home_goals": round(exp_home, 2),
-            "expected_away_goals": round(exp_away, 2),
-            "expected_total_goals": round(exp_home + exp_away, 2),
-            "over_2_5_prob": round(over_25, 3),
-            "under_2_5_prob": round(under_25, 3),
-            "home_win_prob": round(home_win, 3),
-            "draw_prob": round(draw, 3),
-            "away_win_prob": round(away_win, 3),
-        }
-
+            asyncio.get_running_loop()
+            task = asyncio.create_task(_save())
+            MatchAnalyzer._pending_tasks.add(task)
+            task.add_done_callback(MatchAnalyzer._pending_tasks.discard)
+        except RuntimeError:
+            pass
 
 analyzer = MatchAnalyzer()

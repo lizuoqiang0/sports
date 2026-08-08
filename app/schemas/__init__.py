@@ -6,6 +6,7 @@ from decimal import Decimal
 from enum import Enum
 from typing import Optional, List, Dict, Any
 from pydantic import BaseModel, EmailStr, Field, ConfigDict, model_validator
+from app.config import settings
 
 
 # === 通用 ===
@@ -149,19 +150,19 @@ class PlaceBetResponse(BaseModel):
 
 # === AI投注 ===
 class AIConfigRequest(BaseModel):
-    strategy: str = Field("balanced", description="conservative/balanced/aggressive")
-    max_bet_amount: Decimal = Field(100, gt=0)
-    max_daily_bets: int = Field(10, ge=1, le=100)
-    min_confidence: float = Field(0.75, ge=0.1, le=0.99)
+    strategy: str = Field("high_win_rate", description="high_win_rate")
+    max_bet_amount: Decimal = Field(settings.AI_STRATEGY_MAX_BET_AMOUNT, gt=0)
+    max_daily_bets: int = Field(settings.AI_STRATEGY_MAX_DAILY_BETS, ge=1, le=100)
+    min_confidence: float = Field(0.0, ge=0.1, le=0.99)
     preferred_sports: List[str] = []
     excluded_teams: List[str] = []
-    stop_loss: Decimal = Field(500, gt=0)
-    take_profit: Decimal = Field(1000, gt=0)
-    max_odds: float = Field(3.5, gt=1.0)
-    min_odds: float = Field(1.5, gt=1.0)
+    stop_loss: Decimal = Field(settings.AI_STOP_LOSS, gt=0)
+    take_profit: Decimal = Field(settings.AI_TAKE_PROFIT, gt=0)
+    max_odds: float = Field(10.0, gt=1.0)
+    min_odds: float = Field(1.1, gt=1.0)
     use_llm_analysis: bool = True
     auto_cashout: bool = False
-    cashout_threshold: float = 0.8
+    cashout_threshold: float = settings.AI_DEFAULT_CASHOUT_THRESHOLD
 
 
 class AIRecommendationResponse(BaseModel):
@@ -170,8 +171,6 @@ class AIRecommendationResponse(BaseModel):
     confidence: float
     reasoning: str
     suggested_stake: Decimal
-    expected_value: float  # EV
-    kelly_fraction: float  # 凯利值
 
 
 class AIBetExecutionRequest(BaseModel):
@@ -204,4 +203,3 @@ class BookmakerVerifyBatchRequest(BaseModel):
     """并行验证多个站点；codes 为空则验证已填网址的站点。"""
     codes: Optional[List[str]] = None
     manual_venue: bool = False
-

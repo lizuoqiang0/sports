@@ -1,24 +1,18 @@
 """
 捷报比分（nowscore.com）数据抓取器。
 
-替代 DuckDuckGo 搜索，直接从捷报比分获取结构化赛前数据：
-- 历史交锋 (H2H)
-- 球队近期状态 (近10场)
-- 球员伤病/停赛
-- 联赛积分排名
-- 战意/轮换（对阵前/后9名战绩、未来赛程）
-- 球员级别数据（进球/失球/胜率）
-- 天气/场地
+直接抓取并缓存：
+- 分析页：积分排名、对赛往绩、近期战绩、联赛走势、伤停、战绩特征、数据对比
+- 直播页：首发阵容、进失球概率、半场/全场胜负统计
+- 走势页：各公司初指/赛前指数
 
-数据来源：
-  - /mvc/match/GetRecommendSchedules?sportType=1  获取今日比赛ID列表
-  - /Analy/Analysis/{scheduleId}.htm              分析页（H2H、近况、盘路、赛程）
-  - /mvc/soccer/qingbao?scheduleId={id}           情报页（积分排名、伤停）
+最终上下文落 Redis，供 AI 只读实时盘口 + 基本面。
 """
 
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 import logging
 import re
 from typing import Any, Optional
@@ -26,6 +20,8 @@ from typing import Any, Optional
 import httpx
 
 from app.config import settings
+from app.services.bookmakers.sport_classify import classify_sport, normalize_sport, reject_sport_mismatch
+from app.services.sports_data import compute_quality
 
 logger = logging.getLogger(__name__)
 
@@ -44,8 +40,17 @@ if _proxy_raw:
 # 共享 HTTP client，复用 TCP 连接
 _shared_client: Optional[httpx.AsyncClient] = None
 
-# 分析页 HTML 缓存 {schedule_id: html}，同一场比赛分析页单次分析周期内不变
-_html_cache: dict[int, str] = {}
+# 分析页 HTML 缓存 {(sport, schedule_id): html}，避免足球/篮球互串
+_html_cache: dict[tuple[str, int], str] = {}
+_TRACKED_DIMENSIONS = (
+    "h2h",
+    "home_form",
+    "away_form",
+    "standings",
+    "analysis",
+    "live",
+    "trend",
+)
 
 
 async def _get_client() -> httpx.AsyncClient:
@@ -90,11 +95,15 @@ def _parse_score(score_str: str) -> dict[str, Any]:
     """解析比分字符串 '2-1-1-0' -> {home_goals, away_goals, home_red, away_red}。
     格式: 比分-红牌-角球（如 '2-1-1-0-5-3'）或纯比分（如 '2-1'）。
     """
-    # 处理 "半场 全场" 格式（空格分隔），取最后一组作为全场比分
-    score_str = score_str.strip()
-    if " " in score_str:
-        groups = score_str.split()
-        score_str = groups[-1] if groups else score_str
+    # 捷报常见 "全场 半场" 格式，如 "2-1 2-0"；第一组是全场比分。
+    score_str = re.sub(r"\s+", " ", (score_str or "").strip())
+    score_pairs = re.findall(r"(\d{1,3})\s*-\s*(\d{1,3})", score_str)
+    if " " in score_str and score_pairs:
+        home_goals, away_goals = score_pairs[0]
+        return {
+            "home_goals": int(home_goals),
+            "away_goals": int(away_goals),
+        }
     parts = score_str.split("-")
     result: dict[str, Any] = {}
     if len(parts) >= 2:
@@ -111,9 +120,17 @@ def _parse_score(score_str: str) -> dict[str, Any]:
 
 # ── 比赛列表 & ID 查找 ──────────────────────────────────────────────────
 
-# 缓存今日比赛标题列表 {timestamp, {scheduleId: "主队 vs 客队"}}
-_title_cache: dict[str, Any] = {"ts": 0, "data": {}}
+# 缓存今日比赛标题列表，按 sport 隔离，避免足球/篮球互串
+_title_cache: dict[str, dict[str, Any]] = {}
 _CACHE_TTL = settings.NOWSCORE_TITLE_CACHE_TTL  # 30 分钟
+
+
+def _sport_cache_key(sport: str) -> str:
+    return "basketball" if "basket" in (sport or "").lower() else "football"
+
+
+def _html_cache_key(schedule_id: int, sport: str) -> tuple[str, int]:
+    return (_sport_cache_key(sport), int(schedule_id))
 
 
 async def _get_today_schedule_ids(sport_type: int = 1) -> list[int]:
@@ -135,8 +152,10 @@ async def _get_all_titles(sport: str = "football") -> dict[int, str]:
     import time
 
     now = time.time()
-    if _title_cache["data"] and now - _title_cache["ts"] < _CACHE_TTL:
-        return _title_cache["data"]
+    cache_key = _sport_cache_key(sport)
+    cached = _title_cache.get(cache_key) or {}
+    if cached.get("data") and now - float(cached.get("ts") or 0) < _CACHE_TTL:
+        return cached["data"]
 
     sport_type = 2 if "basket" in (sport or "").lower() else 1
     ids = await _get_today_schedule_ids(sport_type)
@@ -154,8 +173,7 @@ async def _get_all_titles(sport: str = "football") -> dict[int, str]:
             if isinstance(title, str) and title:
                 titles[sid] = title
 
-    _title_cache["ts"] = now
-    _title_cache["data"] = titles
+    _title_cache[cache_key] = {"ts": now, "data": titles}
     logger.info("nowscore: cached %d match titles", len(titles))
     return titles
 
@@ -227,7 +245,7 @@ async def _get_match_title(schedule_id: int, sport: str = "football") -> str:
         analysis_path = "/AnalyLq/Analysis/" if "basket" in (sport or "").lower() else "/Analy/Analysis/"
         resp = await c.get(f"{_BASE}{analysis_path}{schedule_id}.htm")
         if resp.status_code == 200:
-            _html_cache[schedule_id] = resp.text
+            _html_cache[_html_cache_key(schedule_id, sport)] = resp.text
             m = re.search(r"<title>([^<]+)</title>", resp.text)
             if m:
                 return m.group(1)
@@ -240,7 +258,7 @@ async def _get_match_title(schedule_id: int, sport: str = "football") -> str:
 
 async def _fetch_analysis_page(schedule_id: int, sport: str = "football") -> str:
     """获取分析页 HTML。"""
-    cached = _html_cache.get(schedule_id)
+    cached = _html_cache.get(_html_cache_key(schedule_id, sport))
     if cached:
         return cached
     try:
@@ -248,7 +266,7 @@ async def _fetch_analysis_page(schedule_id: int, sport: str = "football") -> str
         analysis_path = "/AnalyLq/Analysis/" if "basket" in (sport or "").lower() else "/Analy/Analysis/"
         resp = await c.get(f"{_BASE}{analysis_path}{schedule_id}.htm")
         if resp.status_code == 200:
-            _html_cache[schedule_id] = resp.text
+            _html_cache[_html_cache_key(schedule_id, sport)] = resp.text
             return resp.text
     except Exception as e:
         logger.warning("nowscore: analysis page fetch failed sid=%s err=%s", schedule_id, e)
@@ -268,6 +286,42 @@ async def _fetch_qingbao_page(schedule_id: int, sport: str = "football") -> str:
             return resp.text
     except Exception as e:
         logger.warning("nowscore: qingbao page fetch failed sid=%s err=%s", schedule_id, e)
+    return ""
+
+
+async def _fetch_live_page(schedule_id: int, sport: str = "football") -> str:
+    """获取直播页 HTML。"""
+    try:
+        c = await _get_client()
+        live_path = "/AnalyLq/ShiJian/" if "basket" in (sport or "").lower() else "/Analy/ShiJian/"
+        for url in (
+            f"{_BASE}{live_path}{schedule_id}.htm",
+            f"{_BASE}/Analy/ShiJian/{schedule_id}.htm",
+        ):
+            resp = await c.get(url)
+            if resp.status_code == 200 and resp.text:
+                return resp.text
+    except Exception as e:
+        logger.warning("nowscore: live page fetch failed sid=%s err=%s", schedule_id, e)
+    return ""
+
+
+async def _fetch_trend_page(schedule_id: int, sport: str = "football") -> str:
+    """获取走势/初指页 HTML。"""
+    try:
+        c = await _get_client()
+        candidates = [
+            f"{_BASE}/Analy/Analysis/{schedule_id}.htm",
+            f"{_BASE}/AnalyLq/Analysis/{schedule_id}.htm",
+        ]
+        for url in candidates:
+            resp = await c.get(url)
+            if resp.status_code == 200 and resp.text and (
+                "赛前指数" in resp.text or "初指" in resp.text or "公司" in resp.text
+            ):
+                return resp.text
+    except Exception as e:
+        logger.warning("nowscore: trend page fetch failed sid=%s err=%s", schedule_id, e)
     return ""
 
 
@@ -350,7 +404,150 @@ def _parse_form_row(row: list[str]) -> Optional[dict[str, Any]]:
     }
 
 
-def _parse_h2h(html: str) -> dict[str, Any]:
+def _norm_team_name(name: str) -> str:
+    s = (name or "").strip().lower()
+    s = re.sub(r"\s+", "", s)
+    s = re.sub(r"[()（）\-\.\u200e\u200f·'`]", "", s)
+    return s
+
+
+def _same_team_name(a: str, b: str) -> bool:
+    na = _norm_team_name(a)
+    nb = _norm_team_name(b)
+    if not na or not nb:
+        return False
+    return na == nb or na in nb or nb in na
+
+
+def _resolve_team_perspective(parsed: dict[str, Any], target_team: str) -> Optional[str]:
+    if not target_team:
+        return None
+    if _same_team_name(parsed.get("home") or "", target_team):
+        return "home"
+    if _same_team_name(parsed.get("away") or "", target_team):
+        return "away"
+    return None
+
+
+def _sync_context_dimensions(ctx: dict[str, Any]) -> dict[str, Any]:
+    quality = compute_quality(ctx)
+    present = [
+        str(x).strip()
+        for x in (quality.get("fields_present") or [])
+        if str(x).strip() in _TRACKED_DIMENSIONS
+    ]
+    # analysis / live / trend 不在 compute_quality 的 fields_present 中，
+    # 需依据 ctx 中的实际内容判定是否呈现，避免新增维度被永久归入 missing
+    analysis = ctx.get("analysis") if isinstance(ctx, dict) else None
+    if isinstance(analysis, dict) and (
+        analysis.get("injuries")
+        or analysis.get("features")
+        or analysis.get("compare")
+        or analysis.get("analysis_tables")
+    ):
+        if "analysis" not in present:
+            present.append("analysis")
+    live = ctx.get("live") if isinstance(ctx, dict) else None
+    if isinstance(live, dict) and (
+        (live.get("lineup") or {}).get("count")
+        or (live.get("probabilities") or {}).get("count")
+        or (live.get("half_full_stats") or {}).get("count")
+        or live.get("tables")
+    ):
+        if "live" not in present:
+            present.append("live")
+    trend = ctx.get("trend") if isinstance(ctx, dict) else None
+    if isinstance(trend, dict) and (trend.get("tables") or trend.get("initial_odds")):
+        if "trend" not in present:
+            present.append("trend")
+    missing = [field for field in _TRACKED_DIMENSIONS if field not in set(present)]
+    return {
+        **ctx,
+        "dimensions_present": present,
+        "dimensions_missing": missing,
+        "quality": quality,
+    }
+
+
+def _build_context_text(
+    *,
+    title: str,
+    h2h: dict[str, Any],
+    home_form: dict[str, Any],
+    away_form: dict[str, Any],
+    standings: dict[str, Any],
+) -> str:
+    chunks = [title]
+    for bucket in (h2h, home_form, away_form):
+        for row in (bucket.get("matches") or [])[:6]:
+            if not isinstance(row, dict):
+                continue
+            chunks.extend(
+                [
+                    str(row.get("competition") or ""),
+                    str(row.get("home") or ""),
+                    str(row.get("away") or ""),
+                    str(row.get("score") or ""),
+                ]
+            )
+    for side in ("home", "away"):
+        item = standings.get(side) or {}
+        if isinstance(item, dict):
+            chunks.extend([str(item.get("team") or ""), str(item.get("win_rate") or "")])
+    return " ".join(x for x in chunks if x)
+
+
+def _sample_score_pair(*buckets: dict[str, Any]) -> tuple[Optional[int], Optional[int]]:
+    for bucket in buckets:
+        for row in (bucket.get("matches") or []):
+            if not isinstance(row, dict):
+                continue
+            home_goals = row.get("home_goals")
+            away_goals = row.get("away_goals")
+            if isinstance(home_goals, int) and isinstance(away_goals, int):
+                return home_goals, away_goals
+    return None, None
+
+
+def _context_matches_declared_sport(
+    *,
+    sport: str,
+    title: str,
+    h2h: dict[str, Any],
+    home_form: dict[str, Any],
+    away_form: dict[str, Any],
+    standings: dict[str, Any],
+) -> bool:
+    declared = normalize_sport(sport)
+    if not declared:
+        return False
+    text = _build_context_text(
+        title=title,
+        h2h=h2h,
+        home_form=home_form,
+        away_form=away_form,
+        standings=standings,
+    )
+    sample_home, sample_away = _sample_score_pair(h2h, home_form, away_form)
+    inferred = classify_sport(
+        text=text,
+        home_score=sample_home or 0,
+        away_score=sample_away or 0,
+        sport_hint=declared,
+    )
+    if inferred and inferred != declared:
+        return False
+    if sample_home is None or sample_away is None:
+        return True
+    return not reject_sport_mismatch(
+        declared,
+        home_score=sample_home,
+        away_score=sample_away,
+        text=text,
+    )
+
+
+def _parse_h2h(html: str, home_team: str = "", away_team: str = "") -> dict[str, Any]:
     """解析历史交锋。从 HTML 中按日期格式提取 H2H 记录。"""
     matches: list[dict[str, Any]] = []
     tables = _parse_tables(html)
@@ -393,9 +590,37 @@ def _parse_h2h(html: str) -> dict[str, Any]:
 
     if not unique:
         return {"matches": [], "note": "未找到历史交锋数据"}
-    home_wins = sum(1 for m in unique if m.get("home_goals") is not None and m.get("away_goals") is not None and m["home_goals"] > m["away_goals"])
-    draws = sum(1 for m in unique if m.get("home_goals") is not None and m.get("away_goals") is not None and m["home_goals"] == m["away_goals"])
-    away_wins = sum(1 for m in unique if m.get("home_goals") is not None and m.get("away_goals") is not None and m["home_goals"] < m["away_goals"])
+    home_wins = 0
+    draws = 0
+    away_wins = 0
+    for row in unique:
+        home_goals = row.get("home_goals")
+        away_goals = row.get("away_goals")
+        if home_goals is None or away_goals is None:
+            continue
+        row_home = _resolve_team_perspective(row, home_team)
+        row_away = _resolve_team_perspective(row, away_team)
+        if row_home == "home" and row_away == "away":
+            if home_goals > away_goals:
+                home_wins += 1
+            elif home_goals == away_goals:
+                draws += 1
+            else:
+                away_wins += 1
+        elif row_home == "away" and row_away == "home":
+            if away_goals > home_goals:
+                home_wins += 1
+            elif home_goals == away_goals:
+                draws += 1
+            else:
+                away_wins += 1
+        else:
+            if home_goals > away_goals:
+                home_wins += 1
+            elif home_goals == away_goals:
+                draws += 1
+            else:
+                away_wins += 1
     return {
         "matches": unique[:10],
         "summary": {
@@ -407,7 +632,13 @@ def _parse_h2h(html: str) -> dict[str, Any]:
     }
 
 
-def _parse_recent_form(html: str, team_side: str, _tables: Optional[list] = None) -> dict[str, Any]:
+def _parse_recent_form(
+    html: str,
+    team_side: str,
+    *,
+    team_name: str = "",
+    _tables: Optional[list] = None,
+) -> dict[str, Any]:
     """解析球队近期战绩。Table 5 (主队) / Table 6 (客队)。"""
     tables = _tables if _tables is not None else _parse_tables(html)
     form_tables = []
@@ -433,7 +664,12 @@ def _parse_recent_form(html: str, team_side: str, _tables: Optional[list] = None
         away_goals = parsed.get("away_goals")
         result = ""
         if home_goals is not None and away_goals is not None:
-            if team_side == "home":
+            perspective = _resolve_team_perspective(parsed, team_name)
+            if perspective == "home":
+                result = "胜" if home_goals > away_goals else ("平" if home_goals == away_goals else "负")
+            elif perspective == "away":
+                result = "胜" if away_goals > home_goals else ("平" if away_goals == home_goals else "负")
+            elif team_side == "home":
                 result = "胜" if home_goals > away_goals else ("平" if home_goals == away_goals else "负")
             else:
                 result = "胜" if away_goals > home_goals else ("平" if away_goals == home_goals else "负")
@@ -442,46 +678,120 @@ def _parse_recent_form(html: str, team_side: str, _tables: Optional[list] = None
     return {"matches": matches[:10]}
 
 
-def _parse_injuries(html: str, _tables: Optional[list] = None) -> list[str]:
-    """解析伤停信息。从情报页 table 中提取伤停/停赛球员。
-
-    实际行格式为多列：
-    - [number, (position)player_name, '', '']
-    - ['', '', number, (position)player_name]
-    """
-    injuries = []
-    tables = _tables if _tables is not None else _parse_tables(html)
-    for tbl in tables:
-        for row in tbl:
-            for i, cell in enumerate(row):
-                # 检查是否匹配 "(位置)球员名" 格式
-                m = re.match(r"\(([\u4e00-\u9fff\w·]+)\)(.+)", cell)
-                if m:
-                    position, name = m.groups()
-                    name = name.strip()
-                    # 向前找相邻的纯数字 cell 作为球衣号
-                    jersey = ""
-                    if i > 0 and row[i - 1].strip().isdigit():
-                        jersey = row[i - 1].strip()
-                    # 检查行内是否有 "停赛" 关键词
-                    context_text = " ".join(row)
-                    status = "停赛" if "停赛" in context_text else "伤停"
-                    if jersey:
-                        injuries.append(f"{jersey} ({position}){name} - {status}")
-                    else:
-                        injuries.append(f"({position}){name} - {status}")
-    # 去重
-    seen = set()
-    result = []
-    for inj in injuries:
-        if inj not in seen:
-            seen.add(inj)
-            result.append(inj)
-    return result[:10]
-
-
-def _parse_standings(html: str, qingbao_html: str, _analysis_tables: Optional[list] = None, _qingbao_tables: Optional[list] = None) -> dict[str, Any]:
+def _parse_standings(
+    html: str,
+    qingbao_html: str,
+    _analysis_tables: Optional[list] = None,
+    _qingbao_tables: Optional[list] = None,
+    *,
+    home_team: str = "",
+    away_team: str = "",
+) -> dict[str, Any]:
     """解析积分排名。优先从 qingbao 页获取（更详细）。支持足球和篮球两种格式。"""
+
+    def _normalize_row_candidate(
+        row: list[str],
+        *,
+        is_basketball: bool,
+        current_team: str = "",
+    ) -> Optional[dict[str, Any]]:
+        cells = [str(c).strip() for c in row if str(c).strip()]
+        if not cells:
+            return None
+        if cells[0] in {"#", "球队", "排名"}:
+            return None
+
+        team = ""
+        played = win = draw = lose = points = None
+        goals_for = goals_against = None
+        win_rate = ""
+        scope = ""
+
+        if len(cells) >= 9 and not cells[0].isdigit() and cells[0] not in ("总", "主", "客"):
+            team = cells[0]
+            played = _safe_int(cells[1])
+            win = _safe_int(cells[2])
+            draw = _safe_int(cells[3])
+            lose = _safe_int(cells[4])
+            goals_for = _safe_float(cells[5])
+            goals_against = _safe_float(cells[6])
+            points = _safe_int(cells[7])
+            win_rate = cells[8]
+        elif len(cells) >= 8 and cells[0].isdigit() and not cells[1].isdigit():
+            team = cells[1]
+            played = _safe_int(cells[2])
+            win = _safe_int(cells[3])
+            draw = 0 if not is_basketball else None
+            lose = _safe_int(cells[4])
+            goals_for = _safe_float(cells[5])
+            goals_against = _safe_float(cells[6])
+            win_rate = cells[8] if len(cells) > 8 else cells[-1]
+        elif len(cells) >= 7 and cells[0] in ("总", "主", "客"):
+            scope = cells[0]
+            team = current_team or (cells[1] if len(cells) > 1 else "")
+            if current_team:
+                played = _safe_int(cells[1]) if len(cells) > 1 else None
+                win = _safe_int(cells[2]) if len(cells) > 2 else None
+                lose = _safe_int(cells[3]) if len(cells) > 3 else None
+                goals_for = _safe_float(cells[4]) if len(cells) > 4 else None
+                goals_against = _safe_float(cells[5]) if len(cells) > 5 else None
+                win_rate = cells[-1]
+            else:
+                played = _safe_int(cells[2]) if len(cells) > 2 else None
+                win = _safe_int(cells[3]) if len(cells) > 3 else None
+                lose = _safe_int(cells[4]) if len(cells) > 4 else None
+                goals_for = _safe_float(cells[5]) if len(cells) > 5 else None
+                goals_against = _safe_float(cells[6]) if len(cells) > 6 else None
+                win_rate = cells[-1]
+        elif len(cells) >= 6 and not cells[0].isdigit():
+            team = cells[0]
+            played = _safe_int(cells[1])
+            win = _safe_int(cells[2])
+            if len(cells) >= 9:
+                draw = _safe_int(cells[3])
+                lose = _safe_int(cells[4])
+                goals_for = _safe_float(cells[5])
+                goals_against = _safe_float(cells[6])
+                points = _safe_int(cells[7])
+                win_rate = cells[8]
+            else:
+                lose = _safe_int(cells[3])
+                goals_for = _safe_float(cells[4])
+                goals_against = _safe_float(cells[5])
+                win_rate = cells[-1]
+        else:
+            return None
+
+        if not team:
+            return None
+        return {
+            "team": team,
+            "scope": scope,
+            "played": played,
+            "win": win,
+            "draw": draw,
+            "lose": lose,
+            "goals_for": goals_for,
+            "goals_against": goals_against,
+            "points": points,
+            "win_rate": win_rate,
+        }
+
+    def _assign(result: dict[str, Any], cand: dict[str, Any], *, home_team: str, away_team: str) -> None:
+        team = str(cand.get("team") or "").strip()
+        if not team:
+            return
+        if result["home"] is None and home_team and _same_team_name(team, home_team):
+            result["home"] = cand
+            return
+        if result["away"] is None and away_team and _same_team_name(team, away_team):
+            result["away"] = cand
+            return
+        if result["home"] is None:
+            result["home"] = cand
+            return
+        if result["away"] is None and not _same_team_name(team, str((result["home"] or {}).get("team") or "")):
+            result["away"] = cand
 
     def _try_parse(tables: list) -> dict[str, Any]:
         result = {"home": None, "away": None}
@@ -502,75 +812,22 @@ def _parse_standings(html: str, qingbao_html: str, _analysis_tables: Optional[li
                     if len(row) == 1 and first and first not in ("总", "主", "客") and "全场" not in first and "半场" not in first and "赛" not in first and "均得" not in first and "均失" not in first and not first.isdigit():
                         current_team = first
                         continue
-                    # 篮球格式1 (WNBA): [总/主/客, 赛, 胜, 负, 均得, 均失, 净, 排名, 胜率]
-                    if first in ("总", "主", "客") and len(row) >= 7:
-                        data = {
-                            "team": current_team or "",
-                            "scope": first,
-                            "played": _safe_int(row[1]) if len(row) > 1 else None,
-                            "win": _safe_int(row[2]) if len(row) > 2 else None,
-                            "draw": 0,
-                            "lose": _safe_int(row[3]) if len(row) > 3 else None,
-                            "goals_for": _safe_float(row[4]) if len(row) > 4 else None,
-                            "goals_against": _safe_float(row[5]) if len(row) > 5 else None,
-                            "points": None,
-                            "win_rate": row[-1].strip() if row else None,
-                        }
-                        if data["scope"] == "总":
-                            if result["home"] is None:
-                                result["home"] = data
-                            elif result["away"] is None:
-                                result["away"] = data
-                                break
-                    # 篮球格式2 (PBA): [排名#, 球队名, 赛, 胜, 负, 均得, 均失, 净, 胜率]
-                    elif first.isdigit() and len(row) >= 8 and row[1].strip() and not row[1].strip().isdigit():
-                        data = {
-                            "team": row[1].strip(),
-                            "scope": "总",
-                            "played": _safe_int(row[2]) if len(row) > 2 else None,
-                            "win": _safe_int(row[3]) if len(row) > 3 else None,
-                            "draw": 0,
-                            "lose": _safe_int(row[4]) if len(row) > 4 else None,
-                            "goals_for": _safe_float(row[5]) if len(row) > 5 else None,
-                            "goals_against": _safe_float(row[6]) if len(row) > 6 else None,
-                            "points": None,
-                            "win_rate": row[-1].strip() if row else None,
-                        }
-                        if result["home"] is None:
-                            result["home"] = data
-                        elif result["away"] is None:
-                            result["away"] = data
-                            break
+                    cand = _normalize_row_candidate(
+                        row,
+                        is_basketball=True,
+                        current_team=current_team or "",
+                    )
+                    if cand:
+                        _assign(result, cand, home_team=home_team, away_team=away_team)
             else:
-                # 足球格式（原逻辑）
-                if "积分" not in all_text or "胜率" not in all_text:
+                if "积分" not in all_text and "胜率" not in all_text and "均进" not in all_text:
                     continue
-                current_team = None
                 for row in tbl:
                     if not row:
                         continue
-                    first = row[0].strip()
-                    if len(row) == 1 and first and first not in ("总", "主", "客") and "全场" not in first and "半场" not in first and "赛" not in first:
-                        current_team = first
-                    elif first in ("总", "主", "客") and current_team and len(row) >= 8:
-                        data = {
-                            "team": current_team,
-                            "scope": first,
-                            "played": _safe_int(row[1]) if len(row) > 1 else None,
-                            "win": _safe_int(row[2]) if len(row) > 2 else None,
-                            "draw": _safe_int(row[3]) if len(row) > 3 else None,
-                            "lose": _safe_int(row[4]) if len(row) > 4 else None,
-                            "goals_for": _safe_int(row[5]) if len(row) > 5 else None,
-                            "goals_against": _safe_int(row[6]) if len(row) > 6 else None,
-                            "points": _safe_int(row[7]) if len(row) > 7 else None,
-                            "win_rate": row[8].strip() if len(row) > 8 else None,
-                        }
-                        if data["scope"] == "总":
-                            if result["home"] is None:
-                                result["home"] = data
-                            elif result["away"] is None:
-                                result["away"] = data
-                                break
+                    cand = _normalize_row_candidate(row, is_basketball=False)
+                    if cand:
+                        _assign(result, cand, home_team=home_team, away_team=away_team)
             if result["home"] and result["away"]:
                 break
         return result
@@ -591,127 +848,6 @@ def _parse_standings(html: str, qingbao_html: str, _analysis_tables: Optional[li
     return _try_parse(tables)
 
 
-def _parse_motivation(html: str, _tables: Optional[list] = None) -> dict[str, Any]:
-    """解析战意（对阵前/后9名战绩 + 未来赛程）。"""
-    tables = _tables if _tables is not None else _parse_tables(html)
-    result = {"home": "", "away": "", "notes": []}
-
-    for tbl in tables:
-        header = " ".join(tbl[0]) if tbl else ""
-        if "本赛季" in header and "对阵" in "".join(tbl[1] if len(tbl) > 1 else []):
-            for row in tbl[1:]:
-                if len(row) >= 4:
-                    desc = row[0].strip()
-                    wins = row[1].strip()
-                    draws = row[2].strip()
-                    loses = row[3].strip()
-                    if "主队" in desc:
-                        result["home"] = f"{desc}: {wins}胜{draws}平{loses}负"
-                        result["notes"].append(desc)
-                    elif "客队" in desc:
-                        result["away"] = f"{desc}: {wins}胜{draws}平{loses}负"
-                        result["notes"].append(desc)
-
-    # 未来赛程
-    for tbl in tables:
-        header = " ".join(tbl[0]) if tbl else ""
-        if "间隔" in header:
-            for row in tbl[1:4]:
-                if len(row) >= 6:
-                    result["notes"].append(f"后续: {row[0]} {row[2]} vs {row[4]} ({row[5]}后)")
-
-    return result
-
-
-def _parse_player_stats(html: str, _tables: Optional[list] = None) -> dict[str, Any]:
-    """解析球员级别数据（球队整体进球/失球/胜率）。支持足球和篮球。"""
-    tables = _tables if _tables is not None else _parse_tables(html)
-
-    # 足球：找"进球"+"均进"表头
-    for tbl in tables:
-        if not tbl:
-            continue
-        header = " ".join(tbl[0]) if tbl[0] else ""
-        if "球队" in header and "进球" in header and "均进" in header:
-            home_stats = None
-            away_stats = None
-            for row in tbl[1:]:
-                if len(row) >= 8:
-                    stat = {
-                        "team": row[0].strip(),
-                        "played": _safe_int(row[1]),
-                        "goals": _safe_int(row[2]),
-                        "avg_goals": _safe_float(row[3]),
-                        "conceded": _safe_int(row[4]),
-                        "avg_conceded": _safe_float(row[5]),
-                        "win_rate": row[6].strip(),
-                        "draw_rate": row[7].strip(),
-                    }
-                    if home_stats is None:
-                        home_stats = stat
-                    else:
-                        away_stats = stat
-            return {"home": [home_stats] if home_stats else [], "away": [away_stats] if away_stats else []}
-
-    # 篮球：从积分榜(含"均得"/"均失"的表)提取
-    for tbl in tables:
-        if not tbl:
-            continue
-        all_text = " ".join(" ".join(r) for r in tbl)
-        if "均得" not in all_text and "均失" not in all_text:
-            continue
-
-        home_stats = None
-        away_stats = None
-        current_team = None
-        for row in tbl:
-            if not row:
-                continue
-            first = row[0].strip()
-            # 单元素行是球队名
-            if len(row) == 1 and first and first not in ("总", "主", "客") and "全场" not in first and "半场" not in first and "赛" not in first and "均得" not in first and "均失" not in first and not first.isdigit():
-                current_team = first
-                continue
-            # 篮球格式1 (WNBA): [总/主/客, 赛, 胜, 负, 均得, 均失, 净, 排名, 胜率]
-            if first in ("总", "主", "客") and len(row) >= 7:
-                if first == "总":
-                    stat = {
-                        "team": current_team or "",
-                        "played": _safe_int(row[1]) if len(row) > 1 else None,
-                        "goals": None,
-                        "avg_goals": _safe_float(row[4]) if len(row) > 4 else None,
-                        "conceded": None,
-                        "avg_conceded": _safe_float(row[5]) if len(row) > 5 else None,
-                        "win_rate": row[-1].strip() if row else None,
-                        "draw_rate": "0%",
-                    }
-                    if home_stats is None:
-                        home_stats = stat
-                    else:
-                        away_stats = stat
-            # 篮球格式2 (PBA): [排名#, 球队名, 赛, 胜, 负, 均得, 均失, 净, 胜率]
-            elif first.isdigit() and len(row) >= 8 and row[1].strip() and not row[1].strip().isdigit():
-                stat = {
-                    "team": row[1].strip(),
-                    "played": _safe_int(row[2]) if len(row) > 2 else None,
-                    "goals": None,
-                    "avg_goals": _safe_float(row[5]) if len(row) > 5 else None,
-                    "conceded": None,
-                    "avg_conceded": _safe_float(row[6]) if len(row) > 6 else None,
-                    "win_rate": row[-1].strip() if row else None,
-                    "draw_rate": "0%",
-                }
-                if home_stats is None:
-                    home_stats = stat
-                else:
-                    away_stats = stat
-
-        if home_stats or away_stats:
-            return {"home": [home_stats] if home_stats else [], "away": [away_stats] if away_stats else []}
-
-    return {"home": [], "away": [], "note": "未找到球员数据"}
-
-
 def _safe_int(s: str) -> Optional[int]:
     try:
         return int(s.strip())
@@ -724,6 +860,176 @@ def _safe_float(s: str) -> Optional[float]:
         return float(s.strip())
     except (ValueError, AttributeError):
         return None
+
+
+def _table_text(tbl: list[list[str]]) -> str:
+    return " ".join(" ".join(row) for row in tbl if row)
+
+
+def _row_is_header(row: list[str]) -> bool:
+    txt = " ".join(row)
+    return any(k in txt for k in ("排名", "积分", "首发", "阵容", "进失球", "半场", "全场", "初指", "赛前指数", "对赛", "伤停", "走势", "战绩", "对比"))
+
+
+def _first_non_empty(rows: list[list[str]]) -> list[str]:
+    for row in rows:
+        if any(str(c).strip() for c in row):
+            return row
+    return []
+
+
+def _tables_with_keywords(tables: list[list[list[str]]], keywords: tuple[str, ...]) -> list[list[list[str]]]:
+    out = []
+    for tbl in tables:
+        txt = _table_text(tbl)
+        if any(k in txt for k in keywords):
+            out.append(tbl)
+    return out
+
+
+def _rows_from_tables(tables: list[list[list[str]]]) -> list[list[str]]:
+    rows: list[list[str]] = []
+    for tbl in tables:
+        rows.extend(tbl)
+    return rows
+
+
+def _section_tables(html: str, keywords: tuple[str, ...]) -> list[list[list[str]]]:
+    tables = _parse_tables(html)
+    return _tables_with_keywords(tables, keywords)
+
+
+def _parse_named_rows(tables: list[list[list[str]]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for tbl in tables:
+        if not tbl:
+            continue
+        header = _first_non_empty(tbl[:1]) or []
+        out.append(
+            {
+                "header": header,
+                "rows": tbl[1:] if len(tbl) > 1 else [],
+                "raw": tbl,
+                "text": _table_text(tbl),
+            }
+        )
+    return out
+
+
+def _parse_odds_trend_tables(html: str) -> dict[str, Any]:
+    tables = _tables_with_keywords(_parse_tables(html), ("赛前指数", "初指", "初盘", "公司", "盘口"))
+    if not tables:
+        return {"tables": [], "initial_odds": []}
+    return {
+        "tables": _parse_named_rows(tables),
+        "initial_odds": _parse_named_rows(tables[:4]),
+        "note": "走势/初指数据已抓取",
+    }
+
+
+def _parse_injuries_and_features(html: str) -> dict[str, Any]:
+    tables = _parse_tables(html)
+    injuries = _tables_with_keywords(tables, ("伤停", "伤缺", "停赛"))
+    features = _tables_with_keywords(tables, ("战绩特征", "数据对比", "联赛走势"))
+    compare = _tables_with_keywords(tables, ("数据对比", "对比"))
+    return {
+        "injuries": _parse_named_rows(injuries),
+        "features": _parse_named_rows(features),
+        "compare": _parse_named_rows(compare),
+    }
+
+
+def _parse_live_data(html: str) -> dict[str, Any]:
+    tables = _parse_tables(html)
+    lineup_tbls = _tables_with_keywords(tables, ("首发", "阵容", "预计首发", "替补"))
+    prob_tbls = _tables_with_keywords(tables, ("进失球概率", "进球概率", "失球概率"))
+    hf_tbls = _tables_with_keywords(tables, ("半场", "全场", "胜负统计", "半全场"))
+
+    def _maybe_team_block(tbls: list[list[list[str]]]) -> dict[str, Any]:
+        named = _parse_named_rows(tbls)
+        return {
+            "home": named[0] if len(named) > 0 else None,
+            "away": named[1] if len(named) > 1 else None,
+            "tables": named,
+            "count": len(named),
+        }
+
+    return {
+        "lineup": _maybe_team_block(lineup_tbls),
+        "probabilities": _maybe_team_block(prob_tbls),
+        "half_full_stats": _maybe_team_block(hf_tbls),
+        "tables": _parse_named_rows(lineup_tbls + prob_tbls + hf_tbls),
+    }
+
+
+def _build_context_payload(
+    *,
+    schedule_id: int,
+    sport: str,
+    home_team: str,
+    away_team: str,
+    title: str,
+    analysis_html: str,
+    qingbao_html: str,
+    live_html: str,
+    trend_html: str,
+) -> Optional[dict[str, Any]]:
+    analysis_tables = _parse_tables(analysis_html)
+    qingbao_tables = _parse_tables(qingbao_html)
+    h2h = _parse_h2h(analysis_html, home_team, away_team)
+    home_form = _parse_recent_form(analysis_html, "home", team_name=home_team, _tables=analysis_tables)
+    away_form = _parse_recent_form(analysis_html, "away", team_name=away_team, _tables=analysis_tables)
+    standings = _parse_standings(
+        analysis_html,
+        qingbao_html,
+        _analysis_tables=analysis_tables,
+        _qingbao_tables=qingbao_tables,
+        home_team=home_team,
+        away_team=away_team,
+    )
+    analysis_extra = _parse_injuries_and_features(analysis_html)
+    live_data = _parse_live_data(live_html)
+    trend_data = _parse_odds_trend_tables(trend_html or analysis_html)
+
+    if not _context_matches_declared_sport(
+        sport=sport,
+        title=title,
+        h2h=h2h,
+        home_form=home_form,
+        away_form=away_form,
+        standings=standings,
+    ):
+        logger.warning(
+            "nowscore context rejected by sport check: sport=%s sid=%s home=%s away=%s title=%s",
+            sport, schedule_id, home_team, away_team, title,
+        )
+        return None
+
+    ctx = {
+        "source": "nowscore",
+        "schedule_id": schedule_id,
+        "sport": sport,
+        "home_team": home_team,
+        "away_team": away_team,
+        "match_title": title,
+        "analysis": {
+            "analysis_tables": _parse_named_rows(_section_tables(analysis_html, ("伤停", "战绩特征", "数据对比", "联赛走势"))),
+            "injuries": analysis_extra.get("injuries") or [],
+            "features": analysis_extra.get("features") or [],
+            "compare": analysis_extra.get("compare") or [],
+        },
+        "live": live_data,
+        "trend": trend_data,
+        "h2h": h2h,
+        "home_form": home_form,
+        "away_form": away_form,
+        "standings": standings,
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+    }
+    ctx = _sync_context_dimensions(ctx)
+    if not (ctx.get("dimensions_present") or []):
+        return None
+    return ctx
 
 
 # ── 主入口 ──────────────────────────────────────────────────────────────
@@ -741,10 +1047,12 @@ async def fetch_match_context_via_nowscore(
         logger.warning("nowscore: scheduleId not found for %s vs %s", home_team, away_team)
         return None
 
-    # 2. 并发获取分析页 + 情报页
-    analysis_html, qingbao_html = await asyncio.gather(
+    # 2. 并发获取分析页 + 情报页 + 直播页 + 走势页
+    analysis_html, qingbao_html, live_html, trend_html = await asyncio.gather(
         _fetch_analysis_page(schedule_id, sport),
         _fetch_qingbao_page(schedule_id, sport),
+        _fetch_live_page(schedule_id, sport),
+        _fetch_trend_page(schedule_id, sport),
     )
 
     if not analysis_html and not qingbao_html:
@@ -755,55 +1063,74 @@ async def fetch_match_context_via_nowscore(
     analysis_tables = _parse_tables(analysis_html)
     qingbao_tables = _parse_tables(qingbao_html)
 
-    h2h = _parse_h2h(analysis_html)
-    home_form = _parse_recent_form(analysis_html, "home", _tables=analysis_tables)
-    away_form = _parse_recent_form(analysis_html, "away", _tables=analysis_tables)
-    injuries = _parse_injuries(qingbao_html, _tables=qingbao_tables)
-    standings = _parse_standings(analysis_html, qingbao_html, _analysis_tables=analysis_tables, _qingbao_tables=qingbao_tables)
-    motivation = _parse_motivation(analysis_html, _tables=analysis_tables)
-    player_stats = _parse_player_stats(analysis_html, _tables=analysis_tables)
+    h2h = _parse_h2h(analysis_html, home_team, away_team)
+    home_form = _parse_recent_form(analysis_html, "home", team_name=home_team, _tables=analysis_tables)
+    away_form = _parse_recent_form(analysis_html, "away", team_name=away_team, _tables=analysis_tables)
+    standings = _parse_standings(
+        analysis_html,
+        qingbao_html,
+        _analysis_tables=analysis_tables,
+        _qingbao_tables=qingbao_tables,
+        home_team=home_team,
+        away_team=away_team,
+    )
+
+    title = await _get_match_title(schedule_id, sport)
+    if not _context_matches_declared_sport(
+        sport=sport,
+        title=title,
+        h2h=h2h,
+        home_form=home_form,
+        away_form=away_form,
+        standings=standings,
+    ):
+        logger.warning(
+            "nowscore context rejected by sport check: sport=%s sid=%s home=%s away=%s title=%s",
+            sport, schedule_id, home_team, away_team, title,
+        )
+        return None
+
+    # 解析额外维度
+    analysis_extra = _parse_injuries_and_features(analysis_html)
+    live_data = _parse_live_data(live_html)
+    trend_data = _parse_odds_trend_tables(trend_html or analysis_html)
 
     # 4. 构建返回
     ctx = {
         "source": "nowscore",
         "schedule_id": schedule_id,
         "sport": sport,
+        "home_team": home_team,
+        "away_team": away_team,
+        "match_title": title,
+        "analysis": {
+            "injuries": analysis_extra.get("injuries") or [],
+            "features": analysis_extra.get("features") or [],
+            "compare": analysis_extra.get("compare") or [],
+        },
+        "live": live_data,
+        "trend": trend_data,
         "h2h": h2h,
         "home_form": home_form,
         "away_form": away_form,
-        "news_injuries": injuries,
         "standings": standings,
-        "motivation": motivation,
-        "player_stats": player_stats,
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
     }
-
-    # 5. 计算完整度
-    dimensions_present = []
-    if h2h.get("matches"):
-        dimensions_present.append("h2h")
-    if home_form.get("matches") or away_form.get("matches"):
-        dimensions_present.append("home_form")
-        dimensions_present.append("away_form")
-    if injuries:
-        dimensions_present.append("injuries")
-    if standings.get("home") or standings.get("away"):
-        dimensions_present.append("standings")
-    if motivation.get("home") or motivation.get("away"):
-        dimensions_present.append("motivation")
-    if player_stats.get("home") or player_stats.get("away"):
-        dimensions_present.append("player_stats")
-
-    all_dims = ["h2h", "home_form", "away_form", "injuries", "player_stats", "motivation", "standings"]
-    dimensions_missing = [d for d in all_dims if d not in dimensions_present]
-    completeness = len(dimensions_present) / len(all_dims)
-
-    ctx["dimensions_present"] = dimensions_present
-    ctx["dimensions_missing"] = dimensions_missing
-    ctx["quality"] = {"source": "nowscore", "completeness": completeness}
+    ctx = _sync_context_dimensions(ctx)
+    if not (ctx.get("dimensions_present") or []):
+        logger.warning(
+            "nowscore context empty after parse: sport=%s sid=%s home=%s away=%s",
+            sport, schedule_id, home_team, away_team,
+        )
+        return None
 
     logger.info(
         "nowscore context: home=%s away=%s sid=%s present=%s completeness=%.2f",
-        home_team, away_team, schedule_id, dimensions_present, completeness,
+        home_team,
+        away_team,
+        schedule_id,
+        ctx.get("dimensions_present") or [],
+        float((ctx.get("quality") or {}).get("completeness") or 0.0),
     )
 
     return ctx
@@ -819,10 +1146,14 @@ async def _parse_one_schedule(
     sport: str = "football",
 ) -> Optional[dict[str, Any]]:
     """解析单场比赛的完整上下文（复用已缓存的 HTML）。"""
-    analysis_html = _html_cache.get(schedule_id, "")
+    analysis_html = _html_cache.get(_html_cache_key(schedule_id, sport), "")
     if not analysis_html:
         analysis_html = await _fetch_analysis_page(schedule_id, sport)
-    qingbao_html = await _fetch_qingbao_page(schedule_id, sport)
+    qingbao_html, live_html, trend_html = await asyncio.gather(
+        _fetch_qingbao_page(schedule_id, sport),
+        _fetch_live_page(schedule_id, sport),
+        _fetch_trend_page(schedule_id, sport),
+    )
 
     if not analysis_html and not qingbao_html:
         return None
@@ -847,50 +1178,61 @@ async def _parse_one_schedule(
     analysis_tables = _parse_tables(analysis_html)
     qingbao_tables = _parse_tables(qingbao_html)
 
-    h2h = _parse_h2h(analysis_html)
-    home_form = _parse_recent_form(analysis_html, "home", _tables=analysis_tables)
-    away_form = _parse_recent_form(analysis_html, "away", _tables=analysis_tables)
-    injuries = _parse_injuries(qingbao_html, _tables=qingbao_tables)
-    standings = _parse_standings(analysis_html, qingbao_html, _analysis_tables=analysis_tables, _qingbao_tables=qingbao_tables)
-    motivation = _parse_motivation(analysis_html, _tables=analysis_tables)
-    player_stats = _parse_player_stats(analysis_html, _tables=analysis_tables)
+    h2h = _parse_h2h(analysis_html, home_team, away_team)
+    home_form = _parse_recent_form(analysis_html, "home", team_name=home_team, _tables=analysis_tables)
+    away_form = _parse_recent_form(analysis_html, "away", team_name=away_team, _tables=analysis_tables)
+    standings = _parse_standings(
+        analysis_html,
+        qingbao_html,
+        _analysis_tables=analysis_tables,
+        _qingbao_tables=qingbao_tables,
+        home_team=home_team,
+        away_team=away_team,
+    )
+
+    title = await _get_match_title(schedule_id, sport)
+    if not _context_matches_declared_sport(
+        sport=sport,
+        title=title,
+        h2h=h2h,
+        home_form=home_form,
+        away_form=away_form,
+        standings=standings,
+    ):
+        logger.warning(
+            "nowscore prefetch rejected by sport check: sport=%s sid=%s home=%s away=%s title=%s",
+            sport, schedule_id, home_team, away_team, title,
+        )
+        return None
+
+    # 解析额外维度
+    analysis_extra = _parse_injuries_and_features(analysis_html)
+    live_data = _parse_live_data(live_html)
+    trend_data = _parse_odds_trend_tables(trend_html or analysis_html)
 
     ctx = {
         "source": "nowscore",
         "schedule_id": schedule_id,
         "sport": sport,
+        "home_team": home_team,
+        "away_team": away_team,
+        "match_title": title,
+        "analysis": {
+            "injuries": analysis_extra.get("injuries") or [],
+            "features": analysis_extra.get("features") or [],
+            "compare": analysis_extra.get("compare") or [],
+        },
+        "live": live_data,
+        "trend": trend_data,
         "h2h": h2h,
         "home_form": home_form,
         "away_form": away_form,
-        "news_injuries": injuries,
         "standings": standings,
-        "motivation": motivation,
-        "player_stats": player_stats,
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
     }
-
-    dimensions_present = []
-    if h2h.get("matches"):
-        dimensions_present.append("h2h")
-    if home_form.get("matches") or away_form.get("matches"):
-        dimensions_present.append("home_form")
-        dimensions_present.append("away_form")
-    if injuries:
-        dimensions_present.append("injuries")
-    if standings.get("home") or standings.get("away"):
-        dimensions_present.append("standings")
-    if motivation.get("home") or motivation.get("away"):
-        dimensions_present.append("motivation")
-    if player_stats.get("home") or player_stats.get("away"):
-        dimensions_present.append("player_stats")
-
-    all_dims = ["h2h", "home_form", "away_form", "injuries", "player_stats", "motivation", "standings"]
-    dimensions_missing = [d for d in all_dims if d not in dimensions_present]
-    completeness = len(dimensions_present) / len(all_dims)
-
-    ctx["dimensions_present"] = dimensions_present
-    ctx["dimensions_missing"] = dimensions_missing
-    ctx["quality"] = {"source": "nowscore", "completeness": completeness}
-
+    ctx = _sync_context_dimensions(ctx)
+    if not (ctx.get("dimensions_present") or []):
+        return None
     return ctx
 
 
@@ -961,12 +1303,18 @@ async def prefetch_today_all_contexts(
                 ctx = await _parse_one_schedule(sid, home, away, sport=sport)
                 if not ctx:
                     return
+                if not (ctx.get("dimensions_present") or []):
+                    return
 
                 # 计算 fixture_key 并保存
                 from app.services.fixture_key import fixture_key
                 from app.services.match_context_store import save_context
 
-                fk = fixture_key(sport, home, away)
+                resolved_home = str(ctx.get("home_team") or home or "").strip()
+                resolved_away = str(ctx.get("away_team") or away or "").strip()
+                if not resolved_home or not resolved_away:
+                    return
+                fk = fixture_key(sport, resolved_home, resolved_away)
                 await save_context(fixture_key=fk, ctx=ctx, ttl_sec=None)
                 success_count += 1
                 await _update_progress(success_count)

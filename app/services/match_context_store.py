@@ -16,19 +16,46 @@ from app.services.sports_data import compute_quality
 logger = logging.getLogger(__name__)
 
 CACHE_PREFIX = "ai:match_ctx:v5:"
+TRACKED_DIMENSIONS = (
+    "h2h",
+    "home_form",
+    "away_form",
+    "standings",
+)
 
 
 def redis_key(fixture_key: str) -> str:
     return f"{CACHE_PREFIX}{fixture_key}"
 
 
+def _sync_dimensions(ctx: dict, quality: dict) -> dict:
+    fields = [
+        str(x).strip()
+        for x in (quality.get("fields_present") or [])
+        if str(x).strip() in TRACKED_DIMENSIONS
+    ]
+    seen: set[str] = set()
+    present: list[str] = []
+    for field in fields:
+        if field not in seen:
+            seen.add(field)
+            present.append(field)
+    missing = [field for field in TRACKED_DIMENSIONS if field not in seen]
+    return {
+        **ctx,
+        "dimensions_present": present,
+        "dimensions_missing": missing,
+        "quality": quality,
+    }
+
+
 def ensure_quality(ctx: dict) -> dict:
     if not isinstance(ctx, dict):
         return {}
     q = ctx.get("quality")
-    if not isinstance(q, dict) or "completeness" not in q:
-        ctx = {**ctx, "quality": compute_quality(ctx)}
-    return ctx
+    if not isinstance(q, dict) or "completeness" not in q or "fields_present" not in q:
+        q = compute_quality(ctx)
+    return _sync_dimensions(dict(ctx), q)
 
 
 async def load_from_redis(fixture_key: str) -> Optional[dict]:

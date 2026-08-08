@@ -203,10 +203,6 @@ services:
       AI_MATCH_CONTEXT_TTL_SEC: ${AI_MATCH_CONTEXT_TTL_SEC:-21600}
       NOWSCORE_PROXY_URL: ${NOWSCORE_PROXY_URL:-http://host.docker.internal:7897}
       AI_ENABLED: ${AI_ENABLED:-true}
-      AI_MAX_BET_PERCENTAGE: ${AI_MAX_BET_PERCENTAGE:-0.05}
-      AI_DAILY_LOSS_LIMIT: ${AI_DAILY_LOSS_LIMIT:-0.20}
-      AI_MIN_CONFIDENCE: ${AI_MIN_CONFIDENCE:-0.75}
-      AI_RISK_LEVEL: ${AI_RISK_LEVEL:-moderate}
       DEFAULT_BET_MODE: ${DEFAULT_BET_MODE:-manual}
       EXECUTION_GATEWAY_ENABLED: ${EXECUTION_GATEWAY_ENABLED:-true}
       MAX_QUOTE_AGE_SEC: ${MAX_QUOTE_AGE_SEC:-30}
@@ -332,10 +328,12 @@ services:
       AI_MATCH_CONTEXT_TTL_SEC: ${AI_MATCH_CONTEXT_TTL_SEC:-21600}
       NOWSCORE_PROXY_URL: ${NOWSCORE_PROXY_URL:-http://host.docker.internal:7897}
       AI_ENABLED: ${AI_ENABLED:-true}
-      AI_MAX_BET_PERCENTAGE: ${AI_MAX_BET_PERCENTAGE:-0.05}
-      AI_DAILY_LOSS_LIMIT: ${AI_DAILY_LOSS_LIMIT:-0.20}
-      AI_MIN_CONFIDENCE: ${AI_MIN_CONFIDENCE:-0.75}
-      AI_RISK_LEVEL: ${AI_RISK_LEVEL:-moderate}
+    healthcheck:
+      test: ["CMD", "python", "-c", "from pathlib import Path; import sys; sys.exit(0 if b'ai_betting_engine.py' in Path('/proc/1/cmdline').read_bytes() else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
     depends_on:
       postgres:
         condition: service_healthy

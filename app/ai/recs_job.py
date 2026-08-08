@@ -50,43 +50,53 @@ def filter_recs_by_bet_mode(
     recommendations: list[dict],
     *,
     bet_mode: str = "manual",
-    min_confidence: float = 0.75,
+    min_confidence: float = 0.0,
     min_odds: float = 1.1,
     max_odds: float | None = 10.0,
     preferred_sports: list[str] | None = None,
     excluded_teams: list[str] | None = None,
+    strat=None,
 ) -> list[dict]:
     """
-    人工 / 自动展示规则一致：严格按配置置信度、赔率、球类偏好、排除球队过滤。
-    另隐藏：比分已超盘口、预计 10 分钟内结束。
+    人工 / 自动展示规则一致：仅保留球类/球队/比赛状态过滤。
+    高胜率模式是否放行，统一交给「亚洲盘口 + 基本面 + 二次复核」决定。
     """
-    from app.ai.analysis_filters import DEFAULT_MAX_ODDS, DEFAULT_MIN_ODDS, rec_skip_reason
-    from app.ai.strategy_gates import apply_rec_display_gates
+    from app.ai.analysis_filters import rec_skip_reason
     from app.ai.strategy import StrategyConfig
 
     _ = bet_mode
-    min_conf = max(0.0, min(0.99, float(min_confidence if min_confidence is not None else 0.75)))
-    min_wr = min_conf * 100.0
-    lo = float(min_odds if min_odds is not None else DEFAULT_MIN_ODDS)
-    hi = float(max_odds) if max_odds is not None else DEFAULT_MAX_ODDS
-    strat = StrategyConfig(min_confidence=min_conf, min_odds=lo, max_odds=hi)
+    _ = min_confidence
+    _ = min_odds
+    _ = max_odds
+    _ = strat if isinstance(strat, StrategyConfig) else None
+
+    prefs = {
+        ("football" if str(x).strip().lower() == "soccer" else str(x).strip().lower())
+        for x in (preferred_sports or [])
+        if str(x).strip()
+    }
+    excluded = [str(x).strip().lower() for x in (excluded_teams or []) if str(x).strip()]
+
     out: list[dict] = []
     for rec in recommendations or []:
         if not isinstance(rec, dict) or rec.get("error"):
             continue
-        why = rec_skip_reason(rec, min_odds=lo, max_odds=hi)
-        if why:
+        why = rec_skip_reason(rec)
+        if why and why != "odds_out_of_range":
             continue
-        why2 = apply_rec_display_gates(
-            rec,
-            strat=strat,
-            preferred=preferred_sports,
-            excluded=excluded_teams,
-        )
-        if why2:
+        sport = str(rec.get("sport") or "").strip().lower()
+        sport = "football" if sport == "soccer" else sport
+        if prefs and sport not in prefs:
             continue
-        if _rec_win_rate(rec) + 1e-9 < min_wr:
+        teams = f"{str(rec.get('home_team') or '').lower()} {str(rec.get('away_team') or '').lower()}"
+        if excluded and any(x in teams for x in excluded):
             continue
+        sig = ((rec.get("recommendation") or {}).get("signal_scores") or {})
+        if isinstance(sig, dict):
+            if bool(sig.get("severe_conflict")):
+                continue
+            if str(sig.get("verdict") or "").strip().lower() == "reject":
+                continue
         out.append(rec)
 
     def _sort_key(rec: dict):
@@ -94,7 +104,7 @@ def filter_recs_by_bet_mode(
         return (
             _rec_win_rate(rec),
             1 if r.get("should_bet") else 0,
-            float(r.get("expected_value") or 0),
+            float(r.get("odds") or 0),
         )
 
     out.sort(key=_sort_key, reverse=True)
@@ -254,7 +264,6 @@ async def list_live_match_ids(
         sort_just_started_first,
         total_odds_meet_min,
     )
-
     lo = min_odds
     hi = max_odds
     preferred: list[str] = []

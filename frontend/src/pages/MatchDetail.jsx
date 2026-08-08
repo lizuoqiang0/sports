@@ -1,12 +1,14 @@
 import { useState, useEffect, useCallback } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { matchesAPI, oddsAPI, aiAPI, bookmakersAPI } from '../lib/api.js'
+import { formatAiRecommendationReason } from '../lib/aiReasoning.js'
+import { extractErrorMessage } from '../lib/httpError.js'
 import { usePagePoll } from '../hooks/usePagePoll.js'
 import { useWebSocket } from '../store/websocket.jsx'
 import toast from 'react-hot-toast'
 import { formatMoney, sportLabel } from '../lib/format.js'
 import {
-  ArrowLeft, Bot, TrendingUp, Loader2,
+  ArrowLeft, Bot, Loader2,
   Shield, AlertTriangle, Target
 } from 'lucide-react'
 
@@ -31,16 +33,39 @@ export default function MatchDetailPage() {
   const loadData = useCallback(async ({ silent = false } = {}) => {
     if (!silent) setLoading(true)
     try {
-      const [matchRes, oddsRes, compareRes] = await Promise.all([
+      const [matchRes, oddsRes, compareRes] = await Promise.allSettled([
         matchesAPI.detail(id),
         oddsAPI.getMatch(id),
-        bookmakersAPI.oddsCompare(id).catch(() => null),
+        bookmakersAPI.oddsCompare(id),
       ])
-      setMatch(matchRes.data)
-      setOdds(normalizeOdds(oddsRes.data, matchRes.data?.odds || []))
-      setCrossOdds(compareRes?.data || null)
-    } catch {
-      if (!silent) toast.error('加载失败')
+
+      if (matchRes.status === 'fulfilled') {
+        setMatch(matchRes.value.data)
+      }
+
+      if (oddsRes.status === 'fulfilled') {
+        const fallbackOdds = matchRes.status === 'fulfilled' ? (matchRes.value.data?.odds || []) : []
+        setOdds(normalizeOdds(oddsRes.value.data, fallbackOdds))
+      } else if (matchRes.status === 'fulfilled') {
+        setOdds(normalizeOdds(matchRes.value.data?.odds || [], []))
+      } else {
+        setOdds([])
+      }
+
+      if (compareRes.status === 'fulfilled') {
+        setCrossOdds(compareRes.value?.data || null)
+      } else {
+        setCrossOdds(null)
+      }
+
+      if (matchRes.status !== 'fulfilled') {
+        throw (matchRes.reason || new Error('赛事信息加载失败'))
+      }
+      if (!silent && (oddsRes.status !== 'fulfilled' || compareRes.status !== 'fulfilled')) {
+        toast.error('部分数据加载失败，已先显示赛事基础信息')
+      }
+    } catch (err) {
+      if (!silent) toast.error(extractErrorMessage(err, '赛事详情加载失败，请稍后重试'))
     } finally {
       if (!silent) setLoading(false)
     }
@@ -98,8 +123,8 @@ export default function MatchDetailPage() {
     try {
       const res = await aiAPI.recommend(id)
       setAiAnalysis(res.data)
-    } catch {
-      toast.error('AI分析暂时不可用')
+    } catch (err) {
+      toast.error(extractErrorMessage(err, 'AI 分析加载失败，请稍后重试'))
     } finally {
       setLoadingAI(false)
     }
@@ -120,6 +145,13 @@ export default function MatchDetailPage() {
   const spreadRows = oddsList.filter((o) => o.bet_type === 'spread' || o.bet_type === 'Spread')
   const totalRows = oddsList.filter((o) => o.bet_type === 'total' || o.bet_type === 'Total')
   const clockLabel = [match.period, match.clock].filter(Boolean).join(' · ')
+  const readableAiReason = aiAnalysis
+    ? formatAiRecommendationReason({
+        recommendation: aiAnalysis.recommendation,
+        analysis: aiAnalysis.analysis,
+        strategy: aiAnalysis.strategy,
+      })
+    : ''
 
   return (
     <div className="page max-w-4xl">
@@ -222,20 +254,19 @@ export default function MatchDetailPage() {
           <div className="space-y-3">
             <div className="bg-white rounded-lg p-3">
               <div className="text-sm text-gray-400 mb-1">分析结论</div>
-              <p className="text-sm">{aiAnalysis.recommendation?.reasoning}</p>
+              <p className="text-sm">{readableAiReason || aiAnalysis.recommendation?.reasoning}</p>
             </div>
 
             <div className="grid grid-cols-4 gap-3">
               <MetricCard
-                label="预期价值"
-                value={`${((aiAnalysis.recommendation?.expected_value || 0) * 100).toFixed(1)}%`}
-                positive={aiAnalysis.recommendation?.expected_value > 0}
-                icon={TrendingUp}
+                label="当前赔率"
+                value={`${Number(aiAnalysis.recommendation?.odds || 0).toFixed(2)}`}
+                icon={Target}
               />
               <MetricCard
-                label="建议本金"
+                label="建议金额"
                 value={`${(aiAnalysis.recommendation?.suggested_stake)?.toFixed(0) || 0}`}
-                icon={Target}
+                icon={ArrowLeft}
               />
               <MetricCard
                 label="置信度"

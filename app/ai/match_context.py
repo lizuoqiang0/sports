@@ -21,10 +21,6 @@ _EMPTY = {
     "h2h": {"matches": [], "summary": {}, "note": "暂无交锋数据"},
     "home_form": {"matches": [], "summary": {}, "note": "暂无近况数据"},
     "away_form": {"matches": [], "summary": {}, "note": "暂无近况数据"},
-    "news_injuries": [],
-    "player_status": [],
-    "player_stats": {"home": [], "away": [], "note": ""},
-    "motivation": {"home": "", "away": "", "notes": []},
     "lineup": {"home": [], "away": [], "formations": {}, "note": ""},
     "standings": {"home": None, "away": None, "note": ""},
     "weather": {"condition": "", "temp_c": None, "humidity": None, "wind": None, "pitch": "", "venue": ""},
@@ -34,10 +30,7 @@ _EMPTY = {
         "h2h",
         "home_form",
         "away_form",
-        "injuries",
         "lineup",
-        "player_stats",
-        "motivation",
         "weather",
         "standings",
     ],
@@ -62,6 +55,21 @@ def _fixture_key_of(match_info: dict) -> str:
     )
 
 
+def _fixture_key_aliases(match_info: dict) -> list[str]:
+    from app.services.fixture_key import fixture_key
+
+    primary = _fixture_key_of(match_info)
+    aliases = [primary] if primary else []
+    plain = fixture_key(
+        str(match_info.get("sport") or "football"),
+        str(match_info.get("home_team") or ""),
+        str(match_info.get("away_team") or ""),
+    )
+    if plain and plain not in aliases:
+        aliases.append(plain)
+    return aliases
+
+
 def empty_match_context(**extra: Any) -> dict:
     out = dict(_EMPTY)
     out["fetched_at"] = datetime.now(timezone.utc).isoformat()
@@ -74,10 +82,6 @@ def _ctx_has_stats(ctx: dict) -> bool:
     h2n = len((ctx.get("h2h") or {}).get("matches") or [])
     hf = len((ctx.get("home_form") or {}).get("matches") or [])
     af = len((ctx.get("away_form") or {}).get("matches") or [])
-    inj = len(ctx.get("news_injuries") or [])
-    ps = len(ctx.get("player_status") or [])
-    pstats = ctx.get("player_stats") or {}
-    mot = ctx.get("motivation") or {}
     lineup = ctx.get("lineup") or {}
     standings = ctx.get("standings") or {}
     weather = ctx.get("weather") or {}
@@ -85,10 +89,6 @@ def _ctx_has_stats(ctx: dict) -> bool:
         h2n
         or hf
         or af
-        or inj
-        or ps
-        or (isinstance(pstats, dict) and (pstats.get("home") or pstats.get("away")))
-        or (isinstance(mot, dict) and (mot.get("home") or mot.get("away") or mot.get("notes")))
         or lineup.get("home")
         or lineup.get("away")
         or standings.get("home")
@@ -115,7 +115,11 @@ async def _persist(match_info: dict, fixture_key: str, ctx: dict) -> dict:
         mid_i = int(mid) if mid is not None else None
     except (TypeError, ValueError):
         mid_i = None
-    return await save_context(fixture_key=fixture_key, ctx=ctx, match_id=mid_i)
+    saved = await save_context(fixture_key=fixture_key, ctx=ctx, match_id=mid_i)
+    for alias in _fixture_key_aliases(match_info):
+        if alias and alias != fixture_key:
+            await save_context(fixture_key=alias, ctx=ctx, match_id=mid_i)
+    return saved
 
 
 async def fetch_match_context(match_info: dict) -> dict:
@@ -129,21 +133,24 @@ async def fetch_match_context(match_info: dict) -> dict:
         return empty_match_context(note="缺少主客队名")
 
     fixture_key = _fixture_key_of(match_info)
+    fixture_keys = _fixture_key_aliases(match_info)
     from app.services.match_context_store import load_from_db, load_from_redis
 
-    try:
-        redis_ctx = await load_from_redis(fixture_key)
-        if redis_ctx and redis_ctx.get("source") == "nowscore" and _ctx_has_stats(redis_ctx):
-            return _finalize(redis_ctx)
-    except Exception as e:
-        logger.debug("match_context redis: %s", e)
+    for fk in fixture_keys:
+        try:
+            redis_ctx = await load_from_redis(fk)
+            if redis_ctx and redis_ctx.get("source") == "nowscore" and _ctx_has_stats(redis_ctx):
+                return _finalize(redis_ctx)
+        except Exception as e:
+            logger.debug("match_context redis: %s", e)
 
-    try:
-        db_ctx = await load_from_db(fixture_key)
-        if db_ctx and db_ctx.get("source") == "nowscore" and _ctx_has_stats(db_ctx):
-            return _finalize(db_ctx)
-    except Exception as e:
-        logger.debug("match_context db: %s", e)
+    for fk in fixture_keys:
+        try:
+            db_ctx = await load_from_db(fk)
+            if db_ctx and db_ctx.get("source") == "nowscore" and _ctx_has_stats(db_ctx):
+                return _finalize(db_ctx)
+        except Exception as e:
+            logger.debug("match_context db: %s", e)
 
     search_ctx = None
     # 1. 优先用捷报比分（结构化数据，覆盖8大维度）

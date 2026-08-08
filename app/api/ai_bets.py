@@ -17,11 +17,81 @@ from app.ai.auto_better import (
     AIBettingEngine, analyze_and_recommend,
     start_user_engine, stop_user_engine, get_engine_status
 )
-from app.ai.strategy import STRATEGIES
-from app.schemas import APIResponse, AIConfigRequest, AIRecommendationResponse
+from app.ai.strategy import (
+    STRATEGIES,
+    ai_config_response_payload,
+    effective_strategy_from_ai_config,
+    strategy_public_payload,
+)
+from app.schemas import APIResponse, AIConfigRequest
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/ai", tags=["AI投注"])
+
+
+def compose_ai_runtime_status(
+    *,
+    status_info: dict | None,
+    user: User,
+) -> dict:
+    """统一 AI 引擎状态与下单模式，避免前端自行拼语义。"""
+    from app.services.bet_mode import get_user_bet_mode, mode_flags
+
+    flags = mode_flags(get_user_bet_mode(user))
+    ai_enabled = bool(getattr(user, "ai_enabled", False))
+    engine_running = bool((status_info or {}).get("running"))
+    is_auto_mode = flags["bet_mode"] == "active"
+
+    if ai_enabled and engine_running and is_auto_mode:
+        effective_state = "auto_running"
+        effective_label = "自动下注引擎运行中"
+        effective_description = "后台正在持续分析；命中高胜率策略后会自动真实下单。"
+        badge_tone = "green"
+    elif ai_enabled and engine_running:
+        effective_state = "manual_running"
+        effective_label = "分析引擎运行中（人工确认）"
+        effective_description = "后台正在持续分析；只生成高胜率推荐，不会自动下单。"
+        badge_tone = "amber"
+    elif ai_enabled:
+        effective_state = "enabled_stopped"
+        effective_label = "已开启 AI 开关，未启动引擎"
+        effective_description = "当前不会自动分析，也不会自动下单；需要点击“启动自动下注引擎”。"
+        badge_tone = "orange"
+    elif is_auto_mode:
+        effective_state = "mode_armed"
+        effective_label = "已切到自动下注模式，未启动引擎"
+        effective_description = "当前只是把下单方式切成自动；还需要点击“启动自动下注引擎”后才会自动真实下单。"
+        badge_tone = "slate"
+    else:
+        effective_state = "disabled"
+        effective_label = "分析/下注引擎未启动"
+        effective_description = "当前不会自动分析，也不会自动下单；如需只看推荐，请先启动分析。"
+        badge_tone = "slate"
+
+    scan_interval_sec = max(30, int(getattr(settings, "AI_SCAN_INTERVAL_SEC", 30) or 30))
+    max_bets_per_cycle = max(1, int(getattr(settings, "AI_MAX_BETS_PER_CYCLE", 3) or 3))
+
+    return {
+        **(status_info or {}),
+        **flags,
+        "ai_enabled": ai_enabled,
+        "engine_enabled": ai_enabled,
+        "engine_running": engine_running,
+        "execution_mode": flags["bet_mode"],
+        "execution_mode_label": flags["label"],
+        "can_generate_recommendations": bool(ai_enabled and engine_running),
+        "can_auto_execute": bool(ai_enabled and engine_running and is_auto_mode),
+        "effective_state": effective_state,
+        "effective_label": effective_label,
+        "effective_description": effective_description,
+        "badge_tone": badge_tone,
+        "runtime_limits": {
+            "scan_interval_sec": scan_interval_sec,
+            "scan_interval_min": round(scan_interval_sec / 60, 2),
+            "max_bets_per_cycle": max_bets_per_cycle,
+            "distinct_matches_per_cycle": True,
+        },
+    }
 
 
 # === AI配置 ===
@@ -34,58 +104,7 @@ async def get_ai_config(
     result = await db.execute(select(AIConfig).where(AIConfig.user_id == current_user.id))
     config = result.scalar_one_or_none()
 
-    from app.config import settings as _settings
-
-    # 仓位上下限严格取自策略「单笔最大金额」，不再用系统 MIN_BET 覆盖
-    max_bet = float(config.max_bet_amount) if config else _settings.AI_STRATEGY_MAX_BET_AMOUNT
-    if max_bet <= 0:
-        max_bet = _settings.AI_STRATEGY_MAX_BET_AMOUNT
-    stake_min = 1.0
-    if not config:
-        return APIResponse(data={
-            "is_active": False,
-            "strategy": "balanced",
-            "max_bet_amount": _settings.AI_STRATEGY_MAX_BET_AMOUNT,
-            "max_daily_bets": _settings.AI_STRATEGY_MAX_DAILY_BETS,
-            "min_confidence": _settings.AI_MIN_CONFIDENCE,
-            "preferred_sports": [],
-            "excluded_teams": [],
-            "stop_loss": _settings.AI_STOP_LOSS,
-            "take_profit": _settings.AI_TAKE_PROFIT,
-            "max_odds": _settings.AI_MAX_ODDS,
-            "min_odds": _settings.AI_MIN_ODDS,
-            "use_llm_analysis": True,
-            "auto_cashout": False,
-            "cashout_threshold": _settings.AI_DEFAULT_CASHOUT_THRESHOLD,
-            "min_bet_amount": stake_min,
-            "one_click_min_stake": stake_min,
-            "environment": _settings.ENVIRONMENT,
-        })
-
-    try:
-        conf_now = float(config.min_confidence or 0)
-    except (TypeError, ValueError):
-        conf_now = 0.0
-
-    return APIResponse(data={
-        "is_active": config.is_active,
-        "strategy": config.strategy,
-        "max_bet_amount": max_bet,
-        "max_daily_bets": config.max_daily_bets,
-        "min_confidence": conf_now,
-        "preferred_sports": config.preferred_sports,
-        "excluded_teams": config.excluded_teams,
-        "stop_loss": float(config.stop_loss),
-        "take_profit": float(config.take_profit),
-        "max_odds": config.max_odds,
-        "min_odds": config.min_odds,
-        "use_llm_analysis": config.use_llm_analysis,
-        "auto_cashout": config.auto_cashout,
-        "cashout_threshold": config.cashout_threshold,
-        "min_bet_amount": stake_min,
-        "one_click_min_stake": stake_min,
-        "environment": _settings.ENVIRONMENT,
-    })
+    return APIResponse(data=ai_config_response_payload(config))
 
 
 @router.put("/config", response_model=APIResponse)
@@ -102,27 +121,45 @@ async def update_ai_config(
         config = AIConfig(user_id=current_user.id)
         db.add(config)
 
-    # 更新字段
-    config.strategy = req.strategy
-    config.max_bet_amount = req.max_bet_amount
-    config.max_daily_bets = req.max_daily_bets
-    try:
-        conf_in = float(req.min_confidence)
-    except (TypeError, ValueError):
-        conf_in = _settings.AI_MIN_CONFIDENCE
-    config.min_confidence = min(0.99, max(0.0, conf_in))
+    from types import SimpleNamespace
+
+    raw_snap = SimpleNamespace(
+        strategy=req.strategy,
+        max_bet_amount=req.max_bet_amount,
+        max_daily_bets=req.max_daily_bets,
+        min_confidence=req.min_confidence,
+        preferred_sports=req.preferred_sports,
+        excluded_teams=req.excluded_teams,
+        stop_loss=req.stop_loss,
+        take_profit=req.take_profit,
+        max_odds=req.max_odds,
+        min_odds=req.min_odds,
+        use_llm_analysis=req.use_llm_analysis,
+        auto_cashout=req.auto_cashout,
+        cashout_threshold=req.cashout_threshold,
+        is_active=True,
+    )
+    effective = effective_strategy_from_ai_config(raw_snap)
+
+    # 更新字段：落库即保存“生效值”，避免 UI 展示值与运行时生效值不一致
+    config.strategy = effective.name
+    config.max_bet_amount = effective.max_bet_amount
+    config.max_daily_bets = effective.max_daily_bets
+    config.min_confidence = effective.min_confidence
     config.preferred_sports = req.preferred_sports
     config.excluded_teams = req.excluded_teams
     config.stop_loss = req.stop_loss
     config.take_profit = req.take_profit
-    config.max_odds = req.max_odds
-    config.min_odds = req.min_odds
-    config.use_llm_analysis = req.use_llm_analysis
+    config.max_odds = effective.max_odds
+    config.min_odds = effective.min_odds
+    config.use_llm_analysis = effective.use_llm_analysis
     config.auto_cashout = req.auto_cashout
     config.cashout_threshold = req.cashout_threshold
 
     await db.flush()
     await db.commit()
+
+    response_payload = ai_config_response_payload(config)
 
     # 配置热更新：清推荐缓存 + 通知引擎/前端立即按新阈值生效
     try:
@@ -151,15 +188,7 @@ async def update_ai_config(
             {
                 "type": "ai_config_updated",
                 "data": {
-                    "strategy": config.strategy,
-                    "min_confidence": float(config.min_confidence or 0),
-                    "min_odds": float(config.min_odds or 0),
-                    "max_odds": float(config.max_odds or 0),
-                    "max_bet_amount": float(config.max_bet_amount or 0),
-                    "max_daily_bets": int(config.max_daily_bets or 0),
-                    "stop_loss": float(config.stop_loss or 0),
-                    "take_profit": float(config.take_profit or 0),
-                    "use_llm_analysis": bool(config.use_llm_analysis),
+                    **response_payload,
                 },
             },
         )
@@ -168,16 +197,7 @@ async def update_ai_config(
 
     return APIResponse(
         message="AI配置更新成功，已立即生效",
-        data={
-            "strategy": config.strategy,
-            "min_confidence": float(config.min_confidence or 0),
-            "min_odds": float(config.min_odds or 0),
-            "max_odds": float(config.max_odds or 0),
-            "max_bet_amount": float(config.max_bet_amount or 0),
-            "max_daily_bets": int(config.max_daily_bets or 0),
-            "stop_loss": float(config.stop_loss or 0),
-            "take_profit": float(config.take_profit or 0),
-        },
+        data=response_payload,
     )
 
 
@@ -189,8 +209,6 @@ async def start_ai(
     db: AsyncSession = Depends(get_db),
 ):
     """启动/停止AI自动投注。是否自动真实下单由用户「人工/自动」开关决定。"""
-    from app.services.bet_mode import get_user_bet_mode, mode_flags
-
     current_user.ai_enabled = enabled
     await db.flush()
 
@@ -202,7 +220,7 @@ async def start_ai(
             cfg = AIConfig(
                 user_id=current_user.id,
                 is_active=True,
-                strategy="balanced",
+                strategy="high_win_rate",
                 preferred_sports=["football", "basketball"],
             )
             db.add(cfg)
@@ -212,18 +230,25 @@ async def start_ai(
                 cfg.preferred_sports = ["football", "basketball"]
         await db.flush()
 
-        result = await start_user_engine(current_user.id)
-        flags = mode_flags(get_user_bet_mode(current_user))
+        await start_user_engine(current_user.id)
+        result = compose_ai_runtime_status(
+            status_info=await get_engine_status(current_user.id),
+            user=current_user,
+        )
         await db.commit()
         return APIResponse(
             message=(
-                f"AI引擎已启动（当前{flags['label']}模式："
-                f"{'自动真实下单' if flags['auto_execute'] else '仅推荐，需人工确认'}）"
+                f"AI引擎已启动（{result['effective_label']}："
+                f"{'自动真实下单' if result['can_auto_execute'] else '仅推荐，需人工确认'}）"
             ),
-            data={**result, **flags},
+            data=result,
         )
     else:
-        result = await stop_user_engine(current_user.id)
+        await stop_user_engine(current_user.id)
+        result = compose_ai_runtime_status(
+            status_info=await get_engine_status(current_user.id),
+            user=current_user,
+        )
         await db.commit()
         return APIResponse(message="AI引擎已停止", data=result)
 
@@ -236,7 +261,11 @@ async def stop_ai(
     """停止AI引擎"""
     current_user.ai_enabled = False
     await db.flush()
-    result = await stop_user_engine(current_user.id)
+    await stop_user_engine(current_user.id)
+    result = compose_ai_runtime_status(
+        status_info=await get_engine_status(current_user.id),
+        user=current_user,
+    )
     await db.commit()
     return APIResponse(message="AI引擎已停止", data=result)
 
@@ -247,12 +276,18 @@ async def ai_status(
     db: AsyncSession = Depends(get_db),
 ):
     """获取AI引擎运行状态（含人工/自动开关）"""
-    from app.services.bet_mode import get_user_bet_mode, mode_flags
-
-    status_info = await get_engine_status(current_user.id)
     fresh = await db.get(User, current_user.id)
-    flags = mode_flags(get_user_bet_mode(fresh or current_user))
-    return APIResponse(data={**status_info, **flags})
+    status_info = await get_engine_status(current_user.id)
+    ai_enabled = bool(getattr(fresh or current_user, "ai_enabled", False))
+    # 用户已关闭 AI 时，清理可能残留的跨 worker 运行标记，避免刷新后按钮/横幅错态
+    if not ai_enabled and bool(status_info.get("running")):
+        await stop_user_engine(current_user.id)
+        status_info = {"running": False}
+    runtime = compose_ai_runtime_status(
+        status_info=status_info,
+        user=fresh or current_user,
+    )
+    return APIResponse(data=runtime)
 
 
 # === AI推荐 ===
@@ -312,9 +347,9 @@ async def get_batch_recommendations(
     limit = max(1, min(int(limit or default_lim), _settings.AI_RECS_MAX_LIMIT))
     bet_mode = get_user_bet_mode(current_user)
     ai_snap, strat_cfg = await load_fresh_strategy(current_user.id)
-    min_conf = float(getattr(strat_cfg, "min_confidence", _settings.AI_MIN_CONFIDENCE) or _settings.AI_MIN_CONFIDENCE)
-    min_odds = float(getattr(strat_cfg, "min_odds", _settings.AI_MIN_ODDS) or _settings.AI_MIN_ODDS)
-    max_odds = float(getattr(strat_cfg, "max_odds", _settings.AI_MAX_ODDS) or _settings.AI_MAX_ODDS)
+    min_conf = float(getattr(strat_cfg, "min_confidence", 0.0) or 0.0)
+    min_odds = float(getattr(strat_cfg, "min_odds", 1.1) or 1.1)
+    max_odds = float(getattr(strat_cfg, "max_odds", 10.0) or 10.0)
     preferred_sports = list(getattr(ai_snap, "preferred_sports", None) or [])
     excluded_teams = list(getattr(ai_snap, "excluded_teams", None) or [])
     watching = await is_analysis_watching(current_user.id, sport_norm)
@@ -359,9 +394,9 @@ async def get_batch_recommendations(
 
     analyzing = job.get("status") in ("starting", "analyzing")
     filter_hint = (
-        f"后台分析中 · 严格按配置：胜率≥{min_conf * 100:.0f}% · 赔率[{min_odds:g},{max_odds:g}] · 跳过已超盘/临近结束 · 刚开赛优先"
+        f"后台分析中 · 每 30 秒轮询滚球 · 亚洲盘口 + 捷报数据对比 · 胜率≥{min_conf * 100:.0f}% · 赔率[{min_odds:g},{max_odds:g}]"
         if watching
-        else f"点击「开始分析」；人工/自动均按配置运行：胜率≥{min_conf * 100:.0f}% · 赔率[{min_odds:g},{max_odds:g}]"
+        else f"点击「开始分析」；系统会每 30 秒轮询滚球，按亚洲盘口 + 捷报数据对比，达到胜率≥{min_conf * 100:.0f}% 才放行"
     )
 
     if isinstance(cached, dict) and "recommendations" in cached:
@@ -380,6 +415,7 @@ async def get_batch_recommendations(
             max_odds=max_odds,
             preferred_sports=preferred_sports,
             excluded_teams=excluded_teams,
+            strat=strat_cfg,
         )
         payload = dict(cached)
         payload.update(
@@ -486,24 +522,13 @@ async def stop_recommendations_analysis(
     return APIResponse(data=snap, message="analysis_stopped")
 
 
-# === 策略预设 ===
+# === 唯一高胜率策略 ===
 @router.get("/strategies", response_model=APIResponse)
 async def list_strategies():
-    """获取预设策略列表"""
+    """获取唯一高胜率策略信息"""
     strategies = {}
     for name, config in STRATEGIES.items():
-        strategies[name] = {
-            "name": config.name,
-            "description": {
-                "conservative": "保守策略 - 高置信度、小仓位、严风控",
-                "balanced": "平衡策略 - 攻守兼备、适中仓位",
-                "aggressive": "激进策略 - 高仓位、接受冷门、高回报",
-            }.get(name, ""),
-            "max_bet_percentage": config.max_bet_percentage,
-            "min_confidence": config.min_confidence,
-            "max_daily_loss_percentage": config.max_daily_loss_percentage,
-            "kelly_fraction_cap": config.kelly_fraction_cap,
-        }
+        strategies[name] = strategy_public_payload(config)
     return APIResponse(data=strategies)
 
 
@@ -550,6 +575,7 @@ async def ai_bet_history(
 class OneClickBetRequest(BaseModel):
     stake: float = settings.AI_DEFAULT_STAKE
     markets: list[str] = []  # 支持 total/moneyline/spread
+    dry_run: bool = False
 
 
 @router.post("/one-click-bet/{match_id}", response_model=APIResponse)
@@ -568,7 +594,7 @@ async def one_click_bet(
     if not match:
         raise HTTPException(status_code=404, detail="赛事不存在")
 
-    # 优先使用「开始分析」缓存的可投推荐，避免一键复检 LLM/EV 与列表不一致
+    # 优先使用「开始分析」缓存的可投推荐，避免一键复检与列表不一致
     rec = None
     try:
         from app.core.cache import cache
@@ -599,6 +625,17 @@ async def one_click_bet(
             raise HTTPException(status_code=400, detail=f"AI分析失败: {e}")
 
     if rec.get("error"):
+        if req.dry_run:
+            return APIResponse(
+                message="dry-run 已拦截：当前比赛不满足一键下注条件",
+                data={
+                    "dry_run": True,
+                    "eligible": False,
+                    "match_id": match_id,
+                    "block_reason": str(rec["error"]),
+                    "recommendation": rec.get("recommendation") or {},
+                },
+            )
         raise HTTPException(status_code=400, detail=str(rec["error"]))
 
     from app.ai.strategy_gates import gate_recommendation_for_place, stake_bounds
@@ -622,6 +659,18 @@ async def one_click_bet(
         user_id=current_user.id, rec=rec, stake=stake, db=db
     )
     if not ok_gate:
+        if req.dry_run:
+            return APIResponse(
+                message="dry-run 已拦截：未通过策略配置",
+                data={
+                    "dry_run": True,
+                    "eligible": False,
+                    "match_id": match_id,
+                    "block_reason": str(why_gate),
+                    "stake": float(stake),
+                    "recommendation": rec.get("recommendation") or {},
+                },
+            )
         raise HTTPException(status_code=400, detail=f"未通过策略配置: {why_gate}")
 
     allowed_mkt = {"total", "moneyline", "spread"}
@@ -666,7 +715,7 @@ async def one_click_bet(
                 odds=float(single["odds"]),
                 provider=provider_code,
             )
-            resp = await place_bet(bet_req, db=db, current_user=current_user)
+            resp = await place_bet(bet_req, db=db, current_user=current_user, dry_run=bool(req.dry_run))
             data = getattr(resp, "data", None) or {}
             if isinstance(resp, dict):
                 data = resp.get("data") or resp
@@ -678,6 +727,10 @@ async def one_click_bet(
                 "provider": provider_label,
                 "provider_code": provider_code,
                 "status": (data or {}).get("status") or "pending",
+                "dry_run": bool((data or {}).get("dry_run") or req.dry_run),
+                "potential_payout": float((data or {}).get("potential_payout") or 0),
+                "site_balance": float((data or {}).get("site_balance") or 0),
+                "place_payload": (data or {}).get("place_payload") or {},
             })
         except HTTPException as he:
             failed_bets.append({"market": bt, "error": he.detail})
@@ -686,10 +739,22 @@ async def one_click_bet(
             logger.warning("一键单边投注失败 market=%s site=%s: %s", bt, provider_code, e)
 
     if not placed_bets and failed_bets:
+        if req.dry_run:
+            return APIResponse(
+                message="dry-run 已完成，但当前无可提交注单",
+                data={
+                    "dry_run": True,
+                    "eligible": False,
+                    "match_id": match_id,
+                    "failed": failed_bets,
+                    "recommendation": rec.get("recommendation") or {},
+                },
+            )
         raise HTTPException(status_code=400, detail=f"全部下注失败: {failed_bets}")
 
     total_stake = sum(b["stake"] for b in placed_bets)
-    msg = f"单边成功 {len(placed_bets)} 笔"
+    mode_label = "dry-run 模拟通过" if req.dry_run else "单边成功"
+    msg = f"{mode_label} {len(placed_bets)} 笔"
     if failed_bets:
         msg += f"，失败 {len(failed_bets)} 笔"
 
@@ -702,5 +767,6 @@ async def one_click_bet(
             "success_count": len(placed_bets),
             "failed_count": len(failed_bets),
             "provider": "平博",
+            "dry_run": bool(req.dry_run),
         },
     )

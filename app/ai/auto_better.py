@@ -9,6 +9,8 @@ AI 自动投注引擎 - 主调度器
 5. 风控监控 (止损/止盈/限额)
 6. 记录 AI 决策日志
 """
+from __future__ import annotations
+
 import asyncio
 import logging
 from datetime import datetime, timezone
@@ -56,11 +58,10 @@ _LIVE_ANALYZE_CONCURRENCY = max(
 
 def _decision_profit_score(d: BetDecision) -> tuple:
     """
-    利益最大化排序键（越大越优先）：
-    1) 期望利润 = 仓位 × (胜率×赔率 - 1)
-    2) 期望边际 EV = 胜率×赔率 - 1
-    3) 胜率（置信度）
-    4) 赔率
+    高胜率排序键（越大越优先）：
+    1) 胜率（置信度）
+    2) 赔率
+    3) 仓位
     """
     conf = float(getattr(d, "confidence", 0) or 0)
     if conf > 1.0:
@@ -70,19 +71,11 @@ def _decision_profit_score(d: BetDecision) -> tuple:
         odds = float(getattr(d, "odds", 0) or 0)
     except (TypeError, ValueError):
         odds = 0.0
-    edge = (conf * odds - 1.0) if odds > 1.0 else -1.0
-    # 若决策里已有 EV，取两者较大值，避免被偏低缓存 EV 误伤
-    try:
-        stored_ev = float(getattr(d, "expected_value", 0) or 0)
-    except (TypeError, ValueError):
-        stored_ev = 0.0
-    edge = max(edge, stored_ev)
     try:
         stake = float(getattr(d, "suggested_stake", 0) or 0)
     except (TypeError, ValueError):
         stake = 0.0
-    exp_profit = edge * stake if stake > 0 else edge
-    return (exp_profit, edge, conf, odds)
+    return (conf, odds, stake)
 
 
 class AIBettingEngine:
@@ -121,12 +114,12 @@ class AIBettingEngine:
         logger.info(f"AI投注引擎停止: user={self.user_id}")
 
     async def _main_loop(self):
-        """主循环：分析/下单一轮后休眠（默认 10 分钟）"""
+        """主循环：分析/下单一轮后休眠（默认 30 秒）"""
         while self.is_running:
             try:
                 await self._run_cycle()
-                # 每轮间隔：默认 600s=10 分钟（热读 settings，改 .env 后重启生效）
-                interval = max(60, int(getattr(settings, "AI_SCAN_INTERVAL_SEC", 600) or 600))
+                # 每轮间隔：默认 30s（热读 settings，改 .env 后重启生效）
+                interval = max(30, int(getattr(settings, "AI_SCAN_INTERVAL_SEC", 30) or 30))
                 logger.info("AI 引擎本轮结束，%s 秒后下一轮", interval)
                 await asyncio.sleep(interval)
             except asyncio.CancelledError:
@@ -147,7 +140,6 @@ class AIBettingEngine:
         candidates: list[dict] = []
         bet_mode = "manual"
         auto_place = False
-        remaining_daily = 0
         spendable = Decimal("0")
         daily_loss_amt = Decimal("0")
         active_count = 0
@@ -207,11 +199,8 @@ class AIBettingEngine:
             fixture_groups = [[int(m.id) for m in g] for g in groups]
 
             logger.info(
-                "本轮策略 user=%s conf>=%.0f%% odds=[%.2f,%.2f] stake<=%s daily<=%s stop=%s tp=%s",
+                "本轮策略 user=%s stake<=%s daily<=%s stop=%s tp=%s",
                 self.user_id,
-                strat_cfg.min_confidence * 100,
-                strat_cfg.min_odds,
-                strat_cfg.max_odds,
                 strat_cfg.max_bet_amount,
                 strat_cfg.max_daily_bets,
                 strat_cfg.stop_loss,
@@ -220,15 +209,6 @@ class AIBettingEngine:
             daily_loss = await self._calc_daily_pnl(db, user)
             daily_loss_amt = abs(daily_loss) if daily_loss < 0 else Decimal("0")
             active_count = await self._count_active_bets(db, user)
-            today_count = await self._count_today_bets(db, user)
-            remaining_daily = max(0, int(strat_cfg.max_daily_bets) - int(today_count))
-            if remaining_daily <= 0:
-                logger.info(
-                    "已达每日投注上限: %s/%s",
-                    today_count,
-                    strat_cfg.max_daily_bets,
-                )
-                return
             spendable = await self._spendable_balance(db, user)
             if spendable < settings.AI_MIN_BALANCE:
                 logger.info("可用余额不足: %s", spendable)
@@ -261,23 +241,13 @@ class AIBettingEngine:
         for item in analyses:
             rec = item.get("recommendation") or {}
             sel = str(rec.get("selection") or "").lower()
-            bt = str(rec.get("bet_type") or (item.get("analysis") or {}).get("bet_type") or "total").lower()
-            allowed = {
-                "total": {"over", "under"},
-                "moneyline": {"home", "away", "draw"},
-                "spread": {"home", "away"},
-            }
-            if sel not in allowed.get(bt, ()):
+            if sel not in ("over", "under"):
                 continue
+            bt = "total"
             odds_map = dict(item.get("current_odds") or {})
             if rec.get("odds"):
                 odds_map[sel] = float(rec["odds"])
             conf = float(rec.get("confidence") or (item.get("analysis") or {}).get("confidence") or 0)
-            # EV: 优先用分析结果的去 vig EV，其次用推荐结果
-            analysis_ev = float((item.get("analysis") or {}).get("expected_value") or 0)
-            mkt_ev = float(rec.get("expected_value") or 0)
-            if analysis_ev != 0 and (item.get("analysis") or {}).get("consensus_reached"):
-                mkt_ev = analysis_ev
             decision = await user_engine.evaluate_bet(
                 match_info={
                     "id": int(item["match_id"]),
@@ -286,21 +256,21 @@ class AIBettingEngine:
                     "home_team": item.get("home_team"),
                     "away_team": item.get("away_team"),
                     "league": item.get("league"),
+                    "sport": item.get("sport"),
+                    "period": item.get("period"),
+                    "clock": item.get("clock"),
+                    "home_score": item.get("home_score"),
+                    "away_score": item.get("away_score"),
                 },
                 analysis={
                     **(item.get("analysis") or {}),
                     "prediction": sel,
                     "bet_type": bt,
                     "confidence": conf,
-                    "expected_value": mkt_ev,
                     "odds": float(rec.get("odds") or 0),
                     "provider_code": str(rec.get("provider_code") or ""),
                     "line": rec.get("line"),
-                    "kelly_fraction": float((item.get("analysis") or {}).get("kelly_fraction") or 0),
-                    "ev_passed": True,
-                    "consensus_reached": bool(
-                        (item.get("analysis") or {}).get("consensus_reached")
-                    ),
+                    "consensus_reached": bool((item.get("analysis") or {}).get("consensus_reached")),
                     "reasoning": str(rec.get("reasoning") or ""),
                 },
                 user_balance=spendable,
@@ -309,30 +279,16 @@ class AIBettingEngine:
             )
             if decision.should_bet:
                 logger.info(
-                    "✅ 策略通过 | match=%s %s vs %s | %s/%s | conf=%.2f odds=%.2f EV=%.4f kelly=%.2f stake=$%s",
+                    "✅ 策略通过 | match=%s %s vs %s | %s/%s | conf=%.2f odds=%.2f stake=$%s",
                     item.get("match_id"), item.get("home_team", "?"), item.get("away_team", "?"),
                     decision.bet_type, decision.selection,
                     float(decision.confidence or 0), float(decision.odds or 0),
-                    float(decision.expected_value or 0), float(decision.kelly_fraction or 0),
                     decision.suggested_stake,
                 )
-                from app.ai.strategy_gates import stake_bounds
-
-                _lo, max_amt = stake_bounds(strat_cfg)
                 stake = Decimal(str(decision.suggested_stake or 0))
-                if stake < _lo:
-                    stake = max_amt
-                stake = min(stake, max_amt, spendable)
-                if stake < _lo or stake > max_amt:
-                    decision = decision.model_copy(
-                        update={
-                            "should_bet": False,
-                            "suggested_stake": Decimal("0"),
-                            "reasoning": f"[不投注] 仓位须在 [{_lo:g},{max_amt:g}]（策略单笔上限）",
-                        }
-                    )
-                else:
-                    decision = decision.model_copy(update={"suggested_stake": stake})
+                if stake < Decimal("1.00"):
+                    stake = Decimal("1.00")
+                decision = decision.model_copy(update={"suggested_stake": stake})
             if not decision.should_bet:
                 # 拒绝日志已在 strategy._reject 中输出，此处仅补充比赛名称
                 logger.debug(
@@ -346,7 +302,6 @@ class AIBettingEngine:
                     "should_bet": bool(decision.should_bet),
                     "confidence": float(decision.confidence or conf),
                     "win_rate": round(float(decision.confidence or conf) * 100, 1),
-                    "expected_value": float(decision.expected_value or mkt_ev),
                     "suggested_stake": float(decision.suggested_stake or 0),
                     "reasoning": decision.reasoning,
                     "selection": decision.selection,
@@ -398,19 +353,13 @@ class AIBettingEngine:
 
         approved.sort(key=_decision_profit_score, reverse=True)
         max_per_cycle = max(1, int(getattr(settings, "AI_MAX_BETS_PER_CYCLE", 3) or 3))
-        cycle_cap = min(remaining_daily, max_per_cycle)
+        cycle_cap = max_per_cycle
         seen_matches: set[int] = set()
         top_bets: list[BetDecision] = []
         for d in approved:
             mid = int(d.match_id or 0)
             if mid <= 0 or mid in seen_matches:
                 continue
-            conf = float(d.confidence or 0)
-            if conf > 1:
-                conf /= 100.0
-            od = float(d.odds or 0)
-            edge = round(conf * od - 1.0, 4) if od > 1 else float(d.expected_value or 0)
-            d = d.model_copy(update={"expected_value": edge})
             seen_matches.add(mid)
             top_bets.append(d)
             if len(top_bets) >= cycle_cap:
@@ -418,21 +367,21 @@ class AIBettingEngine:
         for i, d in enumerate(top_bets, 1):
             sc = _decision_profit_score(d)
             logger.info(
-                "本轮优选#%s match=%s sel=%s odds=%.3f wr=%.1f%% EV=%.4f exp_profit=%.2f",
+                "本轮优选#%s match=%s sel=%s odds=%.3f wr=%.1f%% rank=(%.3f,%.3f,%.2f)",
                 i,
                 d.match_id,
                 d.selection,
                 float(d.odds or 0),
                 float(d.confidence or 0) * (100 if float(d.confidence or 0) <= 1 else 1),
-                float(d.expected_value or 0),
-                sc[0],
+                float(sc[0] or 0),
+                float(sc[1] or 0),
+                float(sc[2] or 0),
             )
         logger.info(
-            "本轮候选可投 %s → 利益最大化取 %s 场不同比赛（上限 %s，日剩余 %s）",
+            "本轮候选可投 %s → 按胜率优先取 %s 场不同比赛（上限 %s）",
             len(approved),
             len(top_bets),
             max_per_cycle,
-            remaining_daily,
         )
 
         # --- Phase 3: 新会话执行下单 ---
@@ -445,14 +394,12 @@ class AIBettingEngine:
                 return
             # 预加载策略/风控/今日注单数，避免循环内重复查询
             ai_config, strat_cfg = await load_fresh_strategy(self.user_id)
-            today_count = 0
             should_stop = True
             reason = ""
             if not ai_config:
                 strat_cfg = None
             else:
                 strategy_engine.config = strat_cfg
-                today_count = await self._count_today_bets(db, user)
                 should_stop, reason = await self._check_risk(db, user, ai_config)
                 if should_stop:
                     logger.info("执行中触发风控，停止本轮: %s", reason)
@@ -469,14 +416,6 @@ class AIBettingEngine:
                     continue
                 if not ai_config or should_stop:
                     break
-                if today_count >= int(strat_cfg.max_daily_bets):
-                    logger.info("已达每日投注上限，停止本轮")
-                    break
-                capped = min(
-                    Decimal(str(decision.suggested_stake or 0)),
-                    Decimal(str(strat_cfg.max_bet_amount)),
-                )
-                decision = decision.model_copy(update={"suggested_stake": capped})
                 ok_pass, why = decision_passes_strategy(decision, strat_cfg)
                 if not ok_pass:
                     logger.info("最新策略拦截 match=%s: %s", decision.match_id, why)
@@ -511,7 +450,6 @@ class AIBettingEngine:
                     ai_config, strat_cfg = await load_fresh_strategy(self.user_id)
                     if ai_config:
                         strategy_engine.config = strat_cfg
-                    today_count += 1
             await db.commit()
 
         await self._notify(self.user_id, "cycle_complete", {
@@ -606,13 +544,9 @@ class AIBettingEngine:
             return any(same_fixture(m, bm) for bm in bet_matches)
 
         from app.ai.analysis_filters import skip_reason_for_match, sort_just_started_first
-        from app.ai.strategy import effective_strategy_from_ai_config
 
         from app.ai.strategy_gates import team_is_excluded
 
-        scan_strat = effective_strategy_from_ai_config(ai_config)
-        min_od = float(scan_strat.min_odds)
-        max_od = float(scan_strat.max_odds)
         excluded = list(getattr(ai_config, "excluded_teams", None) or [])
 
         # 刚开赛优先扫描
@@ -633,7 +567,7 @@ class AIBettingEngine:
                 continue
             # Pre-check skip reasons that don't need odds (ending_soon, china_match)
             # to avoid loading odds for matches that will be skipped anyway
-            why = skip_reason_for_match(m, None, min_odds=min_od, max_odds=max_od)
+            why = skip_reason_for_match(m, None)
             if why:
                 logger.debug("scan skip match=%s reason=%s", m.id, why)
                 continue
@@ -653,12 +587,13 @@ class AIBettingEngine:
                 m,
                 total_line,
                 odds_map={"markets": markets_odds, **odds},
-                min_odds=min_od,
-                max_odds=max_od,
             )
             if why:
-                logger.debug("scan skip match=%s reason=%s", m.id, why)
-                continue
+                if why == "odds_out_of_range":
+                    why = None
+                else:
+                    logger.debug("scan skip match=%s reason=%s", m.id, why)
+                    continue
 
             candidates.append({
                 "id": m.id,
@@ -736,28 +671,6 @@ class AIBettingEngine:
             return False
         strat_cfg = effective_strategy_from_ai_config(ai_config)
         strategy_engine.config = strat_cfg
-
-        # 策略硬门槛：置信度 / 赔率 / 日限额 / 仓位
-        if float(decision.confidence or 0) + 1e-9 < float(strat_cfg.min_confidence):
-            logger.warning(
-                "⚠️ 下单拒绝 | match=%s | 门禁=置信度不足 | conf=%.2f < 策略%.2f",
-                decision.match_id, float(decision.confidence or 0), strat_cfg.min_confidence,
-            )
-            return False
-        odds_v = float(decision.odds or 0)
-        if odds_v + 1e-9 < float(strat_cfg.min_odds) or odds_v - 1e-9 > float(strat_cfg.max_odds):
-            logger.warning(
-                "⚠️ 下单拒绝 | match=%s | 门禁=赔率越界 | odds=%.2f 不在[%.1f, %.1f]",
-                decision.match_id, odds_v, float(strat_cfg.min_odds), float(strat_cfg.max_odds),
-            )
-            return False
-        today_count = await self._count_today_bets(db, user)
-        if today_count >= int(strat_cfg.max_daily_bets):
-            logger.warning(
-                "⚠️ 下单拒绝 | match=%s | 门禁=每日上限 | 今日已下%d/%s",
-                decision.match_id, today_count, strat_cfg.max_daily_bets,
-            )
-            return False
 
         odds_result = await db.execute(
             select(Match).where(Match.id == decision.match_id)
@@ -902,47 +815,21 @@ class AIBettingEngine:
             )
             return False
 
-        # 赔率变动检测：最新赔率与决策赔率不一致时，检查是否低于最低赔率
+        # 赔率变动只记录不拦截，避免分析通过后被市场波动再次挡回去
         decision_odds = float(decision.odds or 0)
         if decision_odds > 0 and abs(current_odds - decision_odds) > 0.05:
-            # 赔率逆向变动（上升）：市场不认可我们的方向，放弃下注
             if current_odds > decision_odds + 0.05:
-                logger.warning(
-                    "⚠️ 下单拒绝 | match=%s | 门禁=赔率逆向变动 | 决策=%.2f 最新=%.2f 变动=+%.1f%% | 市场不认可",
+                logger.info(
+                    "📋 赔率上调 | match=%s | 决策=%.2f 最新=%.2f | 继续使用最新赔率",
                     decision.match_id, decision_odds, current_odds,
-                    (current_odds - decision_odds) / decision_odds * 100,
                 )
-                await self._notify(user.id, "bet_failed", {
-                    "match_id": decision.match_id,
-                    "message": f"赔率逆向变动 {decision_odds:.2f}→{current_odds:.2f}，市场不认可，放弃下注",
-                })
-                return False
-            if current_odds + 1e-9 < float(strat_cfg.min_odds):
-                logger.warning(
-                    "⚠️ 下单拒绝 | match=%s | 门禁=赔率低于下限 | 决策=%.2f 最新=%.2f min=%.1f",
-                    decision.match_id, decision_odds, current_odds, float(strat_cfg.min_odds),
+            else:
+                logger.info(
+                    "📋 赔率变动 | match=%s | 决策=%.2f 最新=%.2f | 继续使用最新赔率",
+                    decision.match_id, decision_odds, current_odds,
                 )
-                await self._notify(user.id, "bet_failed", {
-                    "match_id": decision.match_id,
-                    "message": f"赔率降至 {current_odds:.2f}，低于最低赔率 {strat_cfg.min_odds}",
-                })
-                return False
-            logger.info(
-                "📋 赔率变动可接受 | match=%s | 决策=%.2f 最新=%.2f (使用最新赔率)",
-                decision.match_id, decision_odds, current_odds,
-            )
 
-        # 异常高赔率校验：超过策略 max_odds 上限时拒绝下单
-        if current_odds > float(strat_cfg.max_odds):
-            logger.warning(
-                "⚠️ 下单拒绝 | match=%s | 门禁=异常高赔率 | type=%s sel=%s odds=%.2f > %.1f",
-                decision.match_id, bet_type, sel, current_odds, float(strat_cfg.max_odds),
-            )
-            await self._notify(user.id, "bet_failed", {
-                "match_id": decision.match_id,
-                    "message": f"赔率 {current_odds:.2f} 超过策略上限 {strat_cfg.max_odds:.1f}，跳过下单",
-            })
-            return False
+        # AI 分析已决定，直接下单
 
         site_res = await db.execute(
             select(BookmakerAccount).where(
@@ -965,17 +852,9 @@ class AIBettingEngine:
             })
             return False
 
-        from app.ai.strategy_gates import stake_bounds
-
-        _lo, max_amt = stake_bounds(strat_cfg)
-        max_amt = max_amt.quantize(Decimal("0.01"))
-        stake = min(Decimal(str(decision.suggested_stake)).quantize(Decimal("0.01")), max_amt)
-        if stake < _lo:
-            # 默认用策略单笔上限
-            stake = max_amt
-        if stake < _lo or stake > max_amt:
-            logger.info("拒绝下单：仓位 %s 不在策略区间 [%s,%s]", stake, _lo, max_amt)
-            return False
+        stake = Decimal(str(decision.suggested_stake or strat_cfg.max_bet_amount or 1)).quantize(Decimal("0.01"))
+        if stake < Decimal("1.00"):
+            stake = Decimal("1.00")
         if float(site_acc.balance or 0) < float(stake):
             logger.warning("站点余额不足: need=%s, have=%s", stake, site_acc.balance)
             return False
@@ -1032,19 +911,6 @@ class AIBettingEngine:
                         )
                     except (TypeError, ValueError):
                         pass
-                # 赔率低于最低赔率 -> 放弃补单
-                if current_odds + 1e-9 < float(strat_cfg.min_odds):
-                    logger.warning(
-                        "补单放弃：赔率 %.3f < 最低赔率 %.3f match=%s",
-                        current_odds, float(strat_cfg.min_odds), decision.match_id,
-                    )
-                    await self._notify(user.id, "bet_failed", {
-                        "match_id": decision.match_id,
-                        "message": f"赔率降至 {current_odds:.2f}，低于最低赔率 {strat_cfg.min_odds}，放弃补单",
-                    })
-                    if _resume_fn:
-                        _resume_fn()
-                    return False
                 logger.info(
                     "补单重试 %s/%s: match=%s 最新赔率=%.3f",
                     attempt, retry_count, decision.match_id, current_odds,
@@ -1059,29 +925,23 @@ class AIBettingEngine:
                 odds_data=odds_payload,
             )
             if place.ok:
-                # OB 站点：下单后验证 orderNo 是否真实存在
                 if provider_code == "ob" and place.external_bet_id:
-                    # 先记录 orderNo 到 Redis（无论验证结果），防止下轮重复下单
-                    await self._mark_bet_pending(decision.match_id, place.external_bet_id)
-
-                    verified = await self._verify_ob_bet(
-                        site_acc, place.external_bet_id
+                    await self._mark_bet_pending(
+                        decision.match_id,
+                        place.external_bet_id,
+                        selection=sel,
+                        bet_type=bet_type,
+                        odds=current_odds,
+                        stake=stake,
+                        line=line_val,
+                        confidence=decision.confidence,
+                        reasoning=decision.reasoning,
+                        provider=provider_label,
                     )
-                    if not verified:
-                        logger.warning(
-                            "OB 下单验证失败: orderNo=%s 在 OB 注单列表中不存在，视为未下单",
-                            place.external_bet_id,
-                        )
-                        place.ok = False
-                        place.message = f"OB 返回 orderNo={place.external_bet_id} 但验证不存在"
-                        # OB 已返回 orderNo，可能实际已下单；不再重试避免重复下单
-                        logger.warning("OB 已返回 orderNo，不再重试避免重复下单")
-                        break
-                    else:
-                        logger.info(
-                            "OB 下单验证通过: orderNo=%s",
-                            place.external_bet_id,
-                        )
+                    logger.info(
+                        "OB 下单回执已返回 orderNo=%s，按成功受理，不再做存在性验证",
+                        place.external_bet_id,
+                    )
             if place.ok:
                 break
 
@@ -1120,6 +980,7 @@ class AIBettingEngine:
             odds=current_odds,
             stake=stake,
             potential_payout=potential_payout,
+            actual_payout=potential_payout,
             line=float(line_val) if line_val is not None else None,
             status=BetStatus.SUCCESS,
             is_ai_bet=True,
@@ -1140,7 +1001,7 @@ class AIBettingEngine:
             bet_id=bet.id,
             description=(
                 f"AI滚球{type_label}: {match.home_team} vs {match.away_team} "
-                f"[{sel}{line_tag} @ {current_odds}] EV={decision.expected_value}"
+                f"[{sel}{line_tag} @ {current_odds}]"
             ),
         )
         db.add(tx)
@@ -1164,7 +1025,7 @@ class AIBettingEngine:
             "external_bet_id": place.external_bet_id,
             "provider": provider_label,
         })
-        # 验证通过且已入库，清除 Redis 待定标记
+        # 已入库，清除 Redis 待定标记
         try:
             from app.core.cache import cache
             await cache.delete(f"ai:bet:pending:{self.user_id}:{decision.match_id}")
@@ -1176,36 +1037,13 @@ class AIBettingEngine:
 
     async def _verify_ob_bet(self, site_acc, order_no: str) -> bool:
         """下单后验证 OB 注单是否真实存在（防止 OB API 假成功）。"""
-        import asyncio as _aio
-        import httpx
-        from app.services.bookmakers.gate_client import _gate_headers
-        from app.core.crypto import decrypt_secret
+        from app.services.bookmakers.ob_verify import verify_ob_order_exists
 
-        gate = (settings.BOOKMAKER_BROWSER_GATE_URL or "").rstrip("/")
-        if not gate:
-            return True  # 无 gate 则跳过验证
-
-        await _aio.sleep(2.0)  # 等 OB 后端写入注单
-        try:
-            async with httpx.AsyncClient(timeout=45.0, headers=_gate_headers()) as client:
-                resp = await client.post(
-                    f"{gate}/bets/history",
-                    json={
-                        "site_code": "ob",
-                        "base_url": site_acc.base_url or "",
-                        "session_token": decrypt_secret(site_acc.session_token_encrypted),
-                        "days": 1,
-                    },
-                )
-                data = resp.json() if resp.status_code < 500 else {}
-                orders = data.get("orders") or []
-                for od in orders:
-                    if str(od.get("external_bet_id") or "") == str(order_no):
-                        return True
-                return False
-        except Exception as e:
-            logger.warning("OB 下单验证异常: %s", e)
-            return False  # 验证异常时拒绝，避免误判为下单成功
+        return await verify_ob_order_exists(
+            site_acc,
+            order_no,
+            fail_open_on_exception=False,
+        )
 
     # === 风控检查 ===
     async def _get_site_balances(self, db: AsyncSession, user: User) -> list[tuple[str, Decimal]]:
@@ -1398,14 +1236,47 @@ class AIBettingEngine:
             pass
         return False
 
-    async def _mark_bet_pending(self, match_id: int, order_no: str) -> None:
+    async def _mark_bet_pending(
+        self,
+        match_id: int,
+        order_no: str,
+        *,
+        selection: str = "",
+        bet_type: str = "",
+        odds: float | None = None,
+        stake: Decimal | float | None = None,
+        line: float | None = None,
+        confidence: float | None = None,
+        reasoning: str = "",
+        provider: str = "",
+    ) -> None:
         """记录 OB 返回了 orderNo 的待定注单（TTL 6 小时，防止跨轮次重复下单）。"""
         try:
             from app.core.cache import cache
             # 记录 match_id + orderNo，TTL 6h（覆盖一个比赛日）
+            payload = {
+                "order_no": order_no,
+                "time": datetime.now(timezone.utc).isoformat(),
+            }
+            if selection:
+                payload["selection"] = str(selection)
+            if bet_type:
+                payload["bet_type"] = str(bet_type)
+            if odds is not None:
+                payload["odds"] = float(odds)
+            if stake is not None:
+                payload["stake"] = float(stake)
+            if line is not None:
+                payload["line"] = float(line)
+            if confidence is not None:
+                payload["confidence"] = float(confidence)
+            if reasoning:
+                payload["reasoning"] = str(reasoning)
+            if provider:
+                payload["provider"] = str(provider)
             await cache.set_json(
                 f"ai:bet:pending:{self.user_id}:{match_id}",
-                {"order_no": order_no, "time": datetime.now(timezone.utc).isoformat()},
+                payload,
                 ttl=21600,
             )
             logger.info("已记录待定注单 match=%s orderNo=%s（防重复 6h）", match_id, order_no)
@@ -1513,6 +1384,7 @@ async def analyze_and_recommend(
             "fixture_key": fk,
             "extra_data": dict(match.extra_data or {}) if isinstance(match.extra_data, dict) else {},
         }
+        match_info["preferred_bet_type"] = "total"
         try:
             ed = match_info["extra_data"]
         except Exception:
@@ -1558,8 +1430,6 @@ async def analyze_and_recommend(
             match,
             total_line,
             odds_map={"markets": markets_odds, **odds},
-            min_odds=float(strat_cfg.min_odds),
-            max_odds=float(strat_cfg.max_odds),
         )
         if skip_why:
             await db.commit()
@@ -1567,9 +1437,6 @@ async def analyze_and_recommend(
                 "score_over_line": "当前比分已超过大小球盘口，跳过分析",
                 "ending_soon": "比赛预计 10 分钟内结束，跳过分析",
                 "china_match": "中国赛事已过滤，跳过分析",
-                "odds_out_of_range": (
-                    f"赔率不在配置区间 [{strat_cfg.min_odds:g},{strat_cfg.max_odds:g}]，跳过分析"
-                ),
             }
             msg = reason_map.get(skip_why, f"跳过分析: {skip_why}")
             return {
@@ -1597,7 +1464,6 @@ async def analyze_and_recommend(
     if shared_analysis is not None:
         analysis = dict(shared_analysis)
         ctx = dict(shared_ctx or {})
-        news_list = list(ctx.get("news_injuries") or [])
         match_info["recent_form"] = {
             "home": ctx.get("home_form") or {},
             "away": ctx.get("away_form") or {},
@@ -1607,7 +1473,6 @@ async def analyze_and_recommend(
         conf0 = float(analysis.get("confidence") or 0.5)
     elif not use_llm:
         ctx = {}
-        news_list = []
         match_info["recent_form"] = {"home": {}, "away": {}}
         match_info["context_source"] = "strategy_market"
         llm_down = True
@@ -1615,10 +1480,9 @@ async def analyze_and_recommend(
         analysis = {
             "prediction": "over",
             "confidence": 0.0,
-            "reasoning": "[策略] 未启用 LLM，按盘口 EV + AI 策略阈值决策",
+            "reasoning": "[策略] 未启用 LLM，按盘口与 AI 策略阈值决策",
             "models_used": [],
             "consensus_reached": True,
-            "ev_passed": True,
             "error": None,
         }
     else:
@@ -1640,10 +1504,6 @@ async def analyze_and_recommend(
             "h2h": ctx.get("h2h") or {},
             "home_form": ctx.get("home_form") or {},
             "away_form": ctx.get("away_form") or {},
-            "news_injuries": ctx.get("news_injuries") or [],
-            "player_status": ctx.get("player_status") or ctx.get("news_injuries") or [],
-            "player_stats": ctx.get("player_stats") or {},
-            "motivation": ctx.get("motivation") or {},
             "lineup": ctx.get("lineup") or {},
             "standings": ctx.get("standings") or {},
             "weather": ctx.get("weather") or {},
@@ -1660,9 +1520,6 @@ async def analyze_and_recommend(
             "away": ctx.get("away_form") or {},
         }
         match_info["context_source"] = ctx.get("source") or "none"
-        news_list = list(ctx.get("news_injuries") or [])
-        if ctx.get("player_status"):
-            news_list = news_list + [f"状态:{x}" for x in (ctx.get("player_status") or [])[:4]]
 
         analysis = await analyzer.analyze_match(
             match_info,
@@ -1673,22 +1530,21 @@ async def analyze_and_recommend(
                 "odds_style": "asian",
                 **odds,
             },
-            news=news_list,
+            news=[],
         )
         llm_down = bool(analysis.get("error")) or not analysis.get("models_used")
+        analysis["llm_fallback"] = bool(llm_down)
         conf0 = float(analysis.get("confidence") or 0.5)
         ctx_bits = []
         h2n = len((ctx.get("h2h") or {}).get("matches") or [])
         hf = len((ctx.get("home_form") or {}).get("matches") or [])
         af = len((ctx.get("away_form") or {}).get("matches") or [])
-        nn = len(ctx.get("news_injuries") or [])
+        st = 1 if (ctx.get("standings") or {}).get("home") or (ctx.get("standings") or {}).get("away") else 0
         src = str(ctx.get("source") or "none")
-        if h2n or hf or af or nn:
-            ctx_bits.append(f"交锋{h2n}/主近况{hf}/客近况{af}/伤病{nn}(源:{src})")
-            if news_list:
-                ctx_bits.append("伤病要点:" + ";".join(news_list[:2]))
+        if h2n or hf or af or st:
+            ctx_bits.append(f"交锋{h2n}/主近况{hf}/客近况{af}/积分{st}(源:{src})")
         else:
-            ctx_bits.append(f"交锋/近10场/伤病:暂无数据(源:{src})")
+            ctx_bits.append(f"交锋/近10场/积分:暂无数据(源:{src})")
         ctx_note = "[" + " | ".join(ctx_bits) + "] "
 
         failed = analysis.get("models_failed") or []
@@ -1702,7 +1558,7 @@ async def analyze_and_recommend(
         )
 
         if llm_down:
-            # 真正无可用模型 / 超时：可展示盘口启发式，但禁止放行共识/EV 门禁
+            # 真正无可用模型 / 超时：可展示盘口启发式，但禁止放行共识门禁
             why = "LLM 暂不可用"
             if "timeout" in err.lower() or err == "ensemble_timeout":
                 why = "LLM 分析超时"
@@ -1712,20 +1568,18 @@ async def analyze_and_recommend(
                 **analysis,
                 "confidence": min(float(conf0 or 0), 0.49),
                 "consensus_reached": False,
-                "ev_passed": False,
                 "should_bet": False,
                 "reasoning": (
-                    f"[盘口启发式·不可下单] {why}，共识/EV 未通过，仅供参考。 "
+                    f"[盘口启发式·不可下单] {why}，共识未通过，仅供参考。 "
                     + fail_note
                     + ctx_note
                     + str(analysis.get("reasoning") or "")
                 )[:500],
             }
         elif analysis.get("consensus_reached") is False:
-            # 有模型返回但共识不足：不得伪造 consensus/ev_passed
+            # 有模型返回但共识不足：不得伪造 consensus
             analysis = {
                 **analysis,
-                "ev_passed": False,
                 "should_bet": False,
                 "reasoning": (
                     "[共识不足·不可下单] 模型未达共识门槛，禁止放行。 "
@@ -1745,7 +1599,7 @@ async def analyze_and_recommend(
     async with AsyncSessionLocal() as db:
         conf_use = float(analysis.get("confidence") or conf0 or 0)
         conf_use = max(0.0, min(0.99, conf_use))
-        pref_bt = str(analysis.get("bet_type") or "total").lower().strip()
+        pref_bt = "total"
         if pref_bt not in ("total", "moneyline", "spread"):
             pref_bt = "total"
         pred = str(analysis.get("prediction") or "").lower().strip()
@@ -1765,16 +1619,14 @@ async def analyze_and_recommend(
             confidence=conf_use if conf_use > 0 else conf0,
             stake=default_stake if default_stake >= settings.AI_MIN_BALANCE else max_amt,
             providers_filter=providers_filter,
-            min_odds=float(strat_cfg.min_odds),
-            max_odds=float(strat_cfg.max_odds),
+            min_odds=1.01,
+            max_odds=None,
             preferred_bet_type=pref_bt,
         )
         primary_market = next(
-            (m for m in markets if str(m.get("bet_type") or "") == pref_bt and m.get("single")),
+            (m for m in markets if str(m.get("bet_type") or "") == pref_bt),
             None,
         )
-        if not primary_market:
-            primary_market = next((m for m in markets if m.get("single")), None)
         primary = dict((primary_market or {}).get("single") or {})
         bet_type = str(
             (primary_market or {}).get("bet_type")
@@ -1855,8 +1707,6 @@ async def analyze_and_recommend(
                 match_id=match_id,
                 selection=sel or "over",
                 confidence=conf_use,
-                expected_value=0,
-                kelly_fraction=0,
                 suggested_stake=Decimal("0"),
                 reasoning="[不投注] 无可用盘口",
                 risk_score=1.0,
@@ -1867,16 +1717,6 @@ async def analyze_and_recommend(
                 line=float(line) if line is not None else None,
             )
         else:
-            # EV 计算：优先用 analyze_match 返回的去 vig EV，否则用原始赔率计算
-            from app.ai.analyzer import _devig_ev
-            analysis_ev = float(analysis.get("expected_value") or 0)
-            if analysis_ev != 0 and analysis.get("consensus_reached"):
-                mkt_ev = round(analysis_ev, 4)
-            elif sel_odds > 1 and len(market_odds_flat) >= 2:
-                mkt_ev = _devig_ev(conf_use, sel_odds, market_odds_flat)
-            else:
-                mkt_ev = round(conf_use * sel_odds - 1.0, 4) if sel_odds > 1 else 0.0
-            primary["expected_value"] = mkt_ev
             primary["win_rate"] = round(conf_use * 100, 1)
             consensus_ok = True if not use_llm else bool(analysis.get("consensus_reached", True))
             decision = await user_engine.evaluate_bet(
@@ -1885,17 +1725,17 @@ async def analyze_and_recommend(
                     "odds": market_odds_flat,
                     "provider_code": provider_code,
                     "bet_type": bet_type,
+                    "line_movement": (primary_market or {}).get("line_movement"),
+                    "line_movements": odds_pack.get("line_movements") or {},
                 },
                 analysis={
                     **analysis,
                     "prediction": sel,
                     "bet_type": bet_type,
                     "confidence": conf_use,
-                    "expected_value": mkt_ev,
                     "odds": sel_odds,
                     "provider_code": provider_code,
                     "line": line,
-                    "ev_passed": True,
                     "consensus_reached": consensus_ok,
                 },
                 user_balance=balance,
@@ -1903,22 +1743,14 @@ async def analyze_and_recommend(
                 active_bets_count=active_count,
             )
 
-        from app.ai.strategy_gates import check_daily_risk, stake_bounds
+        from app.ai.strategy_gates import check_daily_risk
 
-        _lo, _hi = stake_bounds(strat_cfg)
-        # 仓位严格=策略单笔最大金额（调用方显式传入 stake 时再覆盖）
-        sug_stake = _hi
+        sug_stake = Decimal(str(strat_cfg.max_bet_amount or 1))
         if stake is not None and Decimal(str(stake)) > 0:
-            sug_stake = min(Decimal(str(stake)), _hi)
-        if decision.should_bet and (sug_stake < _lo or sug_stake > _hi):
-            decision = decision.model_copy(
-                update={
-                    "should_bet": False,
-                    "reasoning": f"[不投注] 仓位须在 [{_lo:g},{_hi:g}]（策略单笔上限）",
-                }
-            )
-            sug_stake = Decimal("0")
-        elif decision.should_bet:
+            sug_stake = Decimal(str(stake))
+        if decision.should_bet:
+            if sug_stake < Decimal("1"):
+                sug_stake = Decimal("1")
             decision = decision.model_copy(update={"suggested_stake": sug_stake})
         if decision.should_bet:
             risk_hit, risk_why = await check_daily_risk(db, user_id, strat_cfg)
@@ -1931,7 +1763,6 @@ async def analyze_and_recommend(
                     }
                 )
                 sug_stake = Decimal("0")
-
         win_rate = float(
             primary.get("win_rate")
             if primary.get("win_rate") is not None
@@ -1946,7 +1777,7 @@ async def analyze_and_recommend(
             "h2h_count": len((ctx.get("h2h") or {}).get("matches") or []),
             "home_form_count": len((ctx.get("home_form") or {}).get("matches") or []),
             "away_form_count": len((ctx.get("away_form") or {}).get("matches") or []),
-            "news_count": len(ctx.get("news_injuries") or []),
+            "standings_count": 1 if (ctx.get("standings") or {}).get("home") or (ctx.get("standings") or {}).get("away") else 0,
             "note": (ctx.get("note") or (ctx.get("h2h") or {}).get("note") or "")[:120],
         }
 
@@ -1975,7 +1806,6 @@ async def analyze_and_recommend(
                 "win_rate": win_rate,
                 "suggested_stake": float(sug_stake),
                 "reasoning": decision.reasoning,
-                "expected_value": primary.get("expected_value", decision.expected_value),
                 "risk_score": decision.risk_score,
                 "provider": primary.get("provider") or provider_name_str,
                 "provider_code": primary.get("provider_code") or provider_code,
@@ -1983,12 +1813,10 @@ async def analyze_and_recommend(
                 "bet_type": bet_type,
                 "line": line,
                 "llm_fallback": bool(llm_down),
+                "signal_scores": decision.signal_scores,
             },
             "strategy": {
                 "name": strat_cfg.name,
-                "min_confidence": strat_cfg.min_confidence,
-                "min_odds": strat_cfg.min_odds,
-                "max_odds": strat_cfg.max_odds,
                 "max_bet_amount": strat_cfg.max_bet_amount,
                 "max_daily_bets": strat_cfg.max_daily_bets,
                 "stop_loss": strat_cfg.stop_loss,
@@ -2065,7 +1893,6 @@ async def analyze_fixture_group(
         "h2h": {},
         "home_form": {},
         "away_form": {},
-        "news_injuries": [],
         "note": meta.get("note") or "",
     }
     sibling_ids = [int(m.id) for m in ordered]
@@ -2097,15 +1924,15 @@ async def analyze_fixture_group(
 
 
 def pick_best_rec_for_fixture(recs: list[dict]) -> Optional[dict]:
-    """同场多站推荐中择优一单（优先可投 + EV）。"""
+    """同场多站推荐中择优一单（优先可投 + 胜率）。"""
     if not recs:
         return None
     return max(
         recs,
         key=lambda r: (
             1 if (r.get("recommendation") or {}).get("should_bet") else 0,
-            float((r.get("recommendation") or {}).get("expected_value") or 0),
             float((r.get("recommendation") or {}).get("confidence") or 0),
+            float((r.get("recommendation") or {}).get("odds") or 0),
         ),
     )
 

@@ -1,6 +1,7 @@
 """
 投注 API - 下单 / 撤单 / 兑现 / 历史
 """
+import asyncio
 import logging
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
@@ -25,49 +26,53 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/bets", tags=["投注"])
+LOCAL_RECORDED_BET_STATUSES = frozenset({BetStatus.SUCCESS})
+PENDING_RECONCILE_TIMEOUT_SEC = 4.0
+PENDING_LIST_TIMEOUT_SEC = 2.0
 
 
-async def _verify_ob_bet_async(site_acc, order_no: str) -> bool:
-    """下单后验证 OB 注单是否真实存在（防止 OB API 假成功）。"""
-    import asyncio as _aio
-    import httpx
-    from app.config import settings
-    from app.services.bookmakers.gate_client import _gate_headers
-    from app.core.crypto import decrypt_secret
-
-    gate = (settings.BOOKMAKER_BROWSER_GATE_URL or "").rstrip("/")
-    if not gate:
-        return True
-
-    await _aio.sleep(2.0)
+async def _load_pending_items_for_view(user_id: int, *, scene: str) -> list[dict]:
     try:
-        async with httpx.AsyncClient(timeout=45.0, headers=_gate_headers()) as client:
-            resp = await client.post(
-                f"{gate}/bets/history",
-                json={
-                    "site_code": "ob",
-                    "base_url": site_acc.base_url or "",
-                    "session_token": decrypt_secret(site_acc.session_token_encrypted) if site_acc.session_token_encrypted else "",
-                    "days": 1,
-                },
-            )
-            data = resp.json() if resp.status_code < 500 else {}
-            orders = data.get("orders") or []
-            for od in orders:
-                if str(od.get("external_bet_id") or "") == str(order_no):
-                    logger.info("OB 下单验证通过: orderNo=%s", order_no)
-                    return True
-            logger.warning("OB 下单验证失败: orderNo=%s 不在注单列表中", order_no)
-            return False
+        from app.services.bookmakers.pending_bets import reconcile_pending_ai_bets
+
+        await asyncio.wait_for(
+            reconcile_pending_ai_bets(user_id),
+            timeout=PENDING_RECONCILE_TIMEOUT_SEC,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "%s补录待定单超时 user=%s timeout=%.1fs，先返回已确认数据",
+            scene,
+            user_id,
+            PENDING_RECONCILE_TIMEOUT_SEC,
+        )
     except Exception as e:
-        logger.warning("OB 下单验证异常（跳过）: %s", e)
-        return True
+        logger.warning("%s补录待定单失败 user=%s: %s", scene, user_id, e)
+
+    try:
+        from app.services.bookmakers.pending_bets import list_pending_ai_bets
+
+        return await asyncio.wait_for(
+            list_pending_ai_bets(user_id),
+            timeout=PENDING_LIST_TIMEOUT_SEC,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "%s读取待定单超时 user=%s timeout=%.1fs，按无待定返回",
+            scene,
+            user_id,
+            PENDING_LIST_TIMEOUT_SEC,
+        )
+    except Exception as e:
+        logger.warning("%s读取待定单失败 user=%s: %s", scene, user_id, e)
+    return []
 
 
 # === 下注 ===
 @router.post("/place", response_model=APIResponse)
 async def place_bet(
     req: PlaceBetRequest,
+    dry_run: bool = False,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -329,6 +334,40 @@ async def place_bet(
             line_val = float(odds_obj.odds_data.get("line"))
     except Exception:
         line_val = None
+
+    potential_payout = (stake_val * Decimal(str(odds_val))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    if dry_run:
+        logger.info(
+            "DRY-RUN 下单验证通过: user=%s match=%s type=%s sel=%s stake=%s odds=%.2f provider=%s",
+            user_id_val, match_id_val, bet_type_val, selection_val, stake_val, odds_val, provider_label,
+        )
+        return APIResponse(
+            message="dry-run 验证通过，未提交真实站点",
+            data={
+                "bet_id": None,
+                "status": "dry_run",
+                "stake": stake_val,
+                "odds": odds_val,
+                "potential_payout": potential_payout,
+                "balance_after": current_user.balance,
+                "site_balance": Decimal(str(site_acc.balance or 0)),
+                "provider": provider_label,
+                "provider_code": provider_code,
+                "external_bet_id": None,
+                "dry_run": True,
+                "validation_passed": True,
+                "match_id": match_id_val,
+                "match_label": f"{match_home} vs {match_away}",
+                "selection": selection_val,
+                "bet_type": bet_type_val,
+                "line": line_val,
+                "place_payload": {
+                    **place_payload,
+                    "stake": float(stake_val),
+                    "odds": float(odds_val),
+                },
+            },
+        )
     await release_db_session(db)
 
     # Redis 同场下单锁：覆盖 Gate 调用 + 写库，防多 worker / 一键+自动双发
@@ -370,28 +409,19 @@ async def place_bet(
             raise HTTPException(status_code=400, detail=place.message or f"{provider_label}下单失败")
         external_bet_id = place.external_bet_id
 
-        # OB 站点：下单后验证 orderNo 是否真实存在
         if provider_code == "ob" and external_bet_id:
-            verified = await _verify_ob_bet_async(site_acc, external_bet_id)
-            if not verified:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"OB 返回单号 {external_bet_id} 但验证不存在，下单失败",
-                )
+            logger.info("OB 下单回执已返回 orderNo=%s，按成功受理，不再做存在性验证", external_bet_id)
 
         provider_label = provider_name(provider_code)
         placed_on_site = True
     finally:
         await cache.release_lock(lock_key, lock_token)
 
-    # 4. 计算预期赔付
-    potential_payout = (stake_val * Decimal(str(odds_val))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-
-    # 5. 必须落到真实站点，否则拒绝（不扣本地余额）
+    # 4. 必须落到真实站点，否则拒绝（不扣本地余额）
     if not placed_on_site:
         raise HTTPException(status_code=400, detail="下单未落到真实站点")
 
-    # 6–7. 短会话写库（余额/注单/流水）
+    # 5–6. 短会话写库（余额/注单/流水）
     async with AsyncSessionLocal() as wdb:
         site_acc = await wdb.get(BookmakerAccount, acc_id_val)
         user_row = await wdb.get(User, user_id_val)
@@ -414,6 +444,7 @@ async def place_bet(
             odds=odds_val,
             stake=stake_val,
             potential_payout=potential_payout,
+            actual_payout=potential_payout,
             line=line_val,
             status=BetStatus.SUCCESS,
             provider=provider_label,
@@ -487,45 +518,64 @@ async def bet_history(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """查询投注历史（OB / 平博 汇总）"""
-    query = select(Bet).where(Bet.user_id == current_user.id).options(selectinload(Bet.match))
-    count_query = select(func.count(Bet.id)).where(Bet.user_id == current_user.id)
+    """查询投注历史：仅返回本地手动/自动下单成功记录。"""
+    pending_items = await _load_pending_items_for_view(current_user.id, scene="投注记录")
 
     sf = status_filter or status
     if sf:
-        query = query.where(Bet.status == sf)
-        count_query = count_query.where(Bet.status == sf)
-    if provider:
-        pc = provider.strip().lower()
-        if pc == "ob":
-            query = query.where(Bet.provider.ilike("%OB%"))
-            count_query = count_query.where(Bet.provider.ilike("%OB%"))
-        elif pc == "pinnacle":
-            from sqlalchemy import or_
+        sf_norm = str(sf).strip().lower()
+        if sf_norm not in {"success", BetStatus.SUCCESS.value}:
+            return APIResponse(data={
+                "items": [],
+                "total": 0,
+                "page": page,
+                "page_size": page_size,
+                "remote_fallback": False,
+                "remote_status": "disabled",
+            })
+    async with AsyncSessionLocal() as qdb:
+        query = (
+            select(Bet)
+            .where(
+                Bet.user_id == current_user.id,
+                Bet.status.in_(tuple(LOCAL_RECORDED_BET_STATUSES)),
+            )
+            .options(selectinload(Bet.match))
+        )
+        count_query = select(func.count(Bet.id)).where(
+            Bet.user_id == current_user.id,
+            Bet.status.in_(tuple(LOCAL_RECORDED_BET_STATUSES)),
+        )
 
-            pin_f = or_(Bet.provider.ilike("%平博%"), Bet.provider.ilike("%pinnacle%"))
-            query = query.where(pin_f)
-            count_query = count_query.where(pin_f)
+        if provider:
+            pc = provider.strip().lower()
+            if pc == "ob":
+                query = query.where(Bet.provider.ilike("%OB%"))
+                count_query = count_query.where(Bet.provider.ilike("%OB%"))
+            elif pc == "pinnacle":
+                from sqlalchemy import or_
 
-    if start_date:
-        sd = datetime.fromisoformat(start_date)
-        query = query.where(Bet.created_at >= sd)
-        count_query = count_query.where(Bet.created_at >= sd)
+                pin_f = or_(Bet.provider.ilike("%平博%"), Bet.provider.ilike("%pinnacle%"))
+                query = query.where(pin_f)
+                count_query = count_query.where(pin_f)
 
-    if end_date:
-        ed = datetime.fromisoformat(end_date)
-        query = query.where(Bet.created_at <= ed)
-        count_query = count_query.where(Bet.created_at <= ed)
+        if start_date:
+            sd = datetime.fromisoformat(start_date)
+            query = query.where(Bet.created_at >= sd)
+            count_query = count_query.where(Bet.created_at >= sd)
 
-    # 总数
-    total = (await db.execute(count_query)).scalar_one()
+        if end_date:
+            ed = datetime.fromisoformat(end_date)
+            query = query.where(Bet.created_at <= ed)
+            count_query = count_query.where(Bet.created_at <= ed)
 
-    # 分页
-    offset = (page - 1) * page_size
-    result = await db.execute(
-        query.order_by(Bet.created_at.desc()).offset(offset).limit(page_size)
-    )
-    bets = result.scalars().all()
+        total = (await qdb.execute(count_query)).scalar_one()
+
+        offset = (page - 1) * page_size
+        result = await qdb.execute(
+            query.order_by(Bet.created_at.desc()).offset(offset).limit(page_size)
+        )
+        bets = result.scalars().all()
 
     items = []
     for b in bets:
@@ -541,13 +591,20 @@ async def bet_history(
             "provider": prov,
             "provider_code": prov_code,
             "created_at": b.created_at.isoformat() if b.created_at else None,
+            "pending": False,
         })
+
+    items = pending_items + items
+    total = int(total or 0) + len(pending_items)
+    items = items[:page_size]
 
     return APIResponse(data={
         "items": items,
         "total": total,
         "page": page,
         "page_size": page_size,
+        "remote_fallback": False,
+        "remote_status": "disabled",
     })
 
 
@@ -558,41 +615,73 @@ async def portfolio_summary(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """持仓概览统计"""
-    # 今日投注（午夜 0 点清零）
+    """持仓概览统计：仅统计本地下单成功记录。"""
+    pending_items = await _load_pending_items_for_view(current_user.id, scene="持仓概览")
+
     today = datetime.now(timezone.utc).date()
     today_start = datetime.combine(today, datetime.min.time(), tzinfo=timezone.utc)
-    today_bets_result = await db.execute(
-        select(func.count(Bet.id)).where(
-            Bet.user_id == current_user.id,
-            Bet.created_at >= today_start
-        )
-    )
-    today_bets = today_bets_result.scalar_one()
-
-    # 总投注（每月最后一天清零，按自然月统计）
     month_start = today.replace(day=1)
     month_start_dt = datetime.combine(month_start, datetime.min.time(), tzinfo=timezone.utc)
-    monthly_bets_result = await db.execute(
-        select(func.count(Bet.id)).where(
-            Bet.user_id == current_user.id,
-            Bet.created_at >= month_start_dt
+    pending_today = 0
+    pending_month = 0
+    for item in pending_items:
+        created_at = item.get("created_at")
+        try:
+            dt = datetime.fromisoformat(str(created_at).replace("Z", "+00:00"))
+        except Exception:
+            dt = None
+        if not dt:
+            continue
+        if dt >= today_start:
+            pending_today += 1
+        if dt >= month_start_dt:
+            pending_month += 1
+
+    async with AsyncSessionLocal() as qdb:
+        today_bets_result = await qdb.execute(
+            select(func.count(Bet.id)).where(
+                Bet.user_id == current_user.id,
+                Bet.status.in_(tuple(LOCAL_RECORDED_BET_STATUSES)),
+                Bet.created_at >= today_start
+            )
         )
-    )
-    monthly_bets = monthly_bets_result.scalar_one()
+        today_bets = today_bets_result.scalar_one()
 
-    # 总资产 + 每日盈亏
-    from app.services.balances import load_site_balances
-    from app.services.daily_pnl import get_daily_pnl
+        monthly_bets_result = await qdb.execute(
+            select(func.count(Bet.id)).where(
+                Bet.user_id == current_user.id,
+                Bet.status.in_(tuple(LOCAL_RECORDED_BET_STATUSES)),
+                Bet.created_at >= month_start_dt
+            )
+        )
+        monthly_bets = monthly_bets_result.scalar_one()
 
-    site_balances = await load_site_balances(db, current_user.id)
-    total_assets = sum(float(s.get("balance") or 0) for s in site_balances)
-    pnl_info = await get_daily_pnl(current_user.id, total_assets)
+    total_assets = 0.0
+    pnl_info = {
+        "total_assets": 0.0,
+        "daily_pnl": 0.0,
+        "baseline": 0.0,
+    }
+    try:
+        from app.services.balances import load_site_balances
+        from app.services.daily_pnl import get_daily_pnl
+
+        async with AsyncSessionLocal() as bdb:
+            site_balances = await load_site_balances(bdb, current_user.id)
+        total_assets = sum(float(s.get("balance") or 0) for s in site_balances)
+        pnl_info = await get_daily_pnl(current_user.id, total_assets)
+    except Exception as e:
+        logger.warning("持仓概览余额/盈亏统计失败 user=%s: %s", current_user.id, e)
 
     return APIResponse(data={
-        "today_bets": today_bets,
-        "total_bets": monthly_bets,
+        "today_bets": int(today_bets or 0) + pending_today,
+        "total_bets": int(monthly_bets or 0) + pending_month,
+        "confirmed_today_bets": int(today_bets or 0),
+        "confirmed_total_bets": int(monthly_bets or 0),
+        "pending_bets": len(pending_items),
         "total_assets": pnl_info["total_assets"],
         "daily_pnl": pnl_info["daily_pnl"],
         "baseline": pnl_info["baseline"],
+        "remote_fallback": False,
+        "remote_status": "disabled",
     })

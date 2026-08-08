@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { aiAPI, betsAPI, adminAPI } from '../lib/api.js'
+import { formatAiRecommendationReason } from '../lib/aiReasoning.js'
 import { SITE_NAMES, SITE_ORDER } from '../lib/sites.js'
 import { useAuth } from '../store/auth.jsx'
 import { usePagePoll } from '../hooks/usePagePoll.js'
@@ -9,7 +10,7 @@ import BetModeSwitch from '../components/BetModeSwitch.jsx'
 import toast from 'react-hot-toast'
 import {
   Bot, Play, Square, Settings, Loader2, Shield,
-  TrendingUp, AlertTriangle, Zap, Brain,
+  AlertTriangle, Zap, Brain,
   ChevronDown, ChevronUp, Database, Power,
 } from 'lucide-react'
 
@@ -35,9 +36,36 @@ const SPORT_TABS = [
 const SITE_TABS = SITE_ORDER.map((code) => ({ key: code, label: SITE_NAMES[code] }))
 
 const FALLBACK_STRATEGIES = {
-  conservative: { description: '保守策略 - 高置信度、小仓位、严风控' },
-  balanced: { description: '平衡策略 - 攻守兼备、适中仓位' },
-  aggressive: { description: '激进策略 - 高仓位、接受冷门、高回报' },
+  high_win_rate: { description: 'AI 大小球分析' },
+}
+
+const DEFAULT_FORM_DATA = {
+  is_active: false,
+  max_bet_amount: 50,
+  max_daily_bets: 3,
+  preferred_sports: [],
+  excluded_teams: [],
+  stop_loss: 500,
+  take_profit: 1000,
+}
+
+function toFiniteNumber(value, fallback) {
+  const n = Number(value)
+  return Number.isFinite(n) ? n : fallback
+}
+
+function normalizeFormData(source, fallback = DEFAULT_FORM_DATA) {
+  const base = { ...DEFAULT_FORM_DATA, ...fallback }
+  const data = source || {}
+  return {
+    is_active: data.is_active ?? base.is_active,
+    max_bet_amount: toFiniteNumber(data.max_bet_amount, base.max_bet_amount),
+    max_daily_bets: toFiniteNumber(data.max_daily_bets, base.max_daily_bets),
+    preferred_sports: Array.isArray(data.preferred_sports) ? data.preferred_sports : base.preferred_sports,
+    excluded_teams: Array.isArray(data.excluded_teams) ? data.excluded_teams : base.excluded_teams,
+    stop_loss: toFiniteNumber(data.stop_loss, base.stop_loss),
+    take_profit: toFiniteNumber(data.take_profit, base.take_profit),
+  }
 }
 
 function formatCellLine(market, cell) {
@@ -101,6 +129,7 @@ export default function AIPanelPage() {
   })
   const [analysisBusy, setAnalysisBusy] = useState(false)
   const [dsEnabled, setDsEnabled] = useState(null)
+  const [dsMeta, setDsMeta] = useState(null)
   const [dsLoading, setDsLoading] = useState(false)
   const [prefetchProgress, setPrefetchProgress] = useState(null)
   const [prefetchNullCount, setPrefetchNullCount] = useState(0)
@@ -110,8 +139,10 @@ export default function AIPanelPage() {
     try {
       const res = await adminAPI.getDataSourceSwitch()
       setDsEnabled(res.data?.enabled ?? false)
+      setDsMeta(res.data || null)
     } catch {
       setDsEnabled(false)
+      setDsMeta(null)
     }
   }
 
@@ -149,6 +180,7 @@ export default function AIPanelPage() {
       } else {
         addAiLog('prefetch', '数据源已关闭')
       }
+      await loadDsSwitch()
     } catch (e) {
       toast.error(e.message || '操作失败')
     } finally {
@@ -198,21 +230,7 @@ export default function AIPanelPage() {
   const analysisOn = !!recsMeta.analysisEnabled || analyzing
 
   // 设置表单
-  const [formData, setFormData] = useState({
-    strategy: 'balanced',
-    max_bet_amount: 100,
-    max_daily_bets: 10,
-    min_confidence: 0.75,
-    preferred_sports: [],
-    excluded_teams: [],
-    stop_loss: 500,
-    take_profit: 1000,
-    max_odds: 10,
-    min_odds: 1.1,
-    use_llm_analysis: true,
-    auto_cashout: false,
-    cashout_threshold: 0.8,
-  })
+  const [formData, setFormData] = useState(DEFAULT_FORM_DATA)
 
   useEffect(() => {
     loadAll()
@@ -234,61 +252,29 @@ export default function AIPanelPage() {
         const n = detail.data?.executed || 0
         const analyzed = detail.data?.analyzed || 0
         toast.success(`AI完成一轮分析: ${analyzed}场分析, ${n}笔下单`)
-        addAiLog('cycle', `AI 完成一轮分析：${analyzed} 场分析，${n} 笔下单`, detail.data)
-        // 输出每场分析结果到日志
-        const summary = detail.data?.analysis_summary || []
-        for (const m of summary) {
-          const sel = SEL_LABEL[m.selection] || m.selection || '-'
-          const bt = MARKET_LABEL[m.bet_type] || m.bet_type
-          const tag = m.should_bet ? '✓推荐' : `${m.confidence}%`
-          addAiLog('analysis', `${m.home_team} vs ${m.away_team}  ${bt} ${sel} @ ${Number(m.odds).toFixed(2)}  ${tag}`)
-        }
         loadRecommendations(false)
       } else if (detail.type === 'ai_cycle_done') {
         const analyzed = detail.data?.analyzed || 0
-        const msg = detail.data?.message || '本轮无策略通过场次'
+        const msg = detail.data?.message || '本轮无 AI 大小球推荐通过'
         toast(`AI分析完成: ${analyzed}场, 无下单`, { icon: '📊' })
-        addAiLog('cycle', `AI 分析完成：${analyzed} 场，无符合策略的下单机会`)
-        // 输出每场分析结果到日志
-        const summary = detail.data?.analysis_summary || []
-        for (const m of summary) {
-          const sel = SEL_LABEL[m.selection] || m.selection || '-'
-          const bt = MARKET_LABEL[m.bet_type] || m.bet_type
-          addAiLog('analysis', `${m.home_team} vs ${m.away_team}  ${bt} ${sel} @ ${Number(m.odds).toFixed(2)}  ${m.confidence}%`)
-        }
       } else if (detail.type === 'ai_risk_stop') {
         toast.error(`AI引擎暂停: ${detail.data}`)
-        addAiLog('risk', `风控触发: ${detail.data}`)
         setEngineStatus({ running: false })
       } else if (detail.type === 'ai_manual_recommend') {
         toast(`人工模式推荐: ${detail.data.selection} @ ${detail.data.odds}`, { icon: '🤖' })
-        addAiLog('recommend', `推荐: ${detail.data.selection} @ ${Number(detail.data.odds).toFixed(2)}`, detail.data)
         loadRecommendations(false)
       } else if (detail.type === 'ai_recs_ready') {
         loadRecommendations(false)
       } else if (detail.type === 'ai_config_updated') {
-        toast.success('策略已更新，正在按新参数重新分析…')
-        addAiLog('config', 'AI 策略配置已更新')
+        toast.success('配置已更新，正在按新参数重新分析…')
         const d = detail.data || {}
-        setFormData((prev) => ({
-          ...prev,
-          strategy: d.strategy ?? prev.strategy,
-          min_confidence: d.min_confidence ?? prev.min_confidence,
-          min_odds: d.min_odds ?? prev.min_odds,
-          max_odds: d.max_odds ?? prev.max_odds,
-          max_bet_amount: d.max_bet_amount ?? prev.max_bet_amount,
-          max_daily_bets: d.max_daily_bets ?? prev.max_daily_bets,
-          stop_loss: d.stop_loss ?? prev.stop_loss,
-          take_profit: d.take_profit ?? prev.take_profit,
-          use_llm_analysis: d.use_llm_analysis ?? prev.use_llm_analysis,
-        }))
+        setConfig((prev) => ({ ...(prev || {}), ...d }))
+        setFormData((prev) => normalizeFormData({ ...prev, ...d }, prev))
         loadRecommendations(true)
       } else if (detail.type === 'ai_bet_placed') {
         toast.success(`真实下单成功: ${detail.data.selection} @ ${detail.data.odds}`)
-        addAiLog('bet_placed', `下单成功: ${detail.data.selection} @ ${Number(detail.data.odds).toFixed(2)}`, detail.data)
       } else if (detail.type === 'ai_bet_failed') {
         toast.error(detail.data?.message || 'AI下单失败')
-        addAiLog('bet_failed', `下单失败: ${detail.data?.message || '未知原因'}`, detail.data)
       }
     }
     window.addEventListener('aiUpdate', handleAIUpdate)
@@ -315,8 +301,8 @@ export default function AIPanelPage() {
         rawCount: Number(data.raw_count || 0),
         analysisEnabled: !!data.analysis_enabled,
       })
-      // 金额默认取 AI 策略「单笔最大金额」（见输入框 value ?? formData.max_bet_amount）
-      // 不把凯利 suggested_stake 写入 state，避免出现 2.69 这类偏离配置的金额
+      // 金额默认取 AI 配置「单笔最大金额」（见输入框 value ?? formData.max_bet_amount）
+      // 不把历史金额写入 state，避免出现偏离当前配置的旧金额
     } catch (err) {
       console.error('Load recommendations failed:', err)
       if (!silent) {
@@ -366,7 +352,7 @@ export default function AIPanelPage() {
     }
   }
 
-  // 后台分析开启时：短轮询拉取进度与高胜率结果
+  // 后台分析开启时：短轮询拉取进度与 AI 大小球推荐
   usePagePoll(
     () => loadRecommendations(false, sportTab, siteTab, { silent: true }),
     4000,
@@ -386,10 +372,10 @@ export default function AIPanelPage() {
     if (!odds || odds <= 1) throw new Error('赔率无效')
     const maxStake = Number(formData.max_bet_amount || 0)
     if (!stake || stake < minBetAmount) {
-      throw new Error(`金额需 ≥${minBetAmount}（AI 策略配置）`)
+      throw new Error(`金额需 ≥${minBetAmount}（AI 配置）`)
     }
     if (maxStake > 0 && stake > maxStake) {
-      throw new Error(`金额需 ≤${maxStake}（策略单笔上限）`)
+      throw new Error(`金额需 ≤${maxStake}（单笔上限）`)
     }
     return betsAPI.place({
       match_id: matchId,
@@ -402,15 +388,15 @@ export default function AIPanelPage() {
   }
 
   const handlePlaceFromRec = async (rec) => {
-    // 走一键接口：服务端按完整 AI 配置门禁（置信度/赔率/仓位/止损止盈/每日笔数）
+    // 走一键接口：服务端按 AI 配置门禁（止损止盈/每日笔数）
     const maxStake = Number(formData.max_bet_amount || 0)
     const stake = Number(stakeByMatch[rec.match_id] || maxStake || minBetAmount || 1)
     if (!stake || stake < minBetAmount) {
-      toast.error(`金额需 ≥${minBetAmount}（AI 策略配置）`)
+      toast.error(`金额需 ≥${minBetAmount}（AI 配置）`)
       return
     }
     if (maxStake > 0 && stake > maxStake) {
-      toast.error(`金额需 ≤${maxStake}（策略单笔上限）`)
+      toast.error(`金额需 ≤${maxStake}（单笔上限）`)
       return
     }
     setBettingId(`${rec.match_id}:primary`)
@@ -434,7 +420,7 @@ export default function AIPanelPage() {
     }
   }
 
-  // 一键投注：大小球 + 输赢 + 让球 全部下注
+  // 一键投注：大小球下注
   const handleOneClickAll = async (matchId) => {
     const stake = Number(stakeByMatch[matchId] || formData.max_bet_amount || minBetAmount || 1)
     setBettingId(`${matchId}:all`)
@@ -463,21 +449,21 @@ export default function AIPanelPage() {
     const primarySel = rec?.recommendation?.selection
     const primaryBt = String(rec?.recommendation?.bet_type || '').toLowerCase()
     if (primaryBt && bt !== primaryBt) {
-      toast.error('仅可投注策略主推盘口')
+      toast.error('仅可投注大小球盘口')
       return
     }
     if (primarySel && cell.selection !== primarySel) {
-      toast.error('仅可投注策略主推方向（已按配置过滤）')
+      toast.error('仅可投注主推方向（已按配置过滤）')
       return
     }
-    // 与一键相同：完整策略门禁
+    // 与一键相同：AI 配置门禁
     await handlePlaceFromRec(rec)
   }
 
   const loadAll = async () => {
     setLoading(true)
     try {
-      // 策略/配置与推荐解耦，避免推荐超时导致策略下拉空白
+      // 配置与推荐解耦，避免推荐超时导致配置加载失败
       const [statusRes, configRes, strategiesRes] = await Promise.all([
         aiAPI.status(),
         aiAPI.config(),
@@ -492,26 +478,12 @@ export default function AIPanelPage() {
       setStrategies(strat)
 
       const c = configRes.data || {}
-      // 最低金额跟 AI 策略：默认 1，上限为单笔最大金额（不再用系统 MIN_BET=100）
+      // 最低金额跟 AI 配置：默认 1，上限为单笔最大金额
       const minBet = Number(c.one_click_min_stake ?? c.min_bet_amount ?? 1)
       setMinBetAmount(minBet > 0 ? minBet : 1)
-      // 清空旧凯利金额（如 2.69），改回按配置单笔上限展示
+      // 清空旧的动态金额（如 2.69），改回按配置单笔上限展示
       setStakeByMatch({})
-      setFormData({
-        strategy: c.strategy || 'balanced',
-        max_bet_amount: c.max_bet_amount || 100,
-        max_daily_bets: c.max_daily_bets || 10,
-        min_confidence: c.min_confidence || 0.75,
-        preferred_sports: c.preferred_sports || [],
-        excluded_teams: c.excluded_teams || [],
-        stop_loss: c.stop_loss || 500,
-        take_profit: c.take_profit || 1000,
-        max_odds: c.max_odds || 10,
-        min_odds: c.min_odds || 1.1,
-        use_llm_analysis: c.use_llm_analysis !== false,
-        auto_cashout: c.auto_cashout || false,
-        cashout_threshold: c.cashout_threshold || 0.8,
-      })
+      setFormData(normalizeFormData(c))
     } catch (err) {
       console.error('Load AI data failed:', err)
       setStrategies(FALLBACK_STRATEGIES)
@@ -524,9 +496,9 @@ export default function AIPanelPage() {
     setStarting(true)
     try {
       const res = await aiAPI.start()
-      toast.success(res.message || 'AI引擎已启动')
-      addAiLog('engine', `AI 引擎已启动 (${isAuto ? '自动' : '人工'}模式)`)
-      setEngineStatus({ running: true, ...(res.data || {}) })
+      toast.success(res.message || '自动下注引擎已启动')
+      addAiLog('engine', `自动下注引擎已启动 (${res.data?.effective_label || '运行中'})`)
+      setEngineStatus(res.data || { engine_running: true })
       setBetMode(res.data?.bet_mode || betMode)
       updateUser({ ai_enabled: true })
       loadRecommendations(true)
@@ -539,10 +511,10 @@ export default function AIPanelPage() {
 
   const handleStop = async () => {
     try {
-      await aiAPI.stop()
-      toast.success('AI引擎已停止')
-      addAiLog('engine', 'AI 引擎已停止')
-      setEngineStatus({ running: false })
+      const res = await aiAPI.stop()
+      toast.success('自动下注引擎已停止')
+      addAiLog('engine', '自动下注引擎已停止')
+      setEngineStatus(res.data || { engine_running: false, ai_enabled: false })
       updateUser({ ai_enabled: false })
     } catch (err) {
       toast.error('停止失败')
@@ -555,7 +527,7 @@ export default function AIPanelPage() {
       toast.success('AI配置已保存，参数立即生效')
       setShowSettings(false)
       await loadAll()
-      // 清旧推荐，按新置信度/赔率/仓位等重新分析
+      // 清旧推荐，按新配置重新分析
       await loadRecommendations(true)
     } catch (err) {
       toast.error('保存失败')
@@ -570,40 +542,57 @@ export default function AIPanelPage() {
     )
   }
 
-  const isAuto = (engineStatus?.bet_mode || betMode) === 'active'
+  const engineRunning = !!(engineStatus?.engine_running ?? engineStatus?.running)
+  const isAuto = (engineStatus?.execution_mode || engineStatus?.bet_mode || betMode) === 'active'
+  const badgeTone = engineStatus?.badge_tone || 'slate'
+  const statusTitle = engineStatus?.effective_label || (engineRunning ? (isAuto ? '自动运行中' : '人工运行中') : 'AI未启动')
+  const statusDesc = engineStatus?.effective_description || (
+    engineRunning
+      ? (isAuto ? '后台持续分析中，命中大小球推荐后会自动真实下单。' : '后台持续分析中，只生成推荐，不会自动下单。')
+      : '当前分析/下注引擎未运行。'
+  )
+  const dsLast = dsMeta?.last_result
+  const dsLastText = dsLast?.finished_at
+    ? new Date(Number(dsLast.finished_at) * 1000).toLocaleString('zh-CN', { hour12: false })
+    : ''
 
   return (
     <div className="page">
       <PageHeader
         eyebrow="智能"
         title="AI 投注"
-        description="OB / 平博滚球 · 亚洲盘（独赢/让球/大小）· 结合初盘与盘口变化 · 胜率门槛 ≥75%"
+        description={`OB / 平博滚球 · 亚洲大小球 · 捷报数据对比 · AI 每 10 分钟扫描一次`}
         actions={(
           <>
             <BetModeSwitch
-              onChange={(data) => {
+              onChange={async (data) => {
                 if (!data) return
                 setBetMode(data.bet_mode || 'manual')
-                setEngineStatus((s) => ({ ...(s || {}), ...data }))
+                try {
+                  const statusRes = await aiAPI.status()
+                  setEngineStatus(statusRes.data || {})
+                } catch {
+                  setEngineStatus((s) => ({ ...(s || {}), ...data }))
+                }
                 // 模式切换后立即按新规则刷列表
                 loadRecommendations(false, sportTab, siteTab, { silent: true })
               }}
             />
-            {!engineStatus?.running ? (
+            {!engineRunning ? (
               <button
                 onClick={handleStart}
                 disabled={starting || !engineStatus}
                 className="btn-success flex items-center gap-2 px-6"
               >
                 {starting || !engineStatus ? <Loader2 size={16} className="animate-spin" /> : <Play size={16} />}
-                {engineStatus ? '启动 AI' : '加载中…'}
+                {engineStatus ? '启动自动下注引擎' : '加载中…'}
               </button>
             ) : (
               <button
                 onClick={handleStop}
                 className="btn-danger flex items-center gap-2 px-6"
               >
-                <Square size={16} /> 停止
+                <Square size={16} /> 停止自动下注引擎
               </button>
             )}
             <button
@@ -630,8 +619,15 @@ export default function AIPanelPage() {
               <div className="text-xs text-ink-500">
                 {dsEnabled === null ? '加载中…' : dsEnabled
                   ? '已开启 · 每小时自动预取当日全量赛事上下文'
-                  : '已关闭 · AI 分析时仅读已有缓存'}
+                  : '已关闭 · 仅使用现有缓存，不自动更新捷报数据'}
               </div>
+              {dsEnabled && dsLastText ? (
+                <div className="text-[11px] text-ink-400 mt-1">
+                  {dsLast?.ok === false
+                    ? `上次自动预取失败 · ${dsLastText} · ${dsLast.error || '未知错误'}`
+                    : `上次自动预取完成 · ${dsLastText} · 足球 ${dsLast?.football_cached || 0} 场 / 篮球 ${dsLast?.basketball_cached || 0} 场`}
+                </div>
+              ) : null}
             </div>
           </div>
           <div className="flex items-center gap-2">
@@ -669,33 +665,34 @@ export default function AIPanelPage() {
 
       {/* 状态横幅 */}
       <div className={`card mb-6 border ${
-        engineStatus?.running
-          ? isAuto
-            ? 'border-green-500/30 bg-green-500/5'
-            : 'border-yellow-500/30 bg-yellow-500/5'
-          : 'border-gray-500/30'
+        badgeTone === 'green'
+          ? 'border-green-500/30 bg-green-500/5'
+          : badgeTone === 'amber'
+            ? 'border-yellow-500/30 bg-yellow-500/5'
+            : badgeTone === 'orange'
+              ? 'border-orange-500/30 bg-orange-500/5'
+              : 'border-gray-500/30'
       }`}>
         <div className="flex items-center gap-3">
           <div className={`w-3 h-3 rounded-full ${
-            engineStatus?.running
-              ? isAuto
-                ? 'bg-green-400 animate-pulse'
-                : 'bg-yellow-400 animate-pulse'
-              : 'bg-gray-500'
+            badgeTone === 'green'
+              ? 'bg-green-400 animate-pulse'
+              : badgeTone === 'amber'
+                ? 'bg-yellow-400 animate-pulse'
+                : badgeTone === 'orange'
+                  ? 'bg-orange-400 animate-pulse'
+                  : 'bg-gray-500'
           }`} />
           <span className="font-medium">
-            {engineStatus?.running
-              ? isAuto
-                ? '🟢 自动投注 - 每 10 分钟一轮，最多 3 场不同比赛真实下单'
-                : '🟡 人工投注 - 轮询分析全部滚球，只展示高胜率供手动确认'
-              : engineStatus === null ? '⚪ 正在加载…' : '⚪ AI引擎未运行'}
+            {engineStatus === null ? '⚪ 正在加载…' : statusTitle}
           </span>
-          {engineStatus?.running && (
+          {engineRunning && (
             <span className="text-xs text-ink-500 ml-auto">
-              {isAuto ? '每轮≤2单 · 间隔10分钟' : '轮询扫描滚球大小球'}
+              AI 每 10 分钟扫描一次，每轮最多 3 场不同比赛大小球
             </span>
           )}
         </div>
+        <p className="text-xs text-ink-500 mt-2 pl-6">{statusDesc}</p>
         {recsMeta.filterHint ? (
           <p className="text-xs text-ink-500 mt-2 pl-6">{recsMeta.filterHint}</p>
         ) : null}
@@ -704,21 +701,21 @@ export default function AIPanelPage() {
       {/* 配置面板 */}
       {showSettings && (
         <div className="card mb-6">
-          <h3 className="font-bold mb-4">AI 策略配置</h3>
+          <h3 className="font-bold mb-4">AI 配置</h3>
 
           <div className="grid md:grid-cols-2 gap-4">
-            {/* 策略选择 */}
+            {/* AI 开关 */}
             <div>
-              <label className="block text-sm text-ink-400 mb-1.5">策略预设</label>
-              <select
-                value={formData.strategy}
-                onChange={(e) => setFormData({ ...formData, strategy: e.target.value })}
-                className="input"
-              >
-                {Object.entries(strategies || FALLBACK_STRATEGIES).map(([key, val]) => (
-                  <option key={key} value={key}>{val.description || val.name || key}</option>
-                ))}
-              </select>
+              <label className="flex items-center gap-2 text-sm text-ink-400">
+                <input
+                  type="checkbox"
+                  checked={!!formData.is_active}
+                  onChange={(e) => setFormData({ ...formData, is_active: e.target.checked })}
+                  className="accent-brand-500"
+                />
+                开启 AI
+              </label>
+              <p className="text-xs text-ink-600 mt-1">开启后 AI 引擎按配置自动分析大小球</p>
             </div>
 
             {/* 单笔最大金额 */}
@@ -729,7 +726,7 @@ export default function AIPanelPage() {
                 value={formData.max_bet_amount}
                 onChange={(e) => setFormData({ ...formData, max_bet_amount: Number(e.target.value) })}
                 className="input"
-                min="10"
+                min={minBetAmount}
               />
             </div>
 
@@ -743,22 +740,6 @@ export default function AIPanelPage() {
                 className="input"
                 min="1"
                 max="100"
-              />
-            </div>
-
-            {/* 最低置信度 */}
-            <div>
-              <label className="block text-sm text-ink-400 mb-1.5">
-                最低AI置信度: {(formData.min_confidence * 100).toFixed(0)}%
-              </label>
-              <input
-                type="range"
-                value={formData.min_confidence}
-                onChange={(e) => setFormData({ ...formData, min_confidence: Number(e.target.value) })}
-                className="w-full accent-brand-500"
-                min="0.5"
-                max="0.95"
-                step="0.05"
               />
             </div>
 
@@ -786,56 +767,39 @@ export default function AIPanelPage() {
               />
             </div>
 
-            {/* 赔率范围 */}
+            {/* 偏好球类 */}
             <div>
-              <label className="block text-sm text-ink-400 mb-1.5">赔率范围</label>
-              <div className="flex gap-2">
-                <input
-                  type="number"
-                  value={formData.min_odds}
-                  onChange={(e) => setFormData({ ...formData, min_odds: Number(e.target.value) })}
-                  className="input"
-                  step="0.1"
-                  placeholder="最低"
-                />
-                <span className="self-center text-ink-500">~</span>
-                <input
-                  type="number"
-                  value={formData.max_odds}
-                  onChange={(e) => setFormData({ ...formData, max_odds: Number(e.target.value) })}
-                  className="input"
-                  step="0.5"
-                  placeholder="最高"
-                />
+              <label className="block text-sm text-ink-400 mb-1.5">偏好球类</label>
+              <div className="flex flex-wrap gap-3">
+                {SPORT_TABS.map((tab) => (
+                  <label key={tab.key} className="flex items-center gap-1.5 text-sm text-ink-600">
+                    <input
+                      type="checkbox"
+                      checked={formData.preferred_sports.includes(tab.key)}
+                      onChange={(e) => setFormData((prev) => {
+                        const set = new Set(prev.preferred_sports)
+                        if (e.target.checked) set.add(tab.key)
+                        else set.delete(tab.key)
+                        return { ...prev, preferred_sports: Array.from(set) }
+                      })}
+                      className="accent-brand-500"
+                    />
+                    {tab.label}
+                  </label>
+                ))}
               </div>
             </div>
 
-            {/* LLM分析 */}
+            {/* 排除球队 */}
             <div>
-              <label className="flex items-center gap-2 text-sm text-ink-400">
-                <input
-                  type="checkbox"
-                  checked={formData.use_llm_analysis}
-                  onChange={(e) => setFormData({ ...formData, use_llm_analysis: e.target.checked })}
-                  className="accent-brand-500"
-                />
-                使用LLM深度分析
-              </label>
-              <p className="text-xs text-ink-600 mt-1">调用大模型分析赛事并生成投注建议</p>
-            </div>
-
-            {/* 自动兑现 */}
-            <div>
-              <label className="flex items-center gap-2 text-sm text-ink-400">
-                <input
-                  type="checkbox"
-                  checked={formData.auto_cashout}
-                  onChange={(e) => setFormData({ ...formData, auto_cashout: e.target.checked })}
-                  className="accent-brand-500"
-                />
-                自动提前兑现
-              </label>
-              <p className="text-xs text-ink-600 mt-1">当赔率达到阈值时自动兑现</p>
+              <label className="block text-sm text-ink-400 mb-1.5">排除球队</label>
+              <input
+                type="text"
+                value={formData.excluded_teams.join('，')}
+                onChange={(e) => setFormData({ ...formData, excluded_teams: e.target.value.split(/[，,]/).map((s) => s.trim()).filter(Boolean) })}
+                className="input"
+                placeholder="多个球队用逗号分隔"
+              />
             </div>
           </div>
 
@@ -855,7 +819,7 @@ export default function AIPanelPage() {
         <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
           <h3 className="font-bold flex items-center gap-2">
             <Brain size={18} className="text-brand-700" />
-            今日AI推荐
+            实时 AI 推荐
           </h3>
           <div className="flex flex-wrap items-center gap-2">
             {!analysisOn ? (
@@ -866,7 +830,7 @@ export default function AIPanelPage() {
                 className="btn-success flex items-center gap-1.5 px-3 py-1.5 text-sm"
               >
                 {analysisBusy ? <Loader2 size={14} className="animate-spin" /> : <Play size={14} />}
-                开始分析
+                开始实时分析
               </button>
             ) : (
               <button
@@ -876,7 +840,7 @@ export default function AIPanelPage() {
                 className="btn-danger flex items-center gap-1.5 px-3 py-1.5 text-sm"
               >
                 {analysisBusy ? <Loader2 size={14} className="animate-spin" /> : <Square size={14} />}
-                停止分析
+                停止实时分析
               </button>
             )}
             <button
@@ -919,7 +883,7 @@ export default function AIPanelPage() {
               {tab.label}
             </button>
           ))}
-          <span className="text-xs text-ink-400 ml-1">滚球 · 亚洲盘 · 初盘/变盘分析</span>
+          <span className="text-xs text-ink-400 ml-1">滚球 · 亚洲盘 · 捷报数据对比</span>
         </div>
 
         {analysisOn && (
@@ -930,11 +894,10 @@ export default function AIPanelPage() {
               <span className="w-2.5 h-2.5 rounded-full bg-brand-500 animate-pulse shrink-0" />
             )}
             <span>
-              {analyzing ? '正在后台分析滚球' : '后台分析已开启，轮询更新中'}
+              {analyzing ? '正在后台轮询滚球，按亚洲盘口和捷报数据对比后刷新推荐' : '后台分析已开启，推荐会自动刷新'}
               {SPORT_TABS.find((t) => t.key === sportTab)?.label || ''}
               {SITE_NAMES[siteTab] ? ` · ${SITE_NAMES[siteTab]}` : ''}
               {recsMeta.total > 0 ? `（${recsMeta.progress}/${recsMeta.total}）` : ''}
-              {recsMeta.minWinRate != null ? ` · 展示胜率≥${Number(recsMeta.minWinRate).toFixed(0)}%` : ''}
             </span>
           </div>
         )}
@@ -942,18 +905,18 @@ export default function AIPanelPage() {
         {recsLoading && recommendations.length === 0 && !analyzing ? (
           <div className="text-center py-10 text-ink-500">
             <Loader2 size={32} className="mx-auto mb-3 animate-spin text-brand-500" />
-            <p>正在加载{SPORT_TABS.find((t) => t.key === sportTab)?.label}推荐…</p>
+            <p>正在加载{SPORT_TABS.find((t) => t.key === sportTab)?.label}实时推荐…</p>
           </div>
         ) : recommendations.length === 0 ? (
           <div className="text-center py-10 text-ink-500">
             {analyzing ? (
               <>
                 <Loader2 size={40} className="mx-auto mb-3 animate-spin text-brand-500" />
-                <p>正在分析赛事页中的滚球比赛</p>
+                <p>正在分析赛事页中的滚球比赛，并比对亚洲盘口与捷报数据后生成推荐</p>
                 <p className="text-xs mt-1">
                   {recsMeta.total > 0
-                    ? `进度 ${recsMeta.progress}/${recsMeta.total}，完成后自动显示`
-                    : '结果就绪后将自动显示，无需长时间等待本页'}
+                      ? `进度 ${recsMeta.progress}/${recsMeta.total}，完成后自动显示`
+                    : '结果就绪后会自动显示，无需反复刷新本页'}
                 </p>
               </>
             ) : (
@@ -963,13 +926,13 @@ export default function AIPanelPage() {
                 <p className="text-xs mt-1">
                   {recsMeta.hint
                     || (!analysisOn
-                      ? '点击「开始分析」后后台轮询全部滚球'
-                      : `暂无胜率≥${recsMeta.minWinRate != null ? Number(recsMeta.minWinRate).toFixed(0) : '策略'}% 的比赛`)
+                      ? '点击「开始实时分析」后，后台会扫描全部滚球，并按亚洲盘口 + 捷报数据对比生成大小球推荐'
+                      : '暂无通过 AI 大小球分析的推荐')
                     || '请先在「赛事」页同步滚球'}
                 </p>
                 {recsMeta.rawCount > 0 ? (
                   <p className="text-xs text-ink-400 mt-2">
-                    已分析 {recsMeta.rawCount} 场，高于策略胜率阈值的场次才会显示
+                    已分析 {recsMeta.rawCount} 场，通过 AI 大小球分析的推荐才会显示
                   </p>
                 ) : null}
               </>
@@ -981,17 +944,16 @@ export default function AIPanelPage() {
               const rec_data = rec.recommendation || {}
               const markets = rec.markets || []
               const bettable = !!rec_data.should_bet
+              const readableReason = formatAiRecommendationReason({
+                recommendation: rec_data,
+                analysis: rec.analysis,
+                strategy: rec.strategy,
+              })
               const isManual = (engineStatus?.bet_mode || betMode) !== 'active'
               const winRate = rec_data.win_rate ?? ((rec_data.confidence || 0) * 100)
-              const sportKey = String(rec.sport || sportTab || 'football').toLowerCase()
               const visibleMarkets = markets.filter((m) => {
-                if (sportKey === 'basketball') {
-                  return m.key === 'ft_ou' || m.bet_type === 'total'
-                }
-                return ['ft_1x2', 'ft_ah', 'ft_ou'].includes(m.key)
-                  || ['moneyline', 'spread', 'total'].includes(m.bet_type)
+                return m.key === 'ft_ou' || m.bet_type === 'total'
               })
-              const primaryLabel = MARKET_LABEL[rec_data.bet_type] || '大小'
               return (
                 <div key={rec.match_id} className="bg-white border border-gray-200 rounded-lg p-4">
                   <div className="flex items-center justify-between mb-3">
@@ -1000,13 +962,12 @@ export default function AIPanelPage() {
                       <div className="text-xs text-ink-500 mt-0.5">
                         {rec.league || `赛事 #${rec.match_id}`}
                         <span className="mx-1.5">·</span>
-                        单边 · {sportKey === 'football' ? '独赢/亚洲让球/亚洲大小' : '亚洲大小'} · {SITE_NAMES[siteTab] || siteTab}
-                        {rec_data.bet_type ? ` · 主推${primaryLabel}` : ''}
+                        大小球 · {SITE_NAMES[siteTab] || siteTab}
                       </div>
                     </div>
                     <div className="text-right">
                       <div className={`text-xs font-semibold mb-1 ${bettable ? 'text-brand-700' : 'text-ink-400'}`}>
-                        {bettable ? '可投注' : '观望'}
+                        {bettable ? '可投注' : '未放行'}
                       </div>
                       <div className={`text-sm font-bold ${
                         winRate >= 75 ? 'text-brand-700' :
@@ -1017,7 +978,7 @@ export default function AIPanelPage() {
                     </div>
                   </div>
 
-                  {/* 盘口网格（对齐截图：独赢/让球/大小…） */}
+                  {/* 大小球盘口网格 */}
                   {visibleMarkets.length > 0 ? (
                     <div className="overflow-x-auto mb-3">
                       <div
@@ -1039,7 +1000,7 @@ export default function AIPanelPage() {
                             ) : null}
                           </div>
                         ))}
-                        {/* 按行渲染：独赢最多 3 行，其余 2 行 */}
+                        {/* 按行渲染：大小球最多 2 行 */}
                         {[0, 1, 2].flatMap((rowIdx) =>
                           visibleMarkets.map((m) => {
                             const cell = (m.cells || [])[rowIdx]
@@ -1096,9 +1057,11 @@ export default function AIPanelPage() {
                     </div>
                   ) : null}
 
-                  <div className="text-xs text-ink-400 bg-ink-50 rounded p-2 mb-3">
+                  <div className={`text-xs rounded p-2 mb-3 ${
+                    bettable ? 'text-brand-800 bg-brand-50' : 'text-amber-800 bg-amber-50'
+                  }`}>
                     <Shield size={12} className="inline mr-1" />
-                    {rec_data.reasoning || rec.analysis?.reasoning || '暂无分析说明'}
+                    {readableReason || '暂无分析说明'}
                   </div>
 
                   {isManual && (
@@ -1129,7 +1092,7 @@ export default function AIPanelPage() {
                         )}
                       </button>
                       <span className="text-xs text-ink-400">
-                        主推{primaryLabel} · {rec_data.selection_label || '-'}
+                        {rec_data.selection_label || '-'}
                         {rec_data.line != null && rec_data.line !== '' ? ` ${rec_data.line}` : ''}
                         {' '}@ {Number(rec_data.odds || 0).toFixed(2) || '-'}
                         {winRate ? ` · 胜率 ${Number(winRate).toFixed(0)}%` : ''}
@@ -1145,15 +1108,15 @@ export default function AIPanelPage() {
       </div>
 
       <div className="mt-8 card bg-brand-50/50 border-brand-100/80">
-        <h4 className="section-title mb-3 flex items-center gap-2 text-brand-900">
-          <Zap size={14} className="text-brand-700" />
-          使用说明
-        </h4>
+          <h4 className="section-title mb-3 flex items-center gap-2 text-brand-900">
+            <Zap size={14} className="text-brand-700" />
+            使用说明
+          </h4>
         <ol className="panel-note space-y-1.5 list-decimal list-inside text-ink-600">
-          <li>在「今日AI推荐」点「开始分析 / 停止分析」控制后台轮询</li>
-          <li>人工与自动：全部按「配置」参数运行（置信度、赔率区间、单笔上限、每日笔数、止损/止盈、偏好球类、排除球队、是否 LLM）</li>
-          <li>自动投注还需点「启动 AI」：每 10 分钟一轮，最多下 3 单且为不同比赛</li>
-          <li>人工一键投注：同样校验策略，未通过配置则拒绝下单</li>
+          <li>点「开始实时分析 / 停止实时分析」：只控制后台分析与推荐刷新，不会自动下单</li>
+          <li>后台每 10 分钟扫描一次滚球，结合亚洲盘口与捷报数据对比，生成大小球推荐</li>
+          <li>点「启动自动下注引擎」后，自动模式才会真实下单；每轮最多放行 3 场不同比赛大小球</li>
+          <li>人工模式下可用「一键投注」，AI 大小球分析不通过则拒绝下单</li>
         </ol>
       </div>
     </div>

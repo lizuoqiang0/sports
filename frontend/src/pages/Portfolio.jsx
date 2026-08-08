@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import { betsAPI } from '../lib/api.js'
+import { extractErrorMessage } from '../lib/httpError.js'
 import PageHeader from '../components/PageHeader.jsx'
 import toast from 'react-hot-toast'
 import { Loader2, ChevronLeft, ChevronRight } from 'lucide-react'
@@ -7,7 +8,7 @@ import { format } from 'date-fns'
 
 const STATUS_MAP = {
   success: { label: '成功', color: 'text-brand-700 bg-brand-50' },
-  failed: { label: '失败', color: 'text-red-600 bg-red-50' },
+  pending_confirm: { label: '待补录', color: 'text-amber-700 bg-amber-50' },
 }
 
 const SITE_LABELS = {
@@ -21,31 +22,49 @@ export default function PortfolioPage() {
   const [loading, setLoading] = useState(true)
   const [page, setPage] = useState(1)
   const [total, setTotal] = useState(0)
-  const [statusFilter, setStatusFilter] = useState('')
   const [siteFilter, setSiteFilter] = useState('')
   const pageSize = 20
 
   useEffect(() => {
     loadData()
-  }, [page, statusFilter, siteFilter])
+  }, [page, siteFilter])
 
   const loadData = async () => {
     setLoading(true)
     try {
-      const [portRes, betsRes] = await Promise.all([
+      const [portRes, betsRes] = await Promise.allSettled([
         betsAPI.portfolio(),
         betsAPI.history({
           page,
           page_size: pageSize,
-          status: statusFilter || undefined,
           provider: siteFilter || undefined,
         }),
       ])
-      setPortfolio(portRes.data)
-      setBets(betsRes.data?.items || [])
-      setTotal(betsRes.data?.total || 0)
+      let failed = 0
+
+      if (portRes.status === 'fulfilled') {
+        setPortfolio(portRes.value.data)
+      } else {
+        failed += 1
+        setPortfolio(null)
+      }
+
+      if (betsRes.status === 'fulfilled') {
+        setBets(betsRes.value.data?.items || [])
+        setTotal(betsRes.value.data?.total || 0)
+      } else {
+        failed += 1
+        setBets([])
+        setTotal(0)
+      }
+
+      if (failed === 2) {
+        toast.error(extractErrorMessage(portRes.reason || betsRes.reason, '投注记录加载失败，请稍后重试'))
+      } else if (failed === 1) {
+        toast.error('部分数据加载失败，页面已先显示可用内容')
+      }
     } catch (err) {
-      toast.error('加载失败')
+      toast.error(extractErrorMessage(err, '投注记录加载失败，请稍后重试'))
     } finally {
       setLoading(false)
     }
@@ -58,7 +77,7 @@ export default function PortfolioPage() {
       <PageHeader
         eyebrow="持仓"
         title="投注记录"
-        description="AI 自动投注记录"
+        description="展示本地下单成功记录；OB 已返回单号但待补录的订单也会显示"
       />
 
       {/* 今日投注 / 总投注 */}
@@ -68,13 +87,17 @@ export default function PortfolioPage() {
             <div className="text-center">
               <div className="text-sm text-gray-400">今日投注</div>
               <div className="text-2xl font-bold text-brand-700 mt-1">{portfolio.today_bets} 笔</div>
-              <div className="text-xs text-ink-400 mt-0.5">每日 0 点清零</div>
+              <div className="text-xs text-ink-400 mt-0.5">
+                {portfolio.pending_bets > 0
+                  ? `含 ${portfolio.pending_bets} 笔待补录订单`
+                  : '仅统计本地成功订单'}
+              </div>
             </div>
             <div className="w-px h-12 bg-ink-100" />
             <div className="text-center">
               <div className="text-sm text-gray-400">总投注</div>
               <div className="text-2xl font-bold mt-1">{portfolio.total_bets} 笔</div>
-              <div className="text-xs text-ink-400 mt-0.5">每月末清零</div>
+              <div className="text-xs text-ink-400 mt-0.5">自然月内本地成功订单 + 待补录订单</div>
             </div>
           </div>
         </div>
@@ -99,20 +122,6 @@ export default function PortfolioPage() {
                 {s === '' ? '全部站点' : SITE_LABELS[s] || s}
               </button>
             ))}
-            {['', 'success', 'failed'].map((s) => (
-              <button
-                key={s || 'all'}
-                type="button"
-                onClick={() => { setStatusFilter(s); setPage(1) }}
-                className={`px-3 py-1.5 text-xs rounded-lg font-medium ${
-                  statusFilter === s
-                    ? 'bg-ink-900 text-white'
-                    : 'bg-ink-50 text-ink-500 hover:text-ink-900'
-                }`}
-              >
-                {s === '' ? '全部' : (STATUS_MAP[s]?.label || s)}
-              </button>
-            ))}
           </div>
         </div>
 
@@ -122,7 +131,7 @@ export default function PortfolioPage() {
           </div>
         ) : bets.length === 0 ? (
           <div className="text-center py-10 text-gray-500">
-            暂无投注记录
+            <div>暂无本地成功或待补录投注记录</div>
           </div>
         ) : (
           <>

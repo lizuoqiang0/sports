@@ -1,5 +1,6 @@
 import { createContext, useContext, useEffect, useRef, useState } from 'react'
 import { useAuth } from './auth.jsx'
+import { ingestAiEventLog, pushLogOnce } from './aiLogs.jsx'
 
 const WSContext = createContext(null)
 
@@ -48,6 +49,7 @@ export function WSProvider({ children }) {
     ws.onopen = () => {
       console.log('[WS] Connected')
       setConnected(true)
+      pushLogOnce('ws:connected', 'engine', '实时连接已建立，开始接收 AI / 赔率事件', null, 10000)
       ws.send(JSON.stringify({ action: 'ping' }))
       // 订阅全站滚球推送
       ws.send(JSON.stringify({ action: 'subscribe', channel: 'odds:live' }))
@@ -77,8 +79,16 @@ export function WSProvider({ children }) {
         } else if (msg.type === 'snapshot' && msg.data) {
           console.log('[WS] Snapshot:', msg.data)
         } else if (msg.type === 'bet_placed') {
+          const data = msg.data || {}
+          pushLogOnce(
+            `bet_placed:${data.bet_id || data.match_id || ''}:${data.created_at || ''}`,
+            'bet_placed',
+            `手动下单成功: ${String(data.selection || '-')} @ ${Number(data.odds || 0).toFixed(2)}`,
+            data,
+          )
           window.dispatchEvent(new CustomEvent('betUpdate', { detail: msg.data }))
         } else if (msg.type === 'ai_recommend' || (msg.type && String(msg.type).startsWith('ai_'))) {
+          ingestAiEventLog(msg)
           window.dispatchEvent(new CustomEvent('aiUpdate', { detail: msg }))
         }
       } catch (err) {
@@ -89,6 +99,7 @@ export function WSProvider({ children }) {
     ws.onclose = () => {
       console.log('[WS] Disconnected')
       setConnected(false)
+      pushLogOnce('ws:disconnected', 'engine', '实时连接已断开，系统将自动重连', null, 10000)
       reconnectTimer.current = setTimeout(connect, 5000)
     }
 

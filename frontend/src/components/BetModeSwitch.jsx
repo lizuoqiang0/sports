@@ -9,8 +9,9 @@ import { monitoringAPI } from '../lib/api.js'
  * - 自动：扫描通过后自动真实下单
  */
 export default function BetModeSwitch({ className = '', onChange }) {
-  const [betMode, setBetMode] = useState('manual')
+  const [betMode, setBetMode] = useState(null)
   const [meta, setMeta] = useState(null)
+  const [loading, setLoading] = useState(true)
   const [switching, setSwitching] = useState(false)
 
   const load = async () => {
@@ -21,6 +22,8 @@ export default function BetModeSwitch({ className = '', onChange }) {
       onChange?.(res.data)
     } catch {
       /* ignore */
+    } finally {
+      setLoading(false)
     }
   }
 
@@ -29,7 +32,7 @@ export default function BetModeSwitch({ className = '', onChange }) {
   }, [])
 
   const toggle = async (next) => {
-    if (switching || next === betMode) return
+    if (switching || loading || next === betMode) return
     setSwitching(true)
     try {
       const res = await monitoringAPI.setBetMode(next)
@@ -45,27 +48,32 @@ export default function BetModeSwitch({ className = '', onChange }) {
   }
 
   const isActive = betMode === 'active'
+  const disabled = switching || loading || betMode === null
 
   return (
     <div className={`flex flex-col gap-1 ${className}`}>
       <div className="flex items-center gap-1 p-1 rounded-2xl border border-ink-200 bg-white shadow-sm">
         <button
           type="button"
-          disabled={switching}
+          disabled={disabled}
           onClick={() => toggle('manual')}
           className={`flex items-center gap-1.5 px-3 py-2 rounded-xl text-sm font-semibold transition-all ${
-            !isActive ? 'bg-ink-900 text-white' : 'text-ink-500 hover:text-ink-800'
+            betMode === null
+              ? 'text-ink-400'
+              : (!isActive ? 'bg-ink-900 text-white' : 'text-ink-500 hover:text-ink-800')
           }`}
         >
-          <Hand size={15} />
+          {loading ? <Loader2 size={15} className="animate-spin" /> : <Hand size={15} />}
           人工
         </button>
         <button
           type="button"
-          disabled={switching}
+          disabled={disabled}
           onClick={() => toggle('active')}
           className={`flex items-center gap-1.5 px-3 py-2 rounded-xl text-sm font-semibold transition-all ${
-            isActive ? 'bg-brand-700 text-white' : 'text-ink-500 hover:text-ink-800'
+            betMode === null
+              ? 'text-ink-400'
+              : (isActive ? 'bg-brand-700 text-white' : 'text-ink-500 hover:text-ink-800')
           }`}
         >
           {switching ? <Loader2 size={15} className="animate-spin" /> : <Zap size={15} />}

@@ -65,6 +65,9 @@ export default function DashboardPage() {
 
   const totalAssets = toNumber(stats?.total_assets ?? siteBalances.total_balance)
   const dailyPnl = toNumber(stats?.daily_pnl)
+  const aiTone = aiStatus?.badge_tone || 'slate'
+  const aiLabel = aiStatus?.effective_label || (aiStatus?.engine_running ? 'AI 运行中' : 'AI 未启动')
+  const showAiBadge = Boolean(aiStatus && aiStatus?.effective_state && aiStatus.effective_state !== 'disabled')
 
   return (
     <div className="page">
@@ -76,10 +79,34 @@ export default function DashboardPage() {
         })}`}
         actions={(
           <>
-            {aiStatus.running && (
-              <div className="flex items-center gap-2 px-3 py-1.5 bg-brand-50 border border-brand-100 rounded-lg">
-                <Bot size={15} className="text-brand-700" />
-                <span className="text-xs font-semibold text-brand-700">AI 运行中</span>
+            {showAiBadge && (
+              <div className={`flex items-center gap-2 px-3 py-1.5 rounded-lg border ${
+                aiTone === 'green'
+                  ? 'bg-brand-50 border-brand-100'
+                  : aiTone === 'amber'
+                    ? 'bg-yellow-50 border-yellow-100'
+                    : aiTone === 'orange'
+                      ? 'bg-orange-50 border-orange-100'
+                      : 'bg-ink-50 border-ink-100'
+              }`}>
+                <Bot size={15} className={
+                  aiTone === 'green'
+                    ? 'text-brand-700'
+                    : aiTone === 'amber'
+                      ? 'text-yellow-700'
+                      : aiTone === 'orange'
+                        ? 'text-orange-700'
+                        : 'text-ink-600'
+                } />
+                <span className={`text-xs font-semibold ${
+                  aiTone === 'green'
+                    ? 'text-brand-700'
+                    : aiTone === 'amber'
+                      ? 'text-yellow-700'
+                      : aiTone === 'orange'
+                        ? 'text-orange-700'
+                        : 'text-ink-600'
+                }`}>{aiLabel}</span>
               </div>
             )}
             <div className={`flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg font-semibold border ${

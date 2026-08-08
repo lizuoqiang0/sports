@@ -9,12 +9,13 @@ import enum
 
 from sqlalchemy import (
     Column, BigInteger, String, Boolean, DateTime, Numeric,
-    Integer, ForeignKey, Text, Index, JSON, UniqueConstraint
+    Integer, ForeignKey, Text, Index, JSON, UniqueConstraint, text
 )
 from sqlalchemy.orm import relationship, Mapped, mapped_column
 from sqlalchemy.types import TypeDecorator
 
 from app.database import Base
+from app.config import settings
 
 
 # === 自定义类型 ===
@@ -145,18 +146,23 @@ class AIConfig(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), unique=True)
 
     # 策略配置
-    strategy: Mapped[str] = mapped_column(String(50), default="balanced")  # conservative/balanced/aggressive
+    strategy: Mapped[str] = mapped_column(
+        String(50),
+        default="high_win_rate",
+        server_default=text("'high_win_rate'"),
+        nullable=False,
+    )  # only high_win_rate
     max_bet_amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), default=100)
     max_daily_bets: Mapped[int] = mapped_column(Integer, default=10)
-    min_confidence: Mapped[float] = mapped_column(default=0.75)
+    min_confidence: Mapped[float] = mapped_column(default=0.0)
     preferred_sports: Mapped[list] = mapped_column(JSON, default=list)  # ["football", "basketball"]
     excluded_teams: Mapped[list] = mapped_column(JSON, default=list)
 
     # 风控
     stop_loss: Mapped[Decimal] = mapped_column(Numeric(18, 2), default=500)  # 止损金额
     take_profit: Mapped[Decimal] = mapped_column(Numeric(18, 2), default=1000)  # 止盈金额
-    max_odds: Mapped[float] = mapped_column(default=3.5)  # 最高赔率
-    min_odds: Mapped[float] = mapped_column(default=1.5)   # 最低赔率
+    max_odds: Mapped[float] = mapped_column(default=10.0)  # 最高赔率
+    min_odds: Mapped[float] = mapped_column(default=1.1)   # 最低赔率
 
     # 高级
     use_llm_analysis: Mapped[bool] = mapped_column(Boolean, default=True)
@@ -259,6 +265,7 @@ class Bet(Base):
     odds: Mapped[float] = mapped_column(nullable=False)  # 下注时赔率
     stake: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)  # 投注金额
     potential_payout: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)  # 预期赔付
+    actual_payout: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False, default=0)  # 实际赔付
     # 盘口线：大小球 total / 让球 spread（结算用）
     line: Mapped[Optional[float]] = mapped_column(nullable=True)
 

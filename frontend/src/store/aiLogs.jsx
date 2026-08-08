@@ -7,11 +7,13 @@ import { useState, useEffect } from 'react'
 
 const MAX_LOGS = 300
 const STORAGE_KEY = 'ai_logs_v1'
+const RECENT_KEY_TTL_MS = 15000
 
 // 模块级存储 + 订阅
 let _logs = []
 let _loaded = false
 const _subscribers = new Set()
+const _recentKeys = new Map()
 
 function _load() {
   if (_loaded) return
@@ -48,6 +50,12 @@ function emit() {
   })
 }
 
+function _pruneRecentKeys(now = Date.now()) {
+  for (const [key, expiresAt] of _recentKeys.entries()) {
+    if (expiresAt <= now) _recentKeys.delete(key)
+  }
+}
+
 function _safeDetail(detail) {
   if (!detail) return null
   if (typeof detail === 'string') return detail.slice(0, 500)
@@ -71,6 +79,138 @@ export function pushLog(type, message, detail = null) {
   _logs = [entry, ..._logs].slice(0, MAX_LOGS)
   _persist()
   emit()
+}
+
+export function pushLogOnce(uniqueKey, type, message, detail = null, ttlMs = RECENT_KEY_TTL_MS) {
+  _load()
+  const key = String(uniqueKey || '').trim()
+  if (!key) {
+    pushLog(type, message, detail)
+    return
+  }
+  const now = Date.now()
+  _pruneRecentKeys(now)
+  const expiresAt = _recentKeys.get(key) || 0
+  if (expiresAt > now) return
+  _recentKeys.set(key, now + Math.max(1000, Number(ttlMs) || RECENT_KEY_TTL_MS))
+  pushLog(type, message, detail)
+}
+
+function _num(value, fallback = 0) {
+  const n = Number(value)
+  return Number.isFinite(n) ? n : fallback
+}
+
+function _fmtOdds(value) {
+  const n = _num(value, 0)
+  return n > 0 ? n.toFixed(2) : '-'
+}
+
+function _fmtWinRate(value) {
+  const n = _num(value, 0)
+  return `${n.toFixed(0)}%`
+}
+
+function _providerLabel(provider, fallback = '') {
+  const p = String(provider || fallback || '').trim()
+  return p || ''
+}
+
+export function ingestAiEventLog(detail) {
+  _load()
+  const eventType = String(detail?.type || '').trim()
+  if (!eventType) return
+  const data = detail?.data || {}
+  const stamp = String(detail?.timestamp || data?.timestamp || new Date().toISOString())
+  const eventKey = `${eventType}:${stamp}`
+
+  if (eventType === 'ai_cycle_complete') {
+    const analyzed = _num(data?.analyzed, 0)
+    const executed = _num(data?.executed, 0)
+    pushLogOnce(eventKey, 'cycle', `AI 完成一轮分析：${analyzed} 场分析，${executed} 笔下单`, data)
+    for (const item of Array.isArray(data?.analysis_summary) ? data.analysis_summary : []) {
+      const key = `${eventKey}:analysis:${item.match_id || `${item.home_team || ''}-${item.away_team || ''}`}:${item.selection || ''}:${item.bet_type || ''}`
+      const market = String(item.bet_type || '')
+      const marketLabel = market === 'total' ? '亚洲大小' : market === 'moneyline' ? '独赢' : market === 'spread' ? '亚洲让球' : market || '-'
+      const selection = String(item.selection || '-')
+      const tag = item.should_bet ? '✓推荐' : _fmtWinRate(item.confidence)
+      pushLogOnce(
+        key,
+        'analysis',
+        `${item.home_team || '-'} vs ${item.away_team || '-'}  ${marketLabel} ${selection} @ ${_fmtOdds(item.odds)}  ${tag}`,
+        item,
+      )
+    }
+    return
+  }
+
+  if (eventType === 'ai_cycle_done') {
+    const analyzed = _num(data?.analyzed, 0)
+    pushLogOnce(eventKey, 'cycle', `AI 分析完成：${analyzed} 场，无符合策略的下单机会`, data)
+    for (const item of Array.isArray(data?.analysis_summary) ? data.analysis_summary : []) {
+      const key = `${eventKey}:analysis:${item.match_id || `${item.home_team || ''}-${item.away_team || ''}`}:${item.selection || ''}:${item.bet_type || ''}`
+      const market = String(item.bet_type || '')
+      const marketLabel = market === 'total' ? '亚洲大小' : market === 'moneyline' ? '独赢' : market === 'spread' ? '亚洲让球' : market || '-'
+      pushLogOnce(
+        key,
+        'analysis',
+        `${item.home_team || '-'} vs ${item.away_team || '-'}  ${marketLabel} ${item.selection || '-'} @ ${_fmtOdds(item.odds)}  ${_fmtWinRate(item.confidence)}`,
+        item,
+      )
+    }
+    return
+  }
+
+  if (eventType === 'ai_risk_stop') {
+    pushLogOnce(eventKey, 'risk', `风控触发: ${typeof data === 'string' ? data : (data?.message || 'AI 引擎已暂停')}`, data)
+    return
+  }
+
+  if (eventType === 'ai_manual_recommend') {
+    const sel = String(data?.selection || '-')
+    const provider = _providerLabel(data?.provider)
+    const providerText = provider ? ` · ${provider}` : ''
+    pushLogOnce(eventKey, 'recommend', `推荐: ${sel} @ ${_fmtOdds(data?.odds)}${providerText}`, data)
+    return
+  }
+
+  if (eventType === 'ai_recs_ready') {
+    const sport = String(data?.sport || '').trim()
+    const provider = _providerLabel(data?.provider)
+    const count = _num(data?.count, 0)
+    const fixtures = _num(data?.fixtures, 0)
+    const scope = [sport, provider].filter(Boolean).join(' · ')
+    const suffix = fixtures > 0 ? `，覆盖 ${fixtures} 场比赛` : ''
+    pushLogOnce(eventKey, 'analysis', `推荐刷新完成：${count} 场可展示${scope ? `（${scope}）` : ''}${suffix}`, data)
+    return
+  }
+
+  if (eventType === 'ai_config_updated') {
+    pushLogOnce(
+      eventKey,
+      'config',
+      `策略已更新：胜率≥${_fmtWinRate(_num(data?.min_confidence, 0) * 100)} · 赔率 ${String(data?.min_odds ?? '-')}~${String(data?.max_odds ?? '-')}`,
+      data,
+    )
+    return
+  }
+
+  if (eventType === 'ai_bet_placed') {
+    const provider = _providerLabel(data?.provider)
+    const suffix = provider ? ` · ${provider}` : ''
+    pushLogOnce(
+      eventKey,
+      'bet_placed',
+      `下单成功: ${String(data?.selection || '-')} @ ${_fmtOdds(data?.odds)}${suffix}`,
+      data,
+    )
+    return
+  }
+
+  if (eventType === 'ai_bet_failed') {
+    pushLogOnce(eventKey, 'bet_failed', `下单失败: ${String(data?.message || '未知原因')}`, data)
+    return
+  }
 }
 
 export function clearLogs() {

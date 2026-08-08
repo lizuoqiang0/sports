@@ -1,6 +1,8 @@
 import { NavLink, Outlet, useNavigate, useLocation } from 'react-router-dom'
 import { useAuth } from '../store/auth.jsx'
 import { useWebSocket } from '../store/websocket.jsx'
+import { aiAPI } from '../lib/api.js'
+import { pushLogOnce } from '../store/aiLogs.jsx'
 import {
   LayoutDashboard, Trophy, Wallet,
   Bot, LogOut, Wifi, WifiOff, User, Globe, Menu, X, ScrollText
@@ -54,11 +56,44 @@ export default function Layout() {
   const location = useLocation()
   const [showUserMenu, setShowUserMenu] = useState(false)
   const [navOpen, setNavOpen] = useState(false)
+  const [aiRuntime, setAiRuntime] = useState(null)
 
   useEffect(() => {
     setNavOpen(false)
     setShowUserMenu(false)
   }, [location.pathname])
+
+  useEffect(() => {
+    let alive = true
+    const loadAiRuntime = async () => {
+      if (!user) {
+        if (alive) setAiRuntime(null)
+        return
+      }
+      try {
+        const res = await aiAPI.status()
+        if (alive) {
+          const runtime = res.data || null
+          setAiRuntime(runtime)
+          if (runtime?.effective_label) {
+            pushLogOnce(
+              `runtime:${runtime.effective_state || 'unknown'}:${runtime.engine_running ? '1' : '0'}:${runtime.execution_mode || runtime.bet_mode || ''}`,
+              'engine',
+              `${runtime.effective_label}${runtime.execution_mode_label ? ` · ${runtime.execution_mode_label}` : ''}`,
+              runtime,
+              12000,
+            )
+          }
+        }
+      } catch {
+        if (alive) setAiRuntime(null)
+      }
+    }
+    loadAiRuntime()
+    return () => {
+      alive = false
+    }
+  }, [user, location.pathname])
 
   useEffect(() => {
     if (!navOpen) return undefined
@@ -74,6 +109,18 @@ export default function Layout() {
     toast.success('已退出登录')
     navigate('/login')
   }
+
+  const aiTone = aiRuntime?.badge_tone || 'slate'
+  const aiLabel = aiRuntime?.effective_label || 'AI 未启动'
+  const aiBadgeClass = (
+    aiTone === 'green'
+      ? 'bg-brand-50 text-brand-700'
+      : aiTone === 'amber'
+        ? 'bg-yellow-50 text-yellow-700'
+        : aiTone === 'orange'
+          ? 'bg-orange-50 text-orange-700'
+          : 'bg-ink-100 text-ink-500'
+  )
 
   return (
     <div className="app-shell text-ink-900">
@@ -141,8 +188,8 @@ export default function Layout() {
                   <div className="text-sm font-semibold text-ink-900">{user?.username}</div>
                   <div className="text-xs text-ink-500 mt-0.5 truncate">{user?.email}</div>
                   <div className="text-xs mt-2.5">
-                    <span className={`badge ${user?.ai_enabled ? 'bg-brand-50 text-brand-700' : 'bg-ink-100 text-ink-500'}`}>
-                      AI {user?.ai_enabled ? '已启用' : '未启用'}
+                    <span className={`badge ${aiBadgeClass}`}>
+                      {aiLabel}
                     </span>
                   </div>
                 </div>

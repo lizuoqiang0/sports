@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { bookmakersAPI } from '../lib/api.js'
+import { extractErrorMessage } from '../lib/httpError.js'
 import { BOOKMAKER_SITE_ORDER as SITE_ORDER } from '../lib/sites.js'
 import { formatMoney } from '../lib/format.js'
 import { usePagePoll } from '../hooks/usePagePoll.js'
@@ -77,7 +78,7 @@ export default function BookmakersPage() {
           session_token: '',
         })))
     } catch (e) {
-      toast.error(e.message || e.detail || '加载失败')
+      toast.error(extractErrorMessage(e, '站点列表加载失败，请稍后重试'))
     } finally {
       setLoading(false)
     }

@@ -21,6 +21,7 @@ from app.database import AsyncSessionLocal, init_db
 from app.models.user import User
 from app.ai.auto_better import AIBettingEngine
 from app.config import settings
+from app.core.cache import cache
 
 os.makedirs(os.path.dirname(settings.LOG_FILE) or ".", exist_ok=True)
 
@@ -97,14 +98,18 @@ async def main():
     parser.add_argument("--live", action="store_true", help="实盘模式（默认即为真实下单，保留以兼容编排参数）")
     args = parser.parse_args()
 
+    await cache.connect()
     await init_db()
 
-    if args.all_users:
-        await run_all_users()
-    elif args.user_id:
-        await run_single_user(args.user_id)
-    else:
-        parser.error("请指定 --all-users 或 --user-id")
+    try:
+        if args.all_users:
+            await run_all_users()
+        elif args.user_id:
+            await run_single_user(args.user_id)
+        else:
+            parser.error("请指定 --all-users 或 --user-id")
+    finally:
+        await cache.close()
 
 
 if __name__ == "__main__":

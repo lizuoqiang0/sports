@@ -8,7 +8,11 @@ from typing import Any, Optional
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.ai.strategy import StrategyConfig, decision_passes_strategy, load_fresh_strategy
+from app.ai.strategy import (
+    StrategyConfig,
+    decision_passes_strategy,
+    load_fresh_strategy,
+)
 from app.config import settings
 from app.models.user import Bet
 
@@ -70,30 +74,6 @@ def sport_is_preferred(sport: str, preferred: list[str] | None) -> bool:
         s = "football"
     prefs = ["football" if p == "soccer" else p for p in prefs]
     return s in prefs
-
-
-def odds_pass_strat(odds: float, strat: StrategyConfig) -> tuple[bool, str]:
-    try:
-        o = float(odds)
-    except (TypeError, ValueError):
-        return False, "赔率无效"
-    if o + 1e-9 < float(strat.min_odds):
-        return False, f"赔率 {o} < 配置下限 {strat.min_odds}"
-    if o - 1e-9 > float(strat.max_odds):
-        return False, f"赔率 {o} > 配置上限 {strat.max_odds}"
-    return True, ""
-
-
-def conf_pass_strat(confidence: float, strat: StrategyConfig) -> tuple[bool, str]:
-    try:
-        c = float(confidence)
-    except (TypeError, ValueError):
-        return False, "置信度无效"
-    if c > 1.0:
-        c = c / 100.0
-    if c + 1e-9 < float(strat.min_confidence):
-        return False, f"置信度 {c:.2f} < 配置 {strat.min_confidence:.2f}"
-    return True, ""
 
 
 async def calc_daily_pnl(db: AsyncSession, user_id: int) -> Decimal:
@@ -160,33 +140,10 @@ async def gate_recommendation_for_place(
     if not r.get("should_bet"):
         why = str(r.get("reasoning") or "策略未通过，不可下单")
         return False, why, Decimal("0"), strat
-
-    conf = r.get("confidence")
-    if conf is None:
-        conf = (r.get("win_rate") or 0) / 100.0 if r.get("win_rate") else 0
-    ok_c, why_c = conf_pass_strat(float(conf or 0), strat)
-    if not ok_c:
-        return False, why_c, Decimal("0"), strat
-
-    ok_o, why_o = odds_pass_strat(float(r.get("odds") or 0), strat)
-    if not ok_o:
-        return False, why_o, Decimal("0"), strat
-
     triggered, risk_why = await check_daily_risk(db, user_id, strat)
     if triggered:
         return False, risk_why, Decimal("0"), strat
-
     capped = cap_stake(stake, strat)
-    # 临时挂到 decision 形态复用 decision_passes_strategy
-    class _D:
-        should_bet = True
-        confidence = float(conf or 0)
-        odds = float(r.get("odds") or 0)
-        suggested_stake = capped
-
-    ok_d, why_d = decision_passes_strategy(_D(), strat)
-    if not ok_d:
-        return False, why_d, Decimal("0"), strat
     return True, "", capped, strat
 
 
@@ -218,17 +175,4 @@ def apply_rec_display_gates(
         excluded,
     ):
         return "excluded_team"
-    r = rec.get("recommendation") or {}
-    od = r.get("odds")
-    if od is not None:
-        ok, _ = odds_pass_strat(float(od), strat)
-        if not ok:
-            return "odds_out_of_range"
-    conf = r.get("confidence")
-    if conf is None and r.get("win_rate") is not None:
-        conf = float(r["win_rate"]) / 100.0
-    if conf is not None:
-        ok, _ = conf_pass_strat(float(conf), strat)
-        if not ok:
-            return "confidence_low"
     return None

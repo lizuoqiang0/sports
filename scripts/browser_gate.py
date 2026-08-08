@@ -189,10 +189,15 @@ def _lane_key(base_url: str = "", site_code: str = "") -> str:
         try:
             u = urlparse(raw if "://" in raw else f"https://{raw}")
             host = (u.hostname or raw).lower()
+            if host.startswith("www."):
+                host = host[4:]
             port = u.port or (443 if (u.scheme or "https") == "https" else 80)
             return f"{host}:{port}"
         except Exception:
-            return raw.lower()
+            fallback = raw.lower()
+            if fallback.startswith("www."):
+                fallback = fallback[4:]
+            return fallback
     return (site_code or "default").lower()
 
 
@@ -2012,6 +2017,7 @@ async def bets_history(req: BetHistoryRequest):
     from app.services.bookmakers.plugins.ob import orders as _ob_orders
 
     fetch_ob_orders = _ob_orders.fetch_ob_orders
+    history_timeout_sec = max(20.0, float(os.getenv("GATE_BET_HISTORY_TIMEOUT_SEC") or 60.0))
 
     site_code = (req.site_code or "ob").lower()
     lane = await _get_lane(req.base_url, site_code)
@@ -2035,11 +2041,28 @@ async def bets_history(req: BetHistoryRequest):
                 "orders": [],
             }
         if site_code == "ob":
-            return await fetch_ob_orders(
-                page=page,
-                session_token=sanitize_token(req.session_token),
-                days=max(1, min(int(req.days or 3), 14)),
-            )
+            try:
+                return await asyncio.wait_for(
+                    fetch_ob_orders(
+                        page=page,
+                        session_token=sanitize_token(req.session_token),
+                        days=max(1, min(int(req.days or 3), 14)),
+                    ),
+                    timeout=history_timeout_sec,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "bets/history timeout site=%s lane=%s timeout=%.1fs",
+                    site_code,
+                    lane.key,
+                    history_timeout_sec,
+                )
+                return {
+                    "ok": False,
+                    "message": f"注单历史查询超时（>{history_timeout_sec:.0f}s）",
+                    "orders": [],
+                    "timeout": True,
+                }
         # 平博：暂无稳定公开列表 API，返回空由本地完场结算覆盖
         return {
             "ok": True,
