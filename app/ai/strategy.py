@@ -27,6 +27,10 @@ class StrategyConfig(BaseModel):
     take_profit: float = settings.AI_TAKE_PROFIT
     use_llm_analysis: bool = True
 
+    min_confidence: float = 0.0    # 最低AI置信度（0=不限制）
+    min_odds: float = 1.1          # 最低赔率
+    max_odds: float = 10.0         # 最高赔率
+
 
 # 唯一策略：仅保留 simple 模式
 STRATEGIES = {
@@ -75,6 +79,9 @@ def effective_strategy_from_ai_config(ai_config) -> StrategyConfig:
             "stop_loss": max(0.0, _f("stop_loss", base.stop_loss)),
             "take_profit": max(0.0, _f("take_profit", base.take_profit)),
             "use_llm_analysis": bool(getattr(ai_config, "use_llm_analysis", True)),
+            "min_confidence": max(0.0, _f("min_confidence", base.min_confidence)),
+            "min_odds": max(1.01, _f("min_odds", base.min_odds)),
+            "max_odds": max(1.01, _f("max_odds", base.max_odds)),
         }
     )
 
@@ -87,6 +94,9 @@ def strategy_public_payload(strat: StrategyConfig) -> dict[str, Any]:
         "max_daily_bets": int(strat.max_daily_bets),
         "stop_loss": float(strat.stop_loss),
         "take_profit": float(strat.take_profit),
+        "min_confidence": float(strat.min_confidence),
+        "min_odds": float(strat.min_odds),
+        "max_odds": float(strat.max_odds),
     }
 
 
@@ -115,6 +125,9 @@ def ai_config_response_payload(ai_config: Any | None) -> dict[str, Any]:
         "stop_loss": float(getattr(ai_config, "stop_loss", effective.stop_loss)),
         "take_profit": float(getattr(ai_config, "take_profit", effective.take_profit)),
         "use_llm_analysis": bool(effective.use_llm_analysis),
+        "min_confidence": float(getattr(ai_config, "min_confidence", 0.0)) if ai_config is not None else 0.0,
+        "min_odds": float(getattr(ai_config, "min_odds", 1.1)) if ai_config is not None else 1.1,
+        "max_odds": float(getattr(ai_config, "max_odds", 10.0)) if ai_config is not None else 10.0,
         "auto_cashout": bool(getattr(ai_config, "auto_cashout", False)),
         "cashout_threshold": float(
             getattr(ai_config, "cashout_threshold", settings.AI_DEFAULT_CASHOUT_THRESHOLD)
@@ -277,14 +290,23 @@ class StrategyEngine:
             mid, odds_data, odds,
             "odds_data" if odds_data.get(prediction) else "analysis",
         )
-        if odds <= 1.0:
-            logger.info("[策略评估] ❌ match=%s 赔率无效: %.2f", mid, odds)
-            return self._reject(match_info, analysis, f"赔率无效: {odds}")
+        if odds < float(self.config.min_odds):
+            logger.info("[策略评估] ❌ match=%s 赔率 %.2f < 最低 %.2f", mid, odds, float(self.config.min_odds))
+            return self._reject(match_info, analysis, f"赔率 {odds} 低于最低 {self.config.min_odds}")
+        if odds > float(self.config.max_odds):
+            logger.info("[策略评估] ❌ match=%s 赔率 %.2f > 最高 %.2f", mid, odds, float(self.config.max_odds))
+            return self._reject(match_info, analysis, f"赔率 {odds} 高于最高 {self.config.max_odds}")
 
         # 仅按 AI 分析结果决定
         if not analysis.get("consensus_reached", False):
             logger.info("[策略评估] ❌ match=%s AI 共识未达成", mid)
             return self._reject(match_info, analysis, "AI 共识未达成")
+
+        # 最低置信度检查
+        min_conf = float(self.config.min_confidence or 0.0)
+        if float(confidence or 0) < min_conf:
+            logger.info("[策略评估] ❌ match=%s 置信度 %.2f < 最低 %.2f", mid, float(confidence or 0), min_conf)
+            return self._reject(match_info, analysis, f"置信度 {confidence:.2f} 低于最低 {min_conf:.2f}")
 
         # 投注金额：固定按策略单笔上限出手，不再做动态调仓
         max_amt = Decimal(str(self.config.max_bet_amount or 1))

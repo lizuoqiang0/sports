@@ -20,21 +20,21 @@ class TestStrategyConfig:
     def test_only_simple_strategy(self):
         assert list(STRATEGIES.keys()) == ["simple"]
 
-    def test_no_threshold_fields(self):
+    def test_has_configurable_fields(self):
         cfg = StrategyConfig()
-        assert not hasattr(cfg, "min_confidence")
-        assert not hasattr(cfg, "min_odds")
-        assert not hasattr(cfg, "max_odds")
-        assert not hasattr(cfg, "allowed_bet_types")
-        assert not hasattr(cfg, "max_bet_percentage")
-        assert not hasattr(cfg, "kelly_fraction_cap")
-
-    def test_has_basic_fields(self):
-        cfg = StrategyConfig()
+        assert hasattr(cfg, "min_confidence")
+        assert hasattr(cfg, "min_odds")
+        assert hasattr(cfg, "max_odds")
         assert hasattr(cfg, "max_bet_amount")
         assert hasattr(cfg, "max_daily_bets")
         assert hasattr(cfg, "stop_loss")
         assert hasattr(cfg, "take_profit")
+
+    def test_no_removed_fields(self):
+        cfg = StrategyConfig()
+        assert not hasattr(cfg, "allowed_bet_types")
+        assert not hasattr(cfg, "max_bet_percentage")
+        assert not hasattr(cfg, "kelly_fraction_cap")
 
 
 class TestBetDecision:
