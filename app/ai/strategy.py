@@ -251,8 +251,19 @@ class StrategyEngine:
         confidence = analysis.get("confidence", 0)
         prediction = str(analysis.get("prediction", "") or "").lower()
         bet_type = "total"
+        mid = match_info.get("id", "?")
+        ht = match_info.get("home_team", "?")
+        at = match_info.get("away_team", "?")
+
+        logger.info(
+            "[策略评估] match=%s %s vs %s | pred=%s conf=%.2f consensus=%s | 余额=%.2f 日亏=%.2f 活跃=%d",
+            mid, ht, at, prediction, float(confidence or 0),
+            analysis.get("consensus_reached"),
+            float(user_balance), float(daily_loss), active_bets_count,
+        )
 
         if prediction not in ("over", "under"):
+            logger.info("[策略评估] ❌ match=%s 投注方向无效: %s", mid, prediction)
             return self._reject(match_info, analysis, f"不支持的投注方向: {prediction}")
 
         # 赔率仅做有效性检查，不再做区间门槛
@@ -261,11 +272,18 @@ class StrategyEngine:
             odds = float(odds_data.get(prediction) or analysis.get("odds") or 0)
         except (TypeError, ValueError):
             odds = 0.0
+        logger.info(
+            "[策略评估] match=%s 赔率检查 | odds_data=%s | 取值=%.2f (from %s)",
+            mid, odds_data, odds,
+            "odds_data" if odds_data.get(prediction) else "analysis",
+        )
         if odds <= 1.0:
+            logger.info("[策略评估] ❌ match=%s 赔率无效: %.2f", mid, odds)
             return self._reject(match_info, analysis, f"赔率无效: {odds}")
 
         # 仅按 AI 分析结果决定
         if not analysis.get("consensus_reached", False):
+            logger.info("[策略评估] ❌ match=%s AI 共识未达成", mid)
             return self._reject(match_info, analysis, "AI 共识未达成")
 
         # 投注金额：固定按策略单笔上限出手，不再做动态调仓
@@ -273,6 +291,12 @@ class StrategyEngine:
         suggested_stake = max(max_amt, Decimal("1.00")).quantize(Decimal("0.01"))
 
         risk_score = self._calc_risk_score(confidence, odds, active_bets_count)
+
+        logger.info(
+            "[策略评估] ✅ match=%s 通过 | sel=%s conf=%.2f odds=%.2f | 下注=%.2f risk=%.2f max_bet=%.2f",
+            mid, prediction, float(confidence or 0), odds,
+            float(suggested_stake), risk_score, float(self.config.max_bet_amount or 0),
+        )
 
         return BetDecision(
             match_id=match_info.get("id"),

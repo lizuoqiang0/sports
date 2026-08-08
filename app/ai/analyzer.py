@@ -265,18 +265,52 @@ class MatchAnalyzer:
                 and str(cached.get("prediction") or "") in VALID_PREDICTIONS
                 and str(cached.get("bet_type") or "total") in VALID_BET_TYPES
             ):
-                logger.debug(f"AI ensemble 缓存命中: {cache_key}")
+                logger.info(
+                    "[AI分析] 缓存命中 match=%s %s vs %s | pred=%s conf=%.2f models=%s",
+                    match_info.get("id"), match_info.get("home_team"), match_info.get("away_team"),
+                    cached.get("prediction"), float(cached.get("confidence") or 0),
+                    cached.get("models_used"),
+                )
                 return cached
         except Exception as e:
             logger.debug("AI cache unavailable: %s", e)
 
+        logger.info(
+            "[AI分析] 开始分析 match=%s %s vs %s | sport=%s line=%s | 有基本面=%s 有盘口=%s",
+            match_info.get("id"), match_info.get("home_team"), match_info.get("away_team"),
+            sport, line_tag or "无",
+            bool(historical_data), bool(market_odds),
+        )
+
         prompt = self._build_analysis_prompt(match_info, historical_data, market_odds, news)
+        logger.info(
+            "[AI分析] Prompt 构建完成 match=%s | 长度=%d 字符 | 含analysis=%s 含live=%s 含trend=%s",
+            match_info.get("id"), len(prompt),
+            bool(isinstance(historical_data, dict) and historical_data.get("analysis")),
+            bool(isinstance(historical_data, dict) and historical_data.get("live")),
+            bool(isinstance(historical_data, dict) and historical_data.get("trend")),
+        )
 
         try:
             timeout = float(settings.ENSEMBLE_TIMEOUT_SEC)
             votes = await asyncio.wait_for(self._run_ensemble(prompt), timeout=timeout)
+            logger.info(
+                "[AI分析] Ensemble 完成 match=%s | 总投票=%d 成功=%d 失败=%d",
+                match_info.get("id"), len(votes),
+                sum(1 for v in votes if v.get("ok")),
+                sum(1 for v in votes if not v.get("ok")),
+            )
             analysis = self._aggregate_consensus(votes, market_odds, match_info=match_info)
-
+            logger.info(
+                "[AI分析] 共识判定 match=%s | consensus=%s pred=%s conf=%.2f ratio=%.2f models=%s | odds=%.2f",
+                match_info.get("id"),
+                analysis.get("consensus_reached"),
+                analysis.get("prediction"),
+                float(analysis.get("confidence") or 0),
+                float(analysis.get("consensus_ratio") or 0),
+                analysis.get("models_used"),
+                float(analysis.get("odds") or 0),
+            )
             if analysis.get("consensus_reached") and analysis.get("models_used"):
                 try:
                     await cache.set_json(cache_key, analysis, ttl=settings.LLM_CACHE_TTL)
@@ -285,10 +319,13 @@ class MatchAnalyzer:
             return analysis
 
         except asyncio.TimeoutError:
-            logger.error("AI ensemble 超时")
+            logger.error(
+                "[AI分析] Ensemble 超时 match=%s timeout=%.0fs",
+                match_info.get("id"), timeout,
+            )
             return self._fallback_result("AI分析超时，改用盘口启发式", error="ensemble_timeout")
         except Exception as e:
-            logger.error(f"AI ensemble 分析失败: {e}")
+            logger.error("[AI分析] Ensemble 失败 match=%s: %s", match_info.get("id"), e)
             return self._fallback_result(f"AI分析暂不可用: {e}", error=str(e))
 
     def _select_ensemble_models(self) -> list[str]:
@@ -331,7 +368,9 @@ class MatchAnalyzer:
 
     def _vote_from_raw(self, name: str, raw) -> dict:
         if isinstance(raw, Exception):
-            logger.warning("模型 %s 调用失败: %s", name, raw)
+            logger.warning(
+                "[AI投票] 模型=%s 调用失败: %s", name, raw,
+            )
             return {
                 "model": name,
                 "ok": False,
@@ -348,8 +387,16 @@ class MatchAnalyzer:
         pred = normalize_prediction(parsed.get("prediction"), bet_type=bt)
         if not bt:
             bt = _infer_bet_type(pred, "")
+        latency_ms = float((meta or {}).get("latency_ms") or 0)
+
         # 仅做大小球：bet_type 必须为 total，prediction 必须为 over/under
         if bt != "total" or pred not in ("over", "under"):
+            logger.info(
+                "[AI投票] 模型=%s ❌ 无效 | raw_bt=%s raw_pred=%s latency=%dms | reasoning=%s",
+                name, parsed.get("bet_type"), parsed.get("prediction"),
+                int(latency_ms),
+                str(parsed.get("reasoning", ""))[:120],
+            )
             return {
                 "model": name,
                 "ok": False,
@@ -357,7 +404,7 @@ class MatchAnalyzer:
                 "prediction": None,
                 "bet_type": None,
                 "confidence": 0.0,
-                "latency_ms": float((meta or {}).get("latency_ms") or 0),
+                "latency_ms": latency_ms,
             }
         try:
             conf = float(parsed.get("confidence", settings.LLM_DEFAULT_CONFIDENCE))
@@ -369,6 +416,14 @@ class MatchAnalyzer:
             line_f = float(line) if line is not None and line != "" else None
         except (TypeError, ValueError):
             line_f = None
+
+        logger.info(
+            "[AI投票] 模型=%s ✅ 有效 | pred=%s conf=%.2f line=%s risk=%s latency=%dms | reasoning=%s",
+            name, pred, conf, line_f, parsed.get("risk_level", "?"),
+            int(latency_ms),
+            str(parsed.get("reasoning", ""))[:120],
+        )
+
         return {
             "model": name,
             "ok": True,
@@ -377,7 +432,7 @@ class MatchAnalyzer:
             "bet_type": bt,
             "line": line_f,
             "confidence": conf,
-            "latency_ms": float((meta or {}).get("latency_ms") or 0),
+            "latency_ms": latency_ms,
             "reasoning": parsed.get("reasoning", ""),
             "key_factors": parsed.get("key_factors", []) or [],
             "risk_level": parsed.get("risk_level", "medium"),
@@ -491,6 +546,11 @@ class MatchAnalyzer:
             and v.get("bet_type") in VALID_BET_TYPES
         ]
         if not ok_votes:
+            logger.info(
+                "[AI共识] ❌ 无有效投票 | 总=%d 失败=%d | 失败原因: %s",
+                len(votes), sum(1 for v in votes if not v.get("ok")),
+                "; ".join(f'{v["model"]}: {v.get("error","?")}' for v in votes if not v.get("ok")),
+            )
             return self._fallback_result("无有效模型投票")
 
         # 共识键：bet_type + prediction
@@ -510,7 +570,19 @@ class MatchAnalyzer:
                     single_model_min_conf = cfg_conf
             except (TypeError, ValueError):
                 pass
+
+        logger.info(
+            "[AI共识] 投票明细: %s | 赢家=%s/%s 票数=%d/%d ratio=%.4f | 门槛: min_ratio=%.2f min_votes=%d",
+            {v["model"]: f'{v["prediction"]}/{v.get("confidence",0):.2f}' for v in ok_votes},
+            winning_bt, winning_pred, win_count, len(ok_votes), consensus_ratio,
+            min_ratio, min_votes,
+        )
         if len(ok_votes) == 1:
+            logger.info(
+                "[AI共识] 单模型模式 | conf=%.2f >= 门槛=%.2f => consensus=%s",
+                ok_votes[0]["confidence"], single_model_min_conf,
+                ok_votes[0]["confidence"] >= single_model_min_conf,
+            )
             # 单模型场景不能天然视为“已达共识”，必须额外过当前生效置信度门槛
             consensus_reached = ok_votes[0]["confidence"] >= single_model_min_conf
             if consensus_reached:
@@ -519,6 +591,12 @@ class MatchAnalyzer:
             consensus_reached = (
                 win_count >= min_votes
                 and consensus_ratio + 1e-9 >= min_ratio
+            )
+            logger.info(
+                "[AI共识] 多模型模式 | win_count=%d >= min_votes=%d=%s | ratio=%.4f >= min_ratio=%.2f=%s => consensus=%s",
+                win_count, min_votes, win_count >= min_votes,
+                consensus_ratio, min_ratio, consensus_ratio + 1e-9 >= min_ratio,
+                consensus_reached,
             )
 
         agreeing = [

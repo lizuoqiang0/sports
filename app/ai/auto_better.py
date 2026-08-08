@@ -168,12 +168,18 @@ class AIBettingEngine:
             bet_mode = get_user_bet_mode(user)
             auto_place = is_active_mode(user)
             if not auto_place:
-                logger.info("人工模式：本轮仅分析推荐，不自动下单")
+                logger.info("[AI主循环] user=%s 人工模式：仅分析推荐，不自动下单", self.user_id)
+            else:
+                logger.info("[AI主循环] user=%s 自动模式：分析+自动下单", self.user_id)
 
             candidates = await self._scan_candidates(db, ai_config)
             if not candidates:
-                logger.debug("本轮无滚球候选赛事")
+                logger.info("[AI主循环] user=%s 本轮无滚球候选赛事", self.user_id)
                 return
+            logger.info(
+                "[AI主循环] user=%s 扫描到 %d 场候选赛事 | bet_mode=%s auto_place=%s",
+                self.user_id, len(candidates), bet_mode, auto_place,
+            )
 
             from app.services.fixture_key import group_matches_by_fixture
 
@@ -199,12 +205,13 @@ class AIBettingEngine:
             fixture_groups = [[int(m.id) for m in g] for g in groups]
 
             logger.info(
-                "本轮策略 user=%s stake<=%s daily<=%s stop=%s tp=%s",
+                "[AI主循环] user=%s 策略: stake<=%s daily<=%s stop=%s tp=%s | 同场分组=%d 组",
                 self.user_id,
                 strat_cfg.max_bet_amount,
                 strat_cfg.max_daily_bets,
                 strat_cfg.stop_loss,
                 strat_cfg.take_profit,
+                len(fixture_groups),
             )
             daily_loss = await self._calc_daily_pnl(db, user)
             daily_loss_amt = abs(daily_loss) if daily_loss < 0 else Decimal("0")
@@ -236,12 +243,26 @@ class AIBettingEngine:
         for item in raw:
             if item and not item.get("error"):
                 analyses.append(item)
+            elif item and item.get("error"):
+                logger.warning(
+                    "[AI主循环] 同场分析返回错误: %s vs %s | error=%s",
+                    item.get("home_team", "?"), item.get("away_team", "?"),
+                    item.get("error"),
+                )
+        logger.info(
+            "[AI主循环] Phase2 分析完成 | 分组=%d 成功=%d 失败=%d",
+            len(fixture_groups), len(analyses), len(fixture_groups) - len(analyses),
+        )
 
         decisions: list[BetDecision] = []
         for item in analyses:
             rec = item.get("recommendation") or {}
             sel = str(rec.get("selection") or "").lower()
             if sel not in ("over", "under"):
+                logger.info(
+                    "[AI主循环] 跳过无效方向: match=%s %s vs %s | sel=%s",
+                    item.get("match_id"), item.get("home_team", "?"), item.get("away_team", "?"), sel,
+                )
                 continue
             bt = "total"
             odds_map = dict(item.get("current_odds") or {})
@@ -313,6 +334,10 @@ class AIBettingEngine:
         await self._publish_analyses_to_recs_cache(analyses)
 
         approved = [d for d in decisions if d.should_bet]
+        logger.info(
+            "[AI主循环] 决策汇总 | 分析=%d 通过=%d 拒绝=%d",
+            len(analyses), len(approved), len(decisions) - len(approved),
+        )
         # 构建分析摘要供前端日志展示
         analysis_summary = []
         for item in analyses:
@@ -378,13 +403,14 @@ class AIBettingEngine:
                 float(sc[2] or 0),
             )
         logger.info(
-            "本轮候选可投 %s → 按胜率优先取 %s 场不同比赛（上限 %s）",
+            "[AI主循环] 优选完成 | 候选可投=%d → 选取=%d 场不同比赛（上限 %s）",
             len(approved),
             len(top_bets),
             max_per_cycle,
         )
 
         # --- Phase 3: 新会话执行下单 ---
+        logger.info("[AI主循环] Phase3 开始执行下单 | 计划下单=%d 场", len(top_bets))
         executed = 0
         placed_matches: set[int] = set()
         async with AsyncSessionLocal() as db:
@@ -402,23 +428,24 @@ class AIBettingEngine:
                 strategy_engine.config = strat_cfg
                 should_stop, reason = await self._check_risk(db, user, ai_config)
                 if should_stop:
-                    logger.info("执行中触发风控，停止本轮: %s", reason)
+                    logger.info("[AI主循环] ❌ 执行前触发风控，停止本轮: %s", reason)
             for decision in top_bets:
                 if executed >= cycle_cap:
+                    logger.info("[AI主循环] 已达本轮上限 %d 场，停止", cycle_cap)
                     break
                 mid = int(decision.match_id or 0)
                 if mid in placed_matches:
-                    logger.info("跳过同场重复: match=%s", mid)
+                    logger.info("[AI主循环] 跳过同场重复: match=%s", mid)
                     continue
                 # 跨轮次防重复：跳过今天已下注的比赛
                 if mid > 0 and await self._match_already_bet(db, self.user_id, mid):
-                    logger.info("跳过今日已下注比赛: match=%s", mid)
+                    logger.info("[AI主循环] 跳过今日已下注比赛: match=%s", mid)
                     continue
                 if not ai_config or should_stop:
                     break
                 ok_pass, why = decision_passes_strategy(decision, strat_cfg)
                 if not ok_pass:
-                    logger.info("最新策略拦截 match=%s: %s", decision.match_id, why)
+                    logger.info("[AI主循环] ❌ 最新策略拦截 match=%s: %s", decision.match_id, why)
                     continue
                 analysis_payload = {}
                 for item in analyses:
@@ -452,6 +479,11 @@ class AIBettingEngine:
                         strategy_engine.config = strat_cfg
             await db.commit()
 
+        logger.info(
+            "[AI主循环] 本轮完成 | 候选=%d 分析=%d 通过=%d 执行=%d | 模式=%s",
+            len(candidates), len(analyses), len(approved), executed, bet_mode,
+        )
+
         await self._notify(self.user_id, "cycle_complete", {
             "analyzed": len(analyses),
             "candidates": len(candidates),
@@ -462,7 +494,7 @@ class AIBettingEngine:
             "placed_matches": sorted(placed_matches),
             "bet_mode": bet_mode,
             "auto_place": auto_place,
-            "market": "moneyline,spread,total",
+            "market": "total",
             "scope": "live",
             "analysis_summary": analysis_summary,
             "decisions": [d.model_dump() for d in top_bets],
@@ -707,17 +739,19 @@ class AIBettingEngine:
 
         sel = str(decision.selection or "").lower()
         bet_type = str(getattr(decision, "bet_type", None) or "total").lower()
-        allowed = {
-            "total": {"over", "under"},
-            "moneyline": {"home", "away", "draw"},
-            "spread": {"home", "away"},
-        }
-        if bet_type not in allowed or sel not in allowed[bet_type]:
+        if bet_type != "total" or sel not in ("over", "under"):
             logger.warning(
-                "AI 不支持的盘口/方向: match=%s type=%s sel=%s",
+                "[AI下单] ❌ 不支持的盘口/方向: match=%s type=%s sel=%s",
                 decision.match_id, bet_type, sel,
             )
             return False
+
+        logger.info(
+            "[AI下单] 准备下单 match=%s %s vs %s | sel=%s conf=%.2f odds=%.2f stake=%.2f | provider=%s",
+            decision.match_id, match.home_team or "?", match.away_team or "?",
+            sel, float(decision.confidence or 0), float(decision.odds or 0),
+            float(decision.suggested_stake or 0), str(decision.provider_code or "?"),
+        )
 
         from app.services.bookmakers.catalog import provider_name
         from app.services.bookmakers.registry import is_real_live_account
@@ -992,7 +1026,7 @@ class AIBettingEngine:
         db.add(bet)
         await db.flush()
 
-        type_label = {"total": "大小", "moneyline": "胜负", "spread": "让球"}.get(bet_type, bet_type)
+        type_label = "大小"
         tx = Transaction(
             user_id=user.id,
             type=TransactionType.AI_BET,
@@ -1007,9 +1041,10 @@ class AIBettingEngine:
         db.add(tx)
 
         logger.info(
-            "AI真实投注成功: match=%s type=%s sel=%s line=%s stake=%s odds=%s conf=%.2f ext=%s",
-            decision.match_id, bet_type, sel, line_val, stake, current_odds,
-            decision.confidence, place.external_bet_id,
+            "[AI下单] ✅ 成功 match=%s | sel=%s line=%s stake=%.2f odds=%.2f conf=%.2f ext=%s | 预计赔付=%.2f",
+            decision.match_id, sel, line_val, float(stake), current_odds,
+            float(decision.confidence or 0), place.external_bet_id,
+            float(potential_payout),
         )
 
         await self._notify(user.id, "ai_bet_placed", {
