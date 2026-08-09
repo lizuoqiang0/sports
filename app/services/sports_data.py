@@ -16,6 +16,9 @@ def compute_quality(ctx: dict) -> dict:
         "home_form": 0.20,
         "away_form": 0.20,
         "standings": 0.30,
+        "analysis": 0.12,
+        "live": 0.12,
+        "trend": 0.08,
     }
     score = 0.0
     h2n = len((ctx.get("h2h") or {}).get("matches") or [])
@@ -35,6 +38,25 @@ def compute_quality(ctx: dict) -> dict:
     if standings.get("home") or standings.get("away"):
         fields.append("standings")
         score += weights["standings"]
+    analysis = ctx.get("analysis") if isinstance(ctx.get("analysis"), dict) else {}
+    live = ctx.get("live") if isinstance(ctx.get("live"), dict) else {}
+    trend = ctx.get("trend") if isinstance(ctx.get("trend"), dict) else {}
+
+    if analysis and any(
+        bool(analysis.get(k))
+        for k in ("injuries", "features", "compare", "analysis_tables")
+    ):
+        fields.append("analysis")
+        score += weights["analysis"]
+    if live and any(
+        bool((live.get(k) or {}).get("count")) or bool((live.get(k) or {}).get("tables"))
+        for k in ("lineup", "probabilities", "half_full_stats")
+    ):
+        fields.append("live")
+        score += weights["live"]
+    if trend and (trend.get("tables") or trend.get("initial_odds")):
+        fields.append("trend")
+        score += weights["trend"]
     if source == "none":
         score = 0.0
     return {
@@ -53,7 +75,7 @@ def confidence_cap_for_quality(quality: dict | None) -> Optional[float]:
     except (TypeError, ValueError):
         comp = 0.0
     if source == "none" or comp < 0.3:
-        return 0.55
+        return 0.50
     if comp < 0.5:
-        return 0.65
+        return 0.60
     return None

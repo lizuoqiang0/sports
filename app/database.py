@@ -88,7 +88,7 @@ def _migrate_columns(sync_conn):
 
 
 def _migrate_ai_config_strategy(sync_conn) -> None:
-    """把历史 AI 策略值统一收敛到唯一的 high_win_rate。"""
+    """把历史 AI 策略值统一收敛到唯一的 simple。"""
     inspector = inspect(sync_conn)
     if "ai_configs" not in set(inspector.get_table_names()):
         return
@@ -97,10 +97,10 @@ def _migrate_ai_config_strategy(sync_conn) -> None:
         sync_conn.execute(text(
             """
             UPDATE ai_configs
-            SET strategy = 'high_win_rate'
+            SET strategy = 'simple'
             WHERE strategy IS NULL
                OR TRIM(strategy) = ''
-               OR LOWER(TRIM(strategy)) <> 'high_win_rate'
+               OR LOWER(TRIM(strategy)) <> 'simple'
             """
         ))
     except Exception as exc:
@@ -109,24 +109,12 @@ def _migrate_ai_config_strategy(sync_conn) -> None:
     if sync_conn.dialect.name != "postgresql":
         return
 
+    # 删除旧的 CHECK 约束，统一为 simple
     postgres_statements = [
-        "ALTER TABLE ai_configs ALTER COLUMN strategy SET DEFAULT 'high_win_rate'",
-        "UPDATE ai_configs SET strategy = 'high_win_rate' WHERE strategy IS NULL",
+        "ALTER TABLE ai_configs ALTER COLUMN strategy SET DEFAULT 'simple'",
+        "UPDATE ai_configs SET strategy = 'simple' WHERE strategy IS NULL",
         "ALTER TABLE ai_configs ALTER COLUMN strategy SET NOT NULL",
-        """
-        DO $$
-        BEGIN
-            IF NOT EXISTS (
-                SELECT 1
-                FROM pg_constraint
-                WHERE conname = 'ck_ai_configs_strategy_high_win_rate'
-            ) THEN
-                ALTER TABLE ai_configs
-                ADD CONSTRAINT ck_ai_configs_strategy_high_win_rate
-                CHECK (strategy = 'high_win_rate');
-            END IF;
-        END $$;
-        """,
+        "ALTER TABLE ai_configs DROP CONSTRAINT IF EXISTS ck_ai_configs_strategy_high_win_rate",
     ]
     for sql in postgres_statements:
         try:

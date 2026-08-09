@@ -7,21 +7,18 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-from sqlalchemy.orm import selectinload
 
 from app.database import get_db
 from app.config import settings
-from app.models.user import User, AIConfig, Match, Odds, BetStatus, BetType
+from app.models.user import User, AIConfig, Match
 from app.core.security import get_current_user
 from app.ai.auto_better import (
-    AIBettingEngine, analyze_and_recommend,
+    analyze_and_recommend,
     start_user_engine, stop_user_engine, get_engine_status
 )
 from app.ai.strategy import (
-    STRATEGIES,
     ai_config_response_payload,
     effective_strategy_from_ai_config,
-    strategy_public_payload,
 )
 from app.schemas import APIResponse, AIConfigRequest
 
@@ -33,6 +30,7 @@ def compose_ai_runtime_status(
     *,
     status_info: dict | None,
     user: User,
+    manual_analysis_sports: list[str] | None = None,
 ) -> dict:
     """统一 AI 引擎状态与下单模式，避免前端自行拼语义。"""
     from app.services.bet_mode import get_user_bet_mode, mode_flags
@@ -41,45 +39,53 @@ def compose_ai_runtime_status(
     ai_enabled = bool(getattr(user, "ai_enabled", False))
     engine_running = bool((status_info or {}).get("running"))
     is_auto_mode = flags["bet_mode"] == "active"
+    analysis_sports = list(manual_analysis_sports or [])
+    manual_analysis_running = bool(analysis_sports)
+    sports_label = " / ".join("足球" if s == "football" else "篮球" for s in analysis_sports) or "当前球类"
 
     if ai_enabled and engine_running and is_auto_mode:
         effective_state = "auto_running"
-        effective_label = "自动下注引擎运行中"
-        effective_description = "后台正在持续分析；命中高胜率策略后会自动真实下单。"
+        effective_label = "自动运行中"
+        effective_description = "系统正在分析并自动下单。"
         badge_tone = "green"
+    elif manual_analysis_running:
+        effective_state = "manual_analysis_running"
+        effective_label = "手动分析中"
+        effective_description = f"系统正在分析{sports_label}，只出推荐，不会自动下单。"
+        badge_tone = "amber"
     elif ai_enabled and engine_running:
         effective_state = "manual_running"
-        effective_label = "分析引擎运行中（人工确认）"
-        effective_description = "后台正在持续分析；只生成高胜率推荐，不会自动下单。"
+        effective_label = "分析运行中"
+        effective_description = "系统正在分析，只出推荐。"
         badge_tone = "amber"
     elif ai_enabled:
         effective_state = "enabled_stopped"
-        effective_label = "已开启 AI 开关，未启动引擎"
-        effective_description = "当前不会自动分析，也不会自动下单；需要点击“启动自动下注引擎”。"
+        effective_label = "AI 已开启"
+        effective_description = "AI 已开启，但当前未运行。"
         badge_tone = "orange"
     elif is_auto_mode:
         effective_state = "mode_armed"
-        effective_label = "已切到自动下注模式，未启动引擎"
-        effective_description = "当前只是把下单方式切成自动；还需要点击“启动自动下注引擎”后才会自动真实下单。"
+        effective_label = "自动模式未启动"
+        effective_description = "已切到自动，但 AI 还没运行。"
         badge_tone = "slate"
     else:
         effective_state = "disabled"
-        effective_label = "分析/下注引擎未启动"
-        effective_description = "当前不会自动分析，也不会自动下单；如需只看推荐，请先启动分析。"
+        effective_label = "AI 未启动"
+        effective_description = "当前不会分析，也不会下单。"
         badge_tone = "slate"
 
-    scan_interval_sec = max(30, int(getattr(settings, "AI_SCAN_INTERVAL_SEC", 30) or 30))
-    max_bets_per_cycle = max(1, int(getattr(settings, "AI_MAX_BETS_PER_CYCLE", 3) or 3))
-
+    scan_interval_sec = max(120, int(getattr(settings, "AI_SCAN_INTERVAL_SEC", 120) or 120))
     return {
         **(status_info or {}),
         **flags,
         "ai_enabled": ai_enabled,
         "engine_enabled": ai_enabled,
         "engine_running": engine_running,
+        "manual_analysis_running": manual_analysis_running,
+        "manual_analysis_sports": analysis_sports,
         "execution_mode": flags["bet_mode"],
         "execution_mode_label": flags["label"],
-        "can_generate_recommendations": bool(ai_enabled and engine_running),
+        "can_generate_recommendations": bool(manual_analysis_running or (ai_enabled and engine_running)),
         "can_auto_execute": bool(ai_enabled and engine_running and is_auto_mode),
         "effective_state": effective_state,
         "effective_label": effective_label,
@@ -88,8 +94,7 @@ def compose_ai_runtime_status(
         "runtime_limits": {
             "scan_interval_sec": scan_interval_sec,
             "scan_interval_min": round(scan_interval_sec / 60, 2),
-            "max_bets_per_cycle": max_bets_per_cycle,
-            "distinct_matches_per_cycle": True,
+            "stream_bet_mode": True,
         },
     }
 
@@ -124,7 +129,6 @@ async def update_ai_config(
     from types import SimpleNamespace
 
     raw_snap = SimpleNamespace(
-        strategy=req.strategy,
         max_bet_amount=req.max_bet_amount,
         max_daily_bets=req.max_daily_bets,
         min_confidence=req.min_confidence,
@@ -135,9 +139,7 @@ async def update_ai_config(
         max_odds=req.max_odds,
         min_odds=req.min_odds,
         use_llm_analysis=req.use_llm_analysis,
-        auto_cashout=req.auto_cashout,
-        cashout_threshold=req.cashout_threshold,
-        is_active=True,
+        is_active=bool(req.is_active),
     )
     effective = effective_strategy_from_ai_config(raw_snap)
 
@@ -146,6 +148,7 @@ async def update_ai_config(
     config.max_bet_amount = effective.max_bet_amount
     config.max_daily_bets = effective.max_daily_bets
     config.min_confidence = effective.min_confidence
+    config.is_active = bool(req.is_active)
     config.preferred_sports = req.preferred_sports
     config.excluded_teams = req.excluded_teams
     config.stop_loss = req.stop_loss
@@ -153,13 +156,14 @@ async def update_ai_config(
     config.max_odds = effective.max_odds
     config.min_odds = effective.min_odds
     config.use_llm_analysis = effective.use_llm_analysis
-    config.auto_cashout = req.auto_cashout
-    config.cashout_threshold = req.cashout_threshold
 
+    if not config.is_active:
+        current_user.ai_enabled = False
     await db.flush()
-    await db.commit()
-
     response_payload = ai_config_response_payload(config)
+    await db.commit()
+    if not config.is_active:
+        await stop_user_engine(current_user.id)
 
     # 配置热更新：清推荐缓存 + 通知引擎/前端立即按新阈值生效
     try:
@@ -196,7 +200,7 @@ async def update_ai_config(
         logger.warning("AI配置热更新副作用失败: %s", e)
 
     return APIResponse(
-        message="AI配置更新成功，已立即生效",
+        message="AI 设置已保存",
         data=response_payload,
     )
 
@@ -209,10 +213,20 @@ async def start_ai(
     db: AsyncSession = Depends(get_db),
 ):
     """启动/停止AI自动投注。是否自动真实下单由用户「人工/自动」开关决定。"""
+    from app.ai.recs_job import list_analysis_watching_sports, stop_all_analysis_watches
+    from app.services.bet_mode import get_user_bet_mode
+
+    fresh_user = await db.get(User, current_user.id)
+    if get_user_bet_mode(fresh_user or current_user) != "active":
+        raise HTTPException(status_code=400, detail="请先切换到自动模式，再启动自动下单")
+
     current_user.ai_enabled = enabled
     await db.flush()
 
     if enabled:
+        manual_analysis_sports = await list_analysis_watching_sports(current_user.id)
+        if manual_analysis_sports:
+            await stop_all_analysis_watches(user_id=current_user.id)
         # 确保有可用 AIConfig，避免引擎启动后立刻因无配置退出
         cfg_res = await db.execute(select(AIConfig).where(AIConfig.user_id == current_user.id))
         cfg = cfg_res.scalar_one_or_none()
@@ -220,12 +234,15 @@ async def start_ai(
             cfg = AIConfig(
                 user_id=current_user.id,
                 is_active=True,
-                strategy="high_win_rate",
+                strategy="simple",
                 preferred_sports=["football", "basketball"],
             )
             db.add(cfg)
         else:
-            cfg.is_active = True
+            if not cfg.is_active:
+                raise HTTPException(status_code=400, detail="请先在 AI 设置中开启 AI")
+            if not bool(getattr(cfg, "use_llm_analysis", True)):
+                raise HTTPException(status_code=400, detail="请先在 AI 设置中开启 AI分析，再启动自动下单")
             if not cfg.preferred_sports:
                 cfg.preferred_sports = ["football", "basketball"]
         await db.flush()
@@ -234,23 +251,23 @@ async def start_ai(
         result = compose_ai_runtime_status(
             status_info=await get_engine_status(current_user.id),
             user=current_user,
+            manual_analysis_sports=[],
         )
         await db.commit()
-        return APIResponse(
-            message=(
-                f"AI引擎已启动（{result['effective_label']}："
-                f"{'自动真实下单' if result['can_auto_execute'] else '仅推荐，需人工确认'}）"
-            ),
-            data=result,
-        )
+        message = "自动下单已启动"
+        if manual_analysis_sports:
+            message += "，已停止手动分析"
+        return APIResponse(message=message, data=result)
     else:
+        manual_analysis_sports = await list_analysis_watching_sports(current_user.id)
         await stop_user_engine(current_user.id)
         result = compose_ai_runtime_status(
             status_info=await get_engine_status(current_user.id),
             user=current_user,
+            manual_analysis_sports=manual_analysis_sports,
         )
         await db.commit()
-        return APIResponse(message="AI引擎已停止", data=result)
+        return APIResponse(message="自动下单已停止", data=result)
 
 
 @router.post("/stop", response_model=APIResponse)
@@ -259,15 +276,19 @@ async def stop_ai(
     db: AsyncSession = Depends(get_db),
 ):
     """停止AI引擎"""
+    from app.ai.recs_job import list_analysis_watching_sports
+
     current_user.ai_enabled = False
     await db.flush()
     await stop_user_engine(current_user.id)
+    manual_analysis_sports = await list_analysis_watching_sports(current_user.id)
     result = compose_ai_runtime_status(
         status_info=await get_engine_status(current_user.id),
         user=current_user,
+        manual_analysis_sports=manual_analysis_sports,
     )
     await db.commit()
-    return APIResponse(message="AI引擎已停止", data=result)
+    return APIResponse(message="自动下单已停止", data=result)
 
 
 @router.get("/status", response_model=APIResponse)
@@ -276,6 +297,8 @@ async def ai_status(
     db: AsyncSession = Depends(get_db),
 ):
     """获取AI引擎运行状态（含人工/自动开关）"""
+    from app.ai.recs_job import list_analysis_watching_sports
+
     fresh = await db.get(User, current_user.id)
     status_info = await get_engine_status(current_user.id)
     ai_enabled = bool(getattr(fresh or current_user, "ai_enabled", False))
@@ -286,6 +309,7 @@ async def ai_status(
     runtime = compose_ai_runtime_status(
         status_info=status_info,
         user=fresh or current_user,
+        manual_analysis_sports=await list_analysis_watching_sports(current_user.id),
     )
     return APIResponse(data=runtime)
 
@@ -337,13 +361,14 @@ async def get_batch_recommendations(
     if sport_norm not in ("football", "basketball"):
         return APIResponse(
             success=False,
-            message="请指定球类：football（足球）或 basketball（篮球）",
+            message="仅支持足球或篮球",
             data=None,
         )
 
     from app.config import settings as _settings
 
     default_lim = int(getattr(_settings, "AI_RECS_LIMIT", 80) or 80)
+    scan_interval_sec = max(120, int(getattr(_settings, "AI_SCAN_INTERVAL_SEC", 120) or 120))
     limit = max(1, min(int(limit or default_lim), _settings.AI_RECS_MAX_LIMIT))
     bet_mode = get_user_bet_mode(current_user)
     ai_snap, strat_cfg = await load_fresh_strategy(current_user.id)
@@ -394,9 +419,9 @@ async def get_batch_recommendations(
 
     analyzing = job.get("status") in ("starting", "analyzing")
     filter_hint = (
-        f"后台分析中 · 每 30 秒轮询滚球 · 亚洲盘口 + 捷报数据对比 · 胜率≥{min_conf * 100:.0f}% · 赔率[{min_odds:g},{max_odds:g}]"
+        f"分析中 · 每 {scan_interval_sec} 秒扫描滚球 · 置信度≥{min_conf * 100:.0f}% · 赔率[{min_odds:g},{max_odds:g}]"
         if watching
-        else f"点击「开始分析」；系统会每 30 秒轮询滚球，按亚洲盘口 + 捷报数据对比，达到胜率≥{min_conf * 100:.0f}% 才放行"
+        else f"点击开始分析后，系统会每 {scan_interval_sec} 秒扫描滚球，达到置信度≥{min_conf * 100:.0f}% 才显示"
     )
 
     if isinstance(cached, dict) and "recommendations" in cached:
@@ -432,7 +457,7 @@ async def get_batch_recommendations(
                 "sport": sport_norm,
                 "mode": position_mode,
                 "bet_mode": bet_mode,
-                "filter": "high_win_rate",
+                "filter": "simple",
                 "min_win_rate": round(min_conf * 100, 1),
                 "provider": provider_code or None,
                 "scope": "live",
@@ -440,25 +465,25 @@ async def get_batch_recommendations(
                 "hint": (
                     None
                     if filtered
-                    else f"暂无胜率≥{min_conf * 100:.0f}% 的比赛"
+                    else f"暂无置信度≥{min_conf * 100:.0f}% 的比赛"
                 ),
                 "filter_hint": filter_hint,
             }
         )
         return APIResponse(
             data=payload,
-            message="analyzing" if analyzing else "cached",
+            message="分析中" if analyzing else "已更新",
         )
 
     hint = (
-        "正在后台分析滚球，完成后自动显示高胜率场次…"
+        "正在分析滚球，完成后会自动显示推荐"
         if watching or analyzing
-        else "请点击「开始分析」在后台轮询全部滚球"
+        else "点击开始分析后会自动轮询滚球"
     )
     if job.get("status") == "error":
-        hint = f"分析失败: {job.get('error') or '未知错误'}，请重新开始分析"
+        hint = f"分析失败：{job.get('error') or '未知错误'}"
     elif live_total == 0 and not analyzing:
-        hint = "暂无滚球大小球（请先在赛事页同步 OB / 平博滚球）"
+        hint = "暂无滚球，请先同步站点赛事"
 
     return APIResponse(
         data={
@@ -466,7 +491,7 @@ async def get_batch_recommendations(
             "recommendations": [],
             "sport": sport_norm,
             "bet_mode": bet_mode,
-            "filter": "high_win_rate",
+            "filter": "simple",
             "min_win_rate": round(min_conf * 100, 1),
             "filter_hint": filter_hint,
             "analysis_enabled": watching,
@@ -480,7 +505,7 @@ async def get_batch_recommendations(
             "source": "pending",
             "hint": hint,
         },
-        message="analyzing" if analyzing else "pending",
+        message="分析中" if analyzing else "待分析",
     )
 
 
@@ -489,21 +514,32 @@ async def start_recommendations_analysis(
     sport: str = "football",
     limit: int = 80,
     current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ):
     """开始后台轮询分析当前球类滚球大小球。"""
     from app.ai.recs_job import start_analysis_watch
     from app.config import settings as _settings
+    from app.ai.strategy import load_fresh_strategy
+    from app.services.bet_mode import get_user_bet_mode
     from app.services.bookmakers.sport_classify import normalize_sport
 
     sport_norm = normalize_sport(sport)
     if sport_norm not in ("football", "basketball"):
-        return APIResponse(success=False, message="请指定 football 或 basketball")
+        return APIResponse(success=False, message="仅支持足球或篮球")
+    fresh_user = await db.get(User, current_user.id)
+    if get_user_bet_mode(fresh_user or current_user) != "manual":
+        return APIResponse(success=False, message="自动模式下不能启动手动分析，请先切换到人工")
+    if bool(getattr(fresh_user or current_user, "ai_enabled", False)):
+        return APIResponse(success=False, message="请先停止自动下单，再启动手动分析")
+    ai_snap, _ = await load_fresh_strategy(current_user.id)
+    if ai_snap and not getattr(ai_snap, "is_active", True):
+        return APIResponse(success=False, message="请先在 AI 设置中开启 AI")
     default_lim = int(getattr(_settings, "AI_RECS_LIMIT", 80) or 80)
     limit = max(1, min(int(limit or default_lim), _settings.AI_RECS_MAX_LIMIT))
     snap = await start_analysis_watch(
         user_id=current_user.id, sport=sport_norm, limit=limit
     )
-    return APIResponse(data=snap, message="analysis_started")
+    return APIResponse(data=snap, message="分析已开始")
 
 
 @router.post("/recommendations/stop", response_model=APIResponse)
@@ -517,20 +553,9 @@ async def stop_recommendations_analysis(
 
     sport_norm = normalize_sport(sport)
     if sport_norm not in ("football", "basketball"):
-        return APIResponse(success=False, message="请指定 football 或 basketball")
+        return APIResponse(success=False, message="仅支持足球或篮球")
     snap = await stop_analysis_watch(user_id=current_user.id, sport=sport_norm)
-    return APIResponse(data=snap, message="analysis_stopped")
-
-
-# === 唯一高胜率策略 ===
-@router.get("/strategies", response_model=APIResponse)
-async def list_strategies():
-    """获取唯一高胜率策略信息"""
-    strategies = {}
-    for name, config in STRATEGIES.items():
-        strategies[name] = strategy_public_payload(config)
-    return APIResponse(data=strategies)
-
+    return APIResponse(data=snap, message="分析已停止")
 
 # === AI投注历史 ===
 @router.get("/history", response_model=APIResponse)
@@ -627,7 +652,7 @@ async def one_click_bet(
     if rec.get("error"):
         if req.dry_run:
             return APIResponse(
-                message="dry-run 已拦截：当前比赛不满足一键下注条件",
+                message="模拟通过失败",
                 data={
                     "dry_run": True,
                     "eligible": False,
@@ -661,7 +686,7 @@ async def one_click_bet(
     if not ok_gate:
         if req.dry_run:
             return APIResponse(
-                message="dry-run 已拦截：未通过策略配置",
+                message="模拟通过失败",
                 data={
                     "dry_run": True,
                     "eligible": False,
@@ -741,7 +766,7 @@ async def one_click_bet(
     if not placed_bets and failed_bets:
         if req.dry_run:
             return APIResponse(
-                message="dry-run 已完成，但当前无可提交注单",
+                message="模拟通过完成，但没有可下单结果",
                 data={
                     "dry_run": True,
                     "eligible": False,
@@ -753,7 +778,7 @@ async def one_click_bet(
         raise HTTPException(status_code=400, detail=f"全部下注失败: {failed_bets}")
 
     total_stake = sum(b["stake"] for b in placed_bets)
-    mode_label = "dry-run 模拟通过" if req.dry_run else "单边成功"
+    mode_label = "模拟通过" if req.dry_run else "已提交"
     msg = f"{mode_label} {len(placed_bets)} 笔"
     if failed_bets:
         msg += f"，失败 {len(failed_bets)} 笔"

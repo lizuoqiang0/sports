@@ -57,10 +57,19 @@ async def put_bet_mode(
     user: User = Depends(get_current_user),
 ):
     from app.services.bet_mode import mode_flags, set_user_bet_mode
+    from app.ai.auto_better import stop_user_engine
+    from app.ai.recs_job import stop_all_analysis_watches
 
     fresh = await db.get(User, user.id)
     if not fresh:
         raise HTTPException(status_code=404, detail="用户不存在")
     mode = await set_user_bet_mode(db, fresh, body.bet_mode)
+    if mode == "manual":
+        if bool(getattr(fresh, "ai_enabled", False)):
+            fresh.ai_enabled = False
+            await db.flush()
+            await stop_user_engine(fresh.id)
+    else:
+        await stop_all_analysis_watches(user_id=fresh.id)
     await db.commit()
-    return APIResponse(data=mode_flags(mode), message=f"已切换为{mode_flags(mode)['label']}模式")
+    return APIResponse(data=mode_flags(mode), message=f"已切换到{mode_flags(mode)['label']}")

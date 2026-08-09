@@ -226,8 +226,13 @@ async def _apply_score_clock(match: Match, rm) -> None:
     # 完场降级，避免「进行中」残留旧赛
     if period == "完场" or str(getattr(rm, "status", "") or "") == "finished":
         match.status = MatchStatus.FINISHED
+        if getattr(match, "end_time", None) is None:
+            match.end_time = datetime.now(timezone.utc)
         extra.pop("clock", None)
+        extra.pop("period", None)
         match.extra_data = extra
+    elif str(getattr(rm, "status", "") or "").lower() == "live":
+        match.end_time = None
 
 
 async def _resolve_match_id(db: AsyncSession, rm, local_by_id: dict[int, Match]) -> int | None:

@@ -47,7 +47,6 @@ export function WSProvider({ children }) {
     wsRef.current = ws
 
     ws.onopen = () => {
-      console.log('[WS] Connected')
       setConnected(true)
       pushLogOnce('ws:connected', 'engine', '实时连接已建立，开始接收 AI / 赔率事件', null, 10000)
       ws.send(JSON.stringify({ action: 'ping' }))
@@ -77,7 +76,7 @@ export function WSProvider({ children }) {
         } else if (msg.type === 'match_status' && msg.data) {
           applyMatchUpdate(msg.data)
         } else if (msg.type === 'snapshot' && msg.data) {
-          console.log('[WS] Snapshot:', msg.data)
+          // snapshot received
         } else if (msg.type === 'bet_placed') {
           const data = msg.data || {}
           pushLogOnce(
@@ -97,7 +96,6 @@ export function WSProvider({ children }) {
     }
 
     ws.onclose = () => {
-      console.log('[WS] Disconnected')
       setConnected(false)
       pushLogOnce('ws:disconnected', 'engine', '实时连接已断开，系统将自动重连', null, 10000)
       reconnectTimer.current = setTimeout(connect, 5000)

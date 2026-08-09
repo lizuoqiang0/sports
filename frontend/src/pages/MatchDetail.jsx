@@ -59,13 +59,13 @@ export default function MatchDetailPage() {
       }
 
       if (matchRes.status !== 'fulfilled') {
-        throw (matchRes.reason || new Error('赛事信息加载失败'))
+        throw (matchRes.reason || new Error('赛事加载失败'))
       }
       if (!silent && (oddsRes.status !== 'fulfilled' || compareRes.status !== 'fulfilled')) {
-        toast.error('部分数据加载失败，已先显示赛事基础信息')
+        toast.error('部分数据加载失败')
       }
     } catch (err) {
-      if (!silent) toast.error(extractErrorMessage(err, '赛事详情加载失败，请稍后重试'))
+      if (!silent) toast.error(extractErrorMessage(err, '赛事详情加载失败，请重试'))
     } finally {
       if (!silent) setLoading(false)
     }
@@ -124,7 +124,7 @@ export default function MatchDetailPage() {
       const res = await aiAPI.recommend(id)
       setAiAnalysis(res.data)
     } catch (err) {
-      toast.error(extractErrorMessage(err, 'AI 分析加载失败，请稍后重试'))
+      toast.error(extractErrorMessage(err, 'AI 分析加载失败，请重试'))
     } finally {
       setLoadingAI(false)
     }
@@ -160,7 +160,7 @@ export default function MatchDetailPage() {
         onClick={() => navigate(-1)}
         className="btn-ghost px-2 py-1.5 mb-5 -ml-2 text-ink-500"
       >
-        <ArrowLeft size={16} /> 返回赛事
+        <ArrowLeft size={16} /> 返回
       </button>
 
       <div className="card mb-6">
@@ -199,11 +199,11 @@ export default function MatchDetailPage() {
             className="btn-outline flex items-center gap-2"
           >
             {loadingAI ? <Loader2 size={16} className="animate-spin" /> : <Bot size={16} />}
-            获取AI分析
+            AI 分析
           </button>
           {aiAnalysis && (
             <div className="flex items-center gap-3">
-              <span className="text-sm text-gray-400">AI推荐:</span>
+              <span className="text-sm text-gray-400">AI 推荐：</span>
               <span className={`font-bold ${
                 aiAnalysis.recommendation?.selection === 'home' ? 'text-brand-700' :
                 aiAnalysis.recommendation?.selection === 'away' ? 'text-sky-700' : 'text-amber-600'
@@ -214,7 +214,7 @@ export default function MatchDetailPage() {
                  aiAnalysis.recommendation?.selection === 'under' ? '小球' : '平局'}
               </span>
               <span className="text-sm text-gray-500">
-                置信度: {((aiAnalysis.recommendation?.confidence || 0) * 100).toFixed(0)}%
+                置信度 {((aiAnalysis.recommendation?.confidence || 0) * 100).toFixed(0)}%
               </span>
             </div>
           )}
@@ -223,7 +223,7 @@ export default function MatchDetailPage() {
 
       {crossOdds?.best && Object.keys(crossOdds.best).length > 0 && (
         <div className="card mb-6">
-          <h3 className="font-bold text-gray-900 mb-3">跨站最优赔率</h3>
+          <h3 className="font-bold text-gray-900 mb-3">最优赔率</h3>
           <div className="grid grid-cols-3 gap-3">
             {Object.entries(crossOdds.best).map(([sel, info]) => (
               <div key={sel} className="rounded-lg border border-gray-200 bg-gray-50 p-3 text-center">
@@ -240,7 +240,7 @@ export default function MatchDetailPage() {
         <div className="card mb-6 border-brand-500/30">
           <div className="flex items-center gap-2 mb-3">
             <Bot size={18} className="text-brand-700" />
-            <h3 className="font-bold">AI 深度分析</h3>
+            <h3 className="font-bold">AI 分析</h3>
             <span className={`badge ml-auto ${
               aiAnalysis.analysis?.risk_level === 'low' ? 'bg-brand-50 text-brand-700' :
               aiAnalysis.analysis?.risk_level === 'high' ? 'bg-red-50 text-red-600' :
@@ -253,7 +253,7 @@ export default function MatchDetailPage() {
 
           <div className="space-y-3">
             <div className="bg-white rounded-lg p-3">
-              <div className="text-sm text-gray-400 mb-1">分析结论</div>
+              <div className="text-sm text-gray-400 mb-1">结论</div>
               <p className="text-sm">{readableAiReason || aiAnalysis.recommendation?.reasoning}</p>
             </div>
 

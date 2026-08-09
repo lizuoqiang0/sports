@@ -2,21 +2,19 @@
 赔率 API - WebSocket实时订阅 / 历史查询
 """
 import logging
-import json
-import asyncio
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect, HTTPException, Query
+from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from app.database import get_db
 from app.models.user import Match, Odds
 from app.core.security import decode_token, TokenType, get_current_user
-from app.core.websocket import ConnectionManager, WSEventType, manager
+from app.core.websocket import WSEventType, manager
 from app.core.cache import cache
-from app.schemas import APIResponse, OddsResponse
+from app.schemas import APIResponse
 from app.models.user import User
 
 logger = logging.getLogger(__name__)

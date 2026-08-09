@@ -64,10 +64,23 @@ export default function DashboardPage() {
   }
 
   const totalAssets = toNumber(stats?.total_assets ?? siteBalances.total_balance)
-  const dailyPnl = toNumber(stats?.daily_pnl)
+  const balanceDelta = toNumber(stats?.balance_delta ?? stats?.daily_pnl)
+  const referenceBalance = toNumber(stats?.reference_balance ?? stats?.baseline)
+  const snapshotUpdatedAt = stats?.snapshot_updated_at
   const aiTone = aiStatus?.badge_tone || 'slate'
   const aiLabel = aiStatus?.effective_label || (aiStatus?.engine_running ? 'AI 运行中' : 'AI 未启动')
   const showAiBadge = Boolean(aiStatus && aiStatus?.effective_state && aiStatus.effective_state !== 'disabled')
+  const formatFinishedTime = (match) => {
+    const value = match?.finished_at || match?.end_time || match?.updated_at || match?.start_time
+    if (!value) return '-'
+    try {
+      return new Date(value).toLocaleString('zh-CN', {
+        month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+      })
+    } catch {
+      return String(value)
+    }
+  }
 
   return (
     <div className="page">
@@ -157,17 +170,26 @@ export default function DashboardPage() {
         </div>
         <div className="card">
           <div className="flex items-center justify-between mb-3">
-            <span className="text-xs font-semibold text-ink-500 tracking-wide">盈亏</span>
+            <span className="text-xs font-semibold text-ink-500 tracking-wide">网站盈亏</span>
             <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${
-              dailyPnl >= 0 ? 'bg-brand-50 text-brand-700' : 'bg-rose-50 text-rose-700'
+              balanceDelta >= 0 ? 'bg-brand-50 text-brand-700' : 'bg-rose-50 text-rose-700'
             }`}>
-              {dailyPnl >= 0 ? <TrendingUp size={15} strokeWidth={1.8} /> : <TrendingDown size={15} strokeWidth={1.8} />}
+              {balanceDelta >= 0 ? <TrendingUp size={15} strokeWidth={1.8} /> : <TrendingDown size={15} strokeWidth={1.8} />}
             </div>
           </div>
-          <div className={`metric-value text-[1.5rem] ${dailyPnl >= 0 ? 'text-brand-700' : 'text-rose-600'}`}>
-            {dailyPnl >= 0 ? '+' : ''}¥{formatMoney(dailyPnl)}
+          <div className={`metric-value text-[1.5rem] ${balanceDelta >= 0 ? 'text-brand-700' : 'text-rose-600'}`}>
+            {balanceDelta >= 0 ? '+' : ''}¥{formatMoney(balanceDelta)}
           </div>
-          <div className="text-xs text-ink-400 mt-1.5">每日 0 点清零</div>
+          <div className="text-xs text-ink-400 mt-1.5">
+            {referenceBalance > 0
+              ? `按网站余额相对基准 ¥${formatMoney(referenceBalance)} 的增减计算`
+              : '按网站余额增减计算'}
+          </div>
+          {snapshotUpdatedAt && (
+            <div className="text-[11px] text-ink-300 mt-1">
+              最近快照 {new Date(snapshotUpdatedAt).toLocaleString('zh-CN')}
+            </div>
+          )}
         </div>
       </div>
 
@@ -221,15 +243,16 @@ export default function DashboardPage() {
                   onClick={() => navigate(`/matches/${m.id}`)}
                   className="w-full flex items-center justify-between py-3 text-left hover:bg-ink-50/80 px-1 rounded-lg transition-colors"
                 >
-                  <div className="text-sm text-ink-800">
-                    <span className="font-semibold">{m.home_team}</span>
-                    <span className="text-ink-400 mx-2">vs</span>
-                    <span className="font-semibold">{m.away_team}</span>
+                  <div className="text-sm text-ink-800 min-w-0">
+                    <div className="truncate">
+                      <span className="font-semibold">{m.home_team}</span>
+                      <span className="text-ink-400 mx-2 tabular-nums">{m.home_score} - {m.away_score}</span>
+                      <span className="font-semibold">{m.away_team}</span>
+                    </div>
+                    <div className="text-[11px] text-ink-400 mt-1 truncate">{m.league}</div>
                   </div>
                   <div className="text-xs text-ink-400 tabular-nums">
-                    {new Date(m.start_time).toLocaleString('zh-CN', {
-                      month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
-                    })}
+                    {formatFinishedTime(m)}
                   </div>
                 </button>
               ))}

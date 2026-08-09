@@ -23,6 +23,11 @@ FORWARDED_ALLOW="${UVICORN_FORWARDED_ALLOW_IPS:-127.0.0.1,10.0.0.0/8,172.16.0.0/
 
 echo "backend start: workers=${WORKERS} cpus=${NPROC} concurrency=${LIMIT_CONCURRENCY} loop=uvloop http=httptools"
 
+if [[ "${SKIP_DB_MIGRATIONS:-0}" != "1" ]]; then
+  echo "running db migrations: alembic upgrade head"
+  alembic upgrade head
+fi
+
 exec uvicorn app.main:app \
   --host 0.0.0.0 \
   --port 8000 \

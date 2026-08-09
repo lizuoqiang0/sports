@@ -77,7 +77,7 @@ def sport_is_preferred(sport: str, preferred: list[str] | None) -> bool:
 
 
 async def calc_daily_pnl(db: AsyncSession, user_id: int) -> Decimal:
-    """每日盈亏：以午夜总资产为基线，盈亏 = 当前总资产 - 基线。"""
+    """日风控盈亏：以午夜总资产为基线，供止损/止盈门禁使用。"""
     from app.services.balances import load_site_balances
     from app.services.daily_pnl import get_daily_pnl
 

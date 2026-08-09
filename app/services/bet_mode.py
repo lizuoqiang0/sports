@@ -62,8 +62,8 @@ def mode_flags(mode: BetMode) -> dict:
         "auto_confirm": active,
         "auto_execute": active,
         "description": (
-            "自动模式：扫描通过风控后直接调用体育站真实下单"
+            "自动：命中后直接下单"
             if active
-            else "人工模式：仅生成机会/推荐，需手动确认后真实下单"
+            else "人工：只出推荐，需手动下单"
         ),
     }

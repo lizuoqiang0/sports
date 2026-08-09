@@ -2,9 +2,8 @@
 Redis 缓存层 - 赔率缓存、会话管理、限流
 """
 import json
-import pickle
 import logging
-from typing import Optional, Any, Union
+from typing import Optional, Any
 
 import redis.asyncio as redis
 

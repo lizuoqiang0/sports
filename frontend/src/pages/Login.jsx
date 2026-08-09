@@ -45,11 +45,11 @@ export default function LoginPage() {
       <div className="login-center">
         <header className="login-brand">
           <p className="login-mark">OB Sports</p>
-          <h1 className="login-title">{isLogin ? '登录工作台' : '创建账户'}</h1>
+          <h1 className="login-title">{isLogin ? '登录' : '注册'}</h1>
           <p className="login-subtitle">
             {isLogin
-              ? '继续管理赛事、持仓与 AI 策略'
-              : '注册后即可配置站点并接入真实盘口'}
+              ? '登录后继续使用系统'
+              : '注册后即可进入系统'}
           </p>
         </header>
 
@@ -132,11 +132,11 @@ export default function LoginPage() {
           </form>
 
           <p className="login-hint">
-            登录后请在「站点」验证 OB · 平博
+            登录后先到「站点」完成验证
           </p>
         </section>
 
-        <p className="login-legal">仅接入真实体育站，请遵守当地法规</p>
+        <p className="login-legal">仅支持真实站点</p>
       </div>
     </div>
   )

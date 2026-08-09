@@ -164,7 +164,7 @@ async def update_bookmakers(
         updated.append(_serialize_account(acc))
 
     await db.flush()
-    return APIResponse(message="配置已保存", data=updated)
+    return APIResponse(message="站点已保存", data=updated)
 
 
 @router.get("/api/v1/bookmakers/gate-health", response_model=APIResponse)
@@ -182,18 +182,18 @@ async def gate_health():
             if r.status_code == 200:
                 body = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
                 return APIResponse(
-                    message="浏览器网关正常",
+                    message="Browser Gate 已连接",
                     data={"ok": True, "gate": gate, "health": body},
                 )
             return APIResponse(
                 success=False,
-                message=f"浏览器网关异常 HTTP {r.status_code}",
+                message=f"Browser Gate 异常 HTTP {r.status_code}",
                 data={"ok": False, "gate": gate},
             )
     except Exception as e:
         return APIResponse(
             success=False,
-            message="无法连接本机浏览器网关。请运行: bash scripts/ensure_browser_gate.sh start",
+            message="Browser Gate 未连接，请先启动",
             data={"ok": False, "gate": gate, "error": str(e)},
         )
 
@@ -450,7 +450,7 @@ async def verify_bookmakers_batch(
     ok_n = sum(1 for r in results if r.get("ok"))
     return APIResponse(
         success=ok_n > 0,
-        message=f"并行验证完成：成功 {ok_n}/{len(results)}",
+        message=f"验证完成：成功 {ok_n}/{len(results)}",
         data={"results": list(results), "ok": ok_n, "total": len(results)},
     )
 
@@ -556,7 +556,7 @@ async def disconnect_bookmaker(
     acc.balance = Decimal("0")
     await db.flush()
 
-    msg = "已断开连接"
+    msg = "已断开"
     if gate_msg:
         msg = f"{msg}；{gate_msg}"
     return APIResponse(
@@ -589,7 +589,7 @@ async def purge_and_resync_bookmaker(
     # 重新拉取全部已连接站点（含目标站）；目标站未连接时仅完成清理
     result = await sync_user_bookmakers(db, user.id)
     return APIResponse(
-        message=f"{BOOKMAKER_CATALOG[code].get('name') or code} 已清库并重新同步",
+        message=f"{BOOKMAKER_CATALOG[code].get('name') or code} 已重同步",
         data={"purged": purged, "cache_cleared": cache_n, "sync": result},
     )
 
@@ -600,7 +600,7 @@ async def sync_bookmakers(
     user: User = Depends(get_current_user),
 ):
     result = await sync_user_bookmakers(db, user.id)
-    return APIResponse(message="滚球足球/篮球同步完成", data=result)
+    return APIResponse(message="滚球已同步", data=result)
 
 
 @router.post("/api/v1/bookmakers/sync-live", response_model=APIResponse)
@@ -610,7 +610,7 @@ async def sync_live_bookmakers(
 ):
     """轻量滚球同步：仅足球/篮球比分/时钟/赔率。"""
     result = await sync_live_scores_odds(db, user.id)
-    return APIResponse(message="滚球同步完成", data=result)
+    return APIResponse(message="滚球已刷新", data=result)
 
 
 @router.get("/api/v1/bookmakers/odds-compare/{match_id}", response_model=APIResponse)

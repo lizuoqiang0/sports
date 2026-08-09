@@ -78,7 +78,7 @@ export default function BookmakersPage() {
           session_token: '',
         })))
     } catch (e) {
-      toast.error(extractErrorMessage(e, '站点列表加载失败，请稍后重试'))
+      toast.error(extractErrorMessage(e, '站点加载失败，请重试'))
     } finally {
       setLoading(false)
     }
@@ -135,7 +135,7 @@ export default function BookmakersPage() {
     setSaving(true)
     try {
       await ensureSaved()
-      toast.success('配置已保存')
+      toast.success('站点已保存')
     } catch (e) {
       toast.error(e.message || e.detail || '保存失败')
     } finally {
@@ -152,14 +152,14 @@ export default function BookmakersPage() {
       const acc = accountsRef.current.find((a) => a.code === code)
       const needsGate = GATE_CODES.includes(code)
       if (needsGate && !ok && !(acc?.has_session_token || acc?.session_token)) {
-        toast.error('无法连接浏览器网关容器。请执行: bash scripts/prod_up.sh', { id: toastId })
+        toast.error('Browser Gate 未连接，请先启动', { id: toastId })
         return
       }
       if (acc?.base_url) {
         toast.loading(
           ok
-            ? `正在验证 ${acc.name || code}（可并行多站，首次约 20–60 秒）…`
-            : `正在用已保存会话验证 ${acc.name || code}…`,
+            ? `正在验证 ${acc.name || code}…`
+            : `正在使用已保存会话验证 ${acc.name || code}…`,
           { id: toastId },
         )
       }
@@ -170,7 +170,7 @@ export default function BookmakersPage() {
       else await load()
       await checkGate()
     } catch (e) {
-      const msg = e.message || e.detail || (e.code === 'ECONNABORTED' ? '验证超时，请稍后重试' : '验证失败')
+      const msg = e.message || e.detail || (e.code === 'ECONNABORTED' ? '验证超时，请重试' : '验证失败')
       toast.error(typeof msg === 'string' ? msg : '验证失败', { id: toastId })
       await load()
       await checkGate()
@@ -185,7 +185,7 @@ export default function BookmakersPage() {
       (a) => (a.base_url || '').trim() && (a.username || '').trim()
     )
     if (!targets.length) {
-      toast.error('请先填写至少一个站点的网址与账号')
+      toast.error('请先填写站点网址和账号')
       return
     }
     setVerifyingAll(true)
@@ -199,12 +199,12 @@ export default function BookmakersPage() {
           (a) => GATE_CODES.includes(a.code) && (a.has_session_token || a.session_token)
         )
         if (!hasToken) {
-          toast.error('无法连接浏览器网关容器。请执行: bash scripts/prod_up.sh', { id: toastId })
+          toast.error('Browser Gate 未连接，请先启动', { id: toastId })
           return
         }
       }
       toast.loading(
-        `并行验证 ${targets.length} 个站点（各站独立浏览器，约 20–60 秒）…`,
+        `正在验证 ${targets.length} 个站点…`,
         { id: toastId },
       )
       await ensureSaved()
@@ -216,11 +216,11 @@ export default function BookmakersPage() {
         if (r.ok) toast.success(r.message || `${r.code} 成功`, { id: tid })
         else toast.error(r.message || `${r.code} 失败`, { id: tid })
       })
-      toast.success(res.message || '并行验证完成', { id: toastId })
+      toast.success(res.message || '验证完成', { id: toastId })
       await load()
       await checkGate()
     } catch (e) {
-      const msg = e.message || e.detail || (e.code === 'ECONNABORTED' ? '批量验证超时' : '批量验证失败')
+      const msg = e.message || e.detail || (e.code === 'ECONNABORTED' ? '验证超时' : '批量验证失败')
       toast.error(typeof msg === 'string' ? msg : '批量验证失败', { id: toastId })
       await load()
     } finally {
@@ -247,13 +247,13 @@ export default function BookmakersPage() {
 
   const handleSync = async () => {
     setSyncing(true)
-    const toastId = toast.loading('正在分别同步滚球足球与篮球（约 30–90 秒）…')
+    const toastId = toast.loading('正在同步滚球…')
     try {
       const res = await bookmakersAPI.sync()
-      toast.success(res.message || '滚球同步完成', { id: toastId })
+      toast.success(res.message || '滚球已同步', { id: toastId })
       await load()
     } catch (e) {
-      const msg = e.message || e.detail || (e.code === 'ECONNABORTED' ? '同步超时，请确认本机 Browser Gate 已启动' : '同步失败')
+      const msg = e.message || e.detail || (e.code === 'ECONNABORTED' ? '同步超时，请确认 Browser Gate 已启动' : '同步失败')
       toast.error(msg, { id: toastId })
     } finally {
       setSyncing(false)
@@ -272,20 +272,20 @@ export default function BookmakersPage() {
 
   return (
     <div className="page">
-      <PageHeader
+        <PageHeader
         eyebrow="接入"
-        title="站点配置"
-        description="仅真实站点：填写真实网址并验证；多站可并行进馆，缩短总等待时间"
+        title="站点"
+        description="填写真实网址、账号并验证"
         actions={(
           <>
             <button
               onClick={handleVerifyAll}
               disabled={anyBusy || syncing}
               className="btn-outline"
-              title="同时验证所有已填网址的站点"
+              title="验证全部已填写站点"
             >
               {verifyingAll ? <Loader2 size={16} className="animate-spin" /> : <Zap size={16} />}
-              并行验证全部
+              验证全部
             </button>
             <button onClick={handleSync} disabled={syncing || verifyingAll} className="btn-outline">
               {syncing ? <Loader2 size={16} className="animate-spin" /> : <RefreshCw size={16} />}
@@ -299,11 +299,11 @@ export default function BookmakersPage() {
         )}
       >
         {gateOk === true && (
-          <p className="text-xs text-brand-700 mt-2">Browser Gate 已连接 · 各站独立通道 · 可同时点多个「验证连接」</p>
+          <p className="text-xs text-brand-700 mt-2">Browser Gate 已连接</p>
         )}
         {gateOk === false && (
           <p className="text-xs text-rose-600 mt-2">
-            Browser Gate 离线 · 执行 bash scripts/prod_up.sh 拉起 Docker 网关
+            Browser Gate 未连接，请先启动
           </p>
         )}
       </PageHeader>
@@ -327,7 +327,7 @@ export default function BookmakersPage() {
                           ? 'bg-brand-50 text-brand-700 border-brand-200'
                           : 'bg-amber-50 text-amber-800 border-amber-200'
                       }`}>
-                        {isLive ? '真实' : '待填真实网址'}
+                        {isLive ? '真实站点' : '待填写'}
                       </span>
                     </div>
                     <div className="text-xs text-ink-400 uppercase tracking-wide">{acc.code}</div>
@@ -345,7 +345,7 @@ export default function BookmakersPage() {
                     className="input mt-1"
                     value={acc.base_url || ''}
                     onChange={(e) => updateField(acc.code, 'base_url', e.target.value)}
-                    placeholder="https://真实站点（禁止 .demo）"
+                    placeholder="https://真实站点"
                   />
                 </label>
                 <label className="block text-sm">
@@ -375,7 +375,7 @@ export default function BookmakersPage() {
                 {GATE_CODES.includes(acc.code) && (
                   <>
                     <p className="panel-note mt-1.5">
-                      验证时弹出浏览器 → 请分别进入足球盘口与篮球盘口 → 成功后保持长连接采数（本机: bash scripts/ensure_browser_gate.sh start）。
+                      验证时会拉起浏览器，请进入目标盘口并保持会话。
                     </p>
                     <label className="block text-sm">
                       <span className="text-ink-500 text-xs font-semibold">
@@ -400,7 +400,7 @@ export default function BookmakersPage() {
 
               {acc.profile && (acc.profile.name || acc.profile.member_id) && (
                 <div className="mt-3 rounded-xl bg-ink-50 border border-ink-100 px-3 py-2 text-xs text-ink-600">
-                  <div className="font-semibold text-ink-800 mb-0.5">用户信息</div>
+                  <div className="font-semibold text-ink-800 mb-0.5">账号信息</div>
                   <div className="flex flex-wrap gap-x-3 gap-y-1">
                     {acc.profile.name && <span>昵称 {acc.profile.name}</span>}
                     {acc.profile.member_id && <span>ID {acc.profile.member_id}</span>}
@@ -409,7 +409,7 @@ export default function BookmakersPage() {
               )}
 
               <div className="mt-3 text-xs text-ink-400">
-                最近同步：{acc.last_sync_at ? new Date(acc.last_sync_at).toLocaleString() : '尚未同步'}
+                最近同步：{acc.last_sync_at ? new Date(acc.last_sync_at).toLocaleString() : '暂无'}
               </div>
 
               <div className="mt-4 flex items-center justify-between gap-2">
@@ -422,7 +422,7 @@ export default function BookmakersPage() {
                       onClick={() => handleDisconnect(acc.code)}
                       disabled={isBusy}
                       className="btn-outline flex items-center gap-1.5 text-sm"
-                      title="断开网站会话"
+                      title="断开会话"
                     >
                       {isBusy ? (
                         <Loader2 size={14} className="animate-spin" />
@@ -444,7 +444,7 @@ export default function BookmakersPage() {
                     ) : (
                       <Link2 size={14} />
                     )}
-                    {acc.status === 'connected' ? '重新验证' : '验证连接'}
+                    {acc.status === 'connected' ? '重新验证' : '验证'}
                   </button>
                 </div>
               </div>

@@ -5,17 +5,15 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from enum import Enum
 from typing import Optional
-import enum
 
 from sqlalchemy import (
-    Column, BigInteger, String, Boolean, DateTime, Numeric,
+    BigInteger, String, Boolean, DateTime, Numeric,
     Integer, ForeignKey, Text, Index, JSON, UniqueConstraint, text
 )
 from sqlalchemy.orm import relationship, Mapped, mapped_column
 from sqlalchemy.types import TypeDecorator
 
 from app.database import Base
-from app.config import settings
 
 
 # === 自定义类型 ===
@@ -148,10 +146,10 @@ class AIConfig(Base):
     # 策略配置
     strategy: Mapped[str] = mapped_column(
         String(50),
-        default="high_win_rate",
-        server_default=text("'high_win_rate'"),
+        default="simple",
+        server_default=text("'simple'"),
         nullable=False,
-    )  # only high_win_rate
+    )  # only simple
     max_bet_amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), default=100)
     max_daily_bets: Mapped[int] = mapped_column(Integer, default=10)
     min_confidence: Mapped[float] = mapped_column(default=0.0)
@@ -166,9 +164,6 @@ class AIConfig(Base):
 
     # 高级
     use_llm_analysis: Mapped[bool] = mapped_column(Boolean, default=True)
-    auto_cashout: Mapped[bool] = mapped_column(Boolean, default=False)
-    cashout_threshold: Mapped[float] = mapped_column(default=0.8)  # 兑现阈值
-
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTimeUTC, default=lambda: datetime.now(timezone.utc))
     updated_at: Mapped[datetime] = mapped_column(DateTimeUTC, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))

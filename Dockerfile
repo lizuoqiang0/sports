@@ -27,6 +27,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
       -r requirements-prod.txt
 
 COPY app ./app
+COPY alembic ./alembic
+COPY alembic.ini ./alembic.ini
 COPY scripts ./scripts
 COPY __init__.py ./__init__.py
 

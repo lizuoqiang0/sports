@@ -292,8 +292,11 @@ async def sync_user_bookmakers(db: AsyncSession, user_id: int, *, purge_demo: bo
                         ids = dict((stale.extra_data or {}).get("ids") or {})
                         if len(ids) > 1:
                             stale.status = MatchStatus.UPCOMING
+                            stale.end_time = None
                         else:
                             stale.status = MatchStatus.FINISHED
+                            if getattr(stale, "end_time", None) is None:
+                                stale.end_time = now
                         extra = dict(stale.extra_data or {})
                         extra.pop("clock", None)
                         extra.pop("period", None)

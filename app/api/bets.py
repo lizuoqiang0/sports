@@ -659,17 +659,24 @@ async def portfolio_summary(
     total_assets = 0.0
     pnl_info = {
         "total_assets": 0.0,
-        "daily_pnl": 0.0,
-        "baseline": 0.0,
+        "balance_delta": 0.0,
+        "balance_change": 0.0,
+        "reference_balance": 0.0,
+        "previous_balance": 0.0,
+        "snapshot_updated_at": None,
+        "pnl_mode": "site_balance_delta",
     }
+    risk_pnl = 0.0
     try:
         from app.services.balances import load_site_balances
-        from app.services.daily_pnl import get_daily_pnl
+        from app.services.daily_pnl import get_daily_pnl, sync_balance_snapshot
 
         async with AsyncSessionLocal() as bdb:
             site_balances = await load_site_balances(bdb, current_user.id)
         total_assets = sum(float(s.get("balance") or 0) for s in site_balances)
-        pnl_info = await get_daily_pnl(current_user.id, total_assets)
+        pnl_info = await sync_balance_snapshot(current_user.id, total_assets)
+        risk_daily = await get_daily_pnl(current_user.id, total_assets)
+        risk_pnl = float(risk_daily.get("daily_pnl") or 0)
     except Exception as e:
         logger.warning("持仓概览余额/盈亏统计失败 user=%s: %s", current_user.id, e)
 
@@ -680,8 +687,15 @@ async def portfolio_summary(
         "confirmed_total_bets": int(monthly_bets or 0),
         "pending_bets": len(pending_items),
         "total_assets": pnl_info["total_assets"],
-        "daily_pnl": pnl_info["daily_pnl"],
-        "baseline": pnl_info["baseline"],
+        "daily_pnl": pnl_info["balance_delta"],
+        "balance_delta": pnl_info["balance_delta"],
+        "balance_change": pnl_info["balance_change"],
+        "baseline": pnl_info["reference_balance"],
+        "reference_balance": pnl_info["reference_balance"],
+        "previous_balance": pnl_info["previous_balance"],
+        "snapshot_updated_at": pnl_info["snapshot_updated_at"],
+        "pnl_mode": pnl_info["pnl_mode"],
+        "risk_daily_pnl": risk_pnl,
         "remote_fallback": False,
         "remote_status": "disabled",
     })

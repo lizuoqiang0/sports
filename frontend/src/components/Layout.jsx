@@ -138,7 +138,7 @@ export default function Layout() {
           <div className="app-mark">OB</div>
           <div className="min-w-0 flex-1">
             <div className="font-display text-[14px] text-white tracking-tight">OB Sports</div>
-            <div className="text-[11px] text-white/40 mt-0.5">智能交易台</div>
+            <div className="text-[11px] text-white/40 mt-0.5">投注工作台</div>
           </div>
           <button
             type="button"
@@ -162,7 +162,7 @@ export default function Layout() {
               : 'text-rose-200 bg-rose-500/15'
           }`}>
             {connected ? <Wifi size={13} /> : <WifiOff size={13} />}
-            {connected ? '行情已连接' : '行情已断开'}
+            {connected ? '实时已连接' : '实时已断开'}
           </div>
 
           <div className="relative">

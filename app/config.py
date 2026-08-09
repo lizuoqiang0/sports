@@ -94,54 +94,36 @@ class Settings(BaseSettings):
     NEWAPI_API_KEY: Optional[str] = None
     NEWAPI_BASE_URL: str = "https://www.juaiapi.com/v1"
 
-    DOUBAO_API_KEY: Optional[str] = None
-    DOUBAO_BASE_URL: str = "https://ark.cn-beijing.volces.com/api/plan/v3"
-    DOUBAO_MODEL: str = "doubao-seed-2.0-lite"
-
+    # --- GPT API（唯一模型） ---
     GPT_API_KEY: Optional[str] = None
     GPT_BASE_URL: str = "https://www.juaiapi.com/v1"
     GPT_MODEL: str = "gpt-5.4"
 
-    DEEPSEEK_API_KEY: Optional[str] = None
-    DEEPSEEK_BASE_URL: str = "https://ark.cn-beijing.volces.com/api/plan/v3"
-    DEEPSEEK_MODEL: str = "deepseek-v4-pro"
+    # --- AI 分析配置 ---
+    LLM_CLIENT_TIMEOUT_SEC: float = 90.0   # GPT API 调用超时（大 prompt 需要更长时间）
+    LLM_MAX_TOKENS: int = 2048              # GPT 最大输出 tokens（确保 JSON 不被截断）
+    LLM_DEFAULT_CONFIDENCE: float = 0.33    # GPT 未返回置信度时的默认值
+    LLM_TEMPERATURE: float = 0.2            # GPT 温度
+    LLM_NO_DATA_CONFIDENCE_CAP: float = 0.55  # 无数据时置信度上限
+    LLM_UNAVAILABLE_CONF_CAP: float = 0.49   # LLM不可用时置信度上限
+    LLM_CACHE_TTL: int = 600               # 10分钟
+    # Prompt 压缩：截断冗余数据，控制 prompt 在 8KB 以内
+    PROMPT_MAX_CHARS: int = 8000           # prompt 最大字符数
+    H2H_MAX_MATCHES: int = 5               # 历史交锋最多保留场次
+    FORM_MAX_MATCHES: int = 5               # 近况最多保留场次
+    # 下单门槛（从 settings 读取，不写死）
+    AI_MIN_CONFIDENCE: float = 0.47        # 下单最低置信度（含纯盘口模式）
+    AI_MIN_ODDS: float = 1.80              # 下单最低赔率
+    AI_MAX_ODDS: float = 5.00              # 下单最高赔率
 
-    KIMI_API_KEY: Optional[str] = None
-    KIMI_BASE_URL: str = "https://ark.cn-beijing.volces.com/api/plan/v3"
-    KIMI_MODEL: str = "kimi-k2.6"
+    AI_SCAN_INTERVAL_SEC: int = 120        # AI 引擎扫描间隔（秒）
+    AI_RECS_LIMIT: int = 80                # 推荐页分析上限
+    AI_LIVE_SCAN_LIMIT: int = 120          # 自动引擎扫描上限
+    AI_ANALYZE_CONCURRENCY: int = 8        # GPT 分析并发数
 
-    MINIMAX_API_KEY: Optional[str] = None
-    MINIMAX_BASE_URL: str = "https://ark.cn-beijing.volces.com/api/plan/v3"
-    MINIMAX_MODEL: str = "minimax-m3"
-
-    GLM_API_KEY: Optional[str] = None
-    GLM_BASE_URL: str = "https://ark.cn-beijing.volces.com/api/plan/v3"
-    GLM_MODEL: str = "glm-5.2"
-
-    # Ensemble 共识过滤
-    ENSEMBLE_MIN_CONSENSUS: float = 0.60   # 同意占比门槛（2/3 多数: 2/3=0.667 > 0.60）
-    ENSEMBLE_MIN_VOTES: int = 2            # 可用模型中最少同意票
-    ENSEMBLE_CONCURRENCY: int = 6          # 批量同场分析并发（推荐页加速）
-    ENSEMBLE_TIMEOUT_SEC: float = 30.0     # 单场 ensemble 总超时
-    LLM_CLIENT_TIMEOUT_SEC: float = 15.0   # 单模型 LLM API 调用超时
-    LLM_RETRY_TIMEOUT_SEC: float = 8.0     # 重试时的缩短超时（临时性错误才重试）
-    ENSEMBLE_QUORUM: int = 2               # 收到 N 个成功投票即可早退（不必等慢模型）
-    ENSEMBLE_MAX_MODELS: int = 3           # 单场最多并行调用的模型数
-    # 优先快模型，按速度排序
-    ENSEMBLE_MODEL_ORDER: str = "deepseek,doubao,gpt,minimax,glm,kimi"
-    AI_SCAN_INTERVAL_SEC: int = 30         # AI 引擎扫描间隔（秒），默认 30 秒
-    AI_MAX_BETS_PER_CYCLE: int = 3         # 自动模式每轮最多下单笔数（须为不同比赛）
-    AI_RECS_LIMIT: int = 80                # 每批分析同场上限（尽量覆盖全部滚球）
-    AI_LIVE_SCAN_LIMIT: int = 120          # 自动引擎每轮扫描同场上限
-
-    # LLM缓存
-    LLM_CACHE_TTL: int = 600  # 10分钟
-
-    # 赛前上下文（交锋 / 近10场 / 伤病）- 仅真实数据源，不编造
+    # 赛前上下文（交锋 / 近10场 / 伤病）
     AI_MATCH_CONTEXT_ENABLED: bool = True
-    # nowscore 代理（留空则 httpx 自动读取系统代理）
     NOWSCORE_PROXY_URL: str = ""
-    # 批量推荐时也获取赛前上下文
     AI_MATCH_CONTEXT_IN_BATCH: bool = True
     AI_MATCH_CONTEXT_TTL_SEC: int = 21600  # 6h
 
@@ -150,11 +132,6 @@ class Settings(BaseSettings):
     MAX_BET_AMOUNT: float = 100000.0
     # 数据保留时间（小时）：超过此时间的投注记录和赛事记录自动删除
     DATA_RETENTION_HOURS: int = 24
-
-    @property
-    def one_click_min_stake(self) -> float:
-        """一键投注最低金额：与 MIN_BET_AMOUNT 一致。"""
-        return float(self.MIN_BET_AMOUNT)
     MAX_BETS_PER_MATCH: int = 5
     MAX_DAILY_BETS: int = 50
 
@@ -172,10 +149,6 @@ class Settings(BaseSettings):
     OB_BET_VERIFY_RETRIES: int = 8               # OB 下单后最多验证次数
     OB_BET_VERIFY_INTERVAL_SEC: float = 2.0      # OB 下单后每次验证间隔
     OB_BET_VERIFY_HISTORY_DAYS: int = 1          # OB 注单历史查询天数
-    # LLM 调用参数
-    LLM_TEMPERATURE: float = 0.2              # LLM 采样温度
-    LLM_MAX_TOKENS: int = 2048               # LLM 最大输出 token
-    LLM_DEFAULT_CONFIDENCE: float = 0.33     # 模型未返回置信度时的默认值
     AI_RETRY_SLEEP_SEC: int = 60             # 引擎异常后重试休眠
     AI_MIN_BALANCE: float = 10.0             # 最低可用余额阈值
     # 捷报比分
@@ -189,7 +162,6 @@ class Settings(BaseSettings):
     # 上下文缓存
     AI_CONTEXT_NONE_TTL: int = 900          # source=none 时短缓存 TTL
     # API 参数
-    AI_DEFAULT_CASHOUT_THRESHOLD: float = 0.8  # 默认提前兑现阈值
     AI_DEFAULT_STAKE: float = 100.0           # 默认下注金额
     AI_RECS_MAX_LIMIT: int = 200             # 推荐列表最大上限
     # 风险评分权重

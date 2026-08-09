@@ -116,6 +116,17 @@ def _site_code_of(m: Match) -> str:
     return site_code_from_match(m) or ""
 
 
+def _finished_sort_timestamp(m: Match) -> float:
+    """完场列表按真正完场时间排序：end_time > updated_at > start_time。"""
+    for dt in (getattr(m, "end_time", None), getattr(m, "updated_at", None), getattr(m, "start_time", None)):
+        if dt is not None:
+            try:
+                return float(dt.timestamp())
+            except Exception:
+                continue
+    return 0.0
+
+
 def _serialize_match_list_item(m: Match, *, provider_code: str = "") -> dict:
     """列表项：基础字段 + 比分时钟 + 当前有效赔率。"""
     item = MatchResponse.model_validate(m).model_dump(mode="json")
@@ -131,6 +142,12 @@ def _serialize_match_list_item(m: Match, *, provider_code: str = "") -> dict:
     site = _site_code_of(m)
     item["site_code"] = site
     item["site_name"] = {"ob": "OB体育", "pinnacle": "平博"}.get(site, site or "")
+    if str(item.get("status") or "").lower() == "finished" and not item.get("finished_at"):
+        item["finished_at"] = (
+            item.get("end_time")
+            or item.get("updated_at")
+            or item.get("start_time")
+        )
     provider_names = {
         "ob": ("OB体育", "OB Sports", "OB"),
         "pinnacle": ("平博", "Pinnacle"),
@@ -172,14 +189,14 @@ async def list_matches(
         provider_code = ""
 
     cache_key = (
-        f"matches:list:v4nochina:{sport}:{status_filter}:{league}:{provider_code}:{page}:{page_size}"
+        f"matches:list:v6finishedtime:{sport}:{status_filter}:{league}:{provider_code}:{page}:{page_size}"
     )
     cached = await cache.get_json(cache_key)
     if cached:
         return APIResponse(data=cached)
 
-    query = select(Match).options(selectinload(Match.odds))
-    count_query = select(Match.id)
+    # 只加载 Match 行（不加载 odds），避免 89K 条赔率全量加载
+    query = select(Match)
 
     filters = [Match.sport.in_(_SUPPORTED_SPORTS), _not_virtual_filters()]
     if sport:
@@ -190,10 +207,6 @@ async def list_matches(
         filters.append(Match.league.ilike(f"%{league}%"))
     if filters:
         query = query.where(and_(*filters))
-        count_query = count_query.where(and_(*filters))
-
-    total_result = await db.execute(count_query)
-    total = len(total_result.scalars().all())
 
     result = await db.execute(query)
     all_matches = list(result.scalars().all())
@@ -224,8 +237,8 @@ async def list_matches(
     elif status_filter == "finished":
         all_matches.sort(
             key=lambda m: (
+                _finished_sort_timestamp(m),
                 _match_elapsed_seconds(m) if _match_elapsed_seconds(m) < 10**9 else 0,
-                -(m.start_time.timestamp() if m.start_time else 0),
             ),
             reverse=True,
         )
@@ -242,6 +255,15 @@ async def list_matches(
     offset = (page - 1) * page_size
     matches = all_matches[offset : offset + page_size]
 
+    # 延迟加载：只为分页后的少量比赛加载赔率（用 selectinload 避免异步懒加载错误）
+    if matches:
+        match_ids = [m.id for m in matches]
+        paginated_result = await db.execute(
+            select(Match).options(selectinload(Match.odds)).where(Match.id.in_(match_ids))
+        )
+        paginated_map = {m.id: m for m in paginated_result.scalars().all()}
+        matches = [paginated_map.get(m.id, m) for m in matches]
+
     data = {
         "items": [_serialize_match_list_item(m, provider_code=provider_code) for m in matches],
         "total": total,
@@ -251,7 +273,7 @@ async def list_matches(
         "provider": provider_code or None,
     }
 
-    await cache.set_json(cache_key, data, ttl=3 if status_filter == "live" else 10)
+    await cache.set_json(cache_key, data, ttl=3 if status_filter == "live" else 30)
 
     return APIResponse(data=data)
 

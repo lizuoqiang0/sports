@@ -63,7 +63,7 @@ export default function MatchesPage() {
         }
       }
     } catch (err) {
-      if (!silent) toast.error('加载赛事失败')
+      if (!silent) toast.error('赛事加载失败')
     } finally {
       setLoading(false)
       setRefreshing(false)
@@ -159,8 +159,8 @@ export default function MatchesPage() {
     <div className="page">
       <PageHeader
         eyebrow="赛事"
-        title="进行中赛事"
-        description="OB 与平博分类独立展示；足球 / 篮球可再筛选"
+        title="滚球赛事"
+        description="按站点和球类筛选"
         actions={(
           <div className="relative">
             <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-ink-400" />
@@ -175,9 +175,9 @@ export default function MatchesPage() {
       >
         <p className="text-xs text-ink-400 mt-2">
           {connected ? (
-            <span className="text-brand-700">实时推送已连接</span>
+            <span className="text-brand-700">实时已连接</span>
           ) : (
-            <span className="text-amber-700">实时推送重连中</span>
+            <span className="text-amber-700">实时重连中</span>
           )}
           {lastUpdated ? (
             <span className="ml-2 text-ink-400">

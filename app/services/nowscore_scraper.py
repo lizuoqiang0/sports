@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import datetime, timezone
 import logging
 import re
@@ -20,6 +21,7 @@ from typing import Any, Optional
 import httpx
 
 from app.config import settings
+from app.services.bookmakers.match_resolve import _norm_team, _pair_similarity, _team_similarity
 from app.services.bookmakers.sport_classify import classify_sport, normalize_sport, reject_sport_mismatch
 from app.services.sports_data import compute_quality
 
@@ -122,7 +124,46 @@ def _parse_score(score_str: str) -> dict[str, Any]:
 
 # 缓存今日比赛标题列表，按 sport 隔离，避免足球/篮球互串
 _title_cache: dict[str, dict[str, Any]] = {}
+_schedule_feed_cache: dict[str, dict[str, Any]] = {}
+_alias_override_cache: dict[str, Any] = {}
 _CACHE_TTL = settings.NOWSCORE_TITLE_CACHE_TTL  # 30 分钟
+_SCHEDULE_FEED_CACHE_TTL = min(max(60, _CACHE_TTL), 300)
+_ALIAS_CANDIDATE_HASH_KEY = "nowscore:alias_candidates:data"
+_ALIAS_OVERRIDE_HASH_KEY = "nowscore:alias_overrides:data"
+_ALIAS_AUDIT_LOG_KEY = "nowscore:alias_audit_logs"
+_ALIAS_CANDIDATE_MIN_SCORE = 0.35
+_ALIAS_OVERRIDE_CACHE_TTL = 60
+_ALIAS_AUDIT_LOG_LIMIT = 300
+_NOWSCORE_TEAM_ALIAS_GROUPS: dict[str, tuple[tuple[str, ...], ...]] = {
+    "all": (
+        ("卢森堡U18(女)", "卢森堡女篮U18"),
+        ("瑞士U18(女)", "瑞士女篮U18"),
+    ),
+    "football": (
+        ("奈司特维德", "纳斯特维德"),
+        ("赫勒乌普", "海勒鲁普"),
+        ("基辅叛军", "基辅反抗"),
+        ("卡尔邦切尔卡瑟", "卡尔本切尔卡瑟"),
+        ("印度海军", "印度纳维"),
+        ("马可09", "马尔寇"),
+        ("滋贺湖王", "瑞拉滋贺"),
+        ("岐阜", "FC岐阜"),
+        ("布拉迪斯拉发B队", "斯洛云B队"),
+        ("萨蒙林", "沙莫林"),
+        ("索尔亚", "柔亚"),
+        ("克里沃罗格克里夫巴斯", "克里夫巴斯"),
+        ("埃克通斯堡", "EIK通斯堡"),
+        ("特拉夫", "泰夫"),
+        ("切列波维茨", "舍克斯纳"),
+        ("法鲁人", "法伦斯"),
+        ("图伦斯", "杜连斯"),
+        ("莱格尼察B队", "马特斯B队"),
+        ("巴里兹苏洛", "巴里奇苏洛"),
+    ),
+    "basketball": (
+        ("ANU狼群", "非洲拿撒勒大学狼群"),
+    ),
+}
 
 
 def _sport_cache_key(sport: str) -> str:
@@ -133,8 +174,764 @@ def _html_cache_key(schedule_id: int, sport: str) -> tuple[str, int]:
     return (_sport_cache_key(sport), int(schedule_id))
 
 
+def _dedupe_keep_order(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in items:
+        value = str(item or "").strip()
+        if not value:
+            continue
+        key = value.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(value)
+    return result
+
+
+def _alias_candidate_key(
+    sport: str,
+    home: str,
+    away: str,
+    candidate_home: str,
+    candidate_away: str,
+) -> str:
+    return "|".join(
+        [
+            _sport_cache_key(sport),
+            _norm_team(home),
+            _norm_team(away),
+            _norm_team(candidate_home),
+            _norm_team(candidate_away),
+        ]
+    )
+
+
+def _invalidate_alias_override_cache() -> None:
+    _alias_override_cache.clear()
+
+
+def _alias_override_compare_view(record: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "sport": _sport_cache_key(str(record.get("sport") or "football")),
+        "source_home": str(record.get("source_home") or "").strip(),
+        "source_away": str(record.get("source_away") or "").strip(),
+        "candidate_home": str(record.get("candidate_home") or "").strip(),
+        "candidate_away": str(record.get("candidate_away") or "").strip(),
+        "candidate_title": str(record.get("candidate_title") or "").strip(),
+        "schedule_id": int(record.get("schedule_id") or 0),
+        "best_score": round(float(record.get("best_score") or 0.0), 6),
+        "home_alias_group": _dedupe_keep_order(list(record.get("home_alias_group") or [])),
+        "away_alias_group": _dedupe_keep_order(list(record.get("away_alias_group") or [])),
+    }
+
+
+async def _emit_alias_audit_log(
+    action: str,
+    *,
+    actor: str = "",
+    payload: Optional[dict[str, Any]] = None,
+) -> None:
+    entry = {
+        "time": datetime.now(timezone.utc).isoformat(),
+        "action": str(action or "").strip() or "unknown",
+        "actor": str(actor or "").strip() or "system",
+        "payload": payload or {},
+    }
+    try:
+        from app.core.cache import cache
+
+        await cache.client.lpush(_ALIAS_AUDIT_LOG_KEY, json.dumps(entry, ensure_ascii=False))
+        await cache.client.ltrim(_ALIAS_AUDIT_LOG_KEY, 0, _ALIAS_AUDIT_LOG_LIMIT - 1)
+    except Exception as e:
+        logger.debug("nowscore alias audit log failed: %s", e)
+
+
+async def list_alias_audit_logs(limit: int = 100) -> list[dict[str, Any]]:
+    try:
+        from app.core.cache import cache
+
+        rows = await cache.lrange(_ALIAS_AUDIT_LOG_KEY, 0, max(0, min(int(limit or 100), 500)) - 1)
+    except Exception as e:
+        logger.debug("nowscore alias audit logs load failed: %s", e)
+        return []
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            item = json.loads(row)
+        except Exception:
+            continue
+        if isinstance(item, dict):
+            out.append(item)
+    return out
+
+
+async def _record_alias_candidate(
+    sport: str,
+    home: str,
+    away: str,
+    home_variants: list[str],
+    away_variants: list[str],
+    best_sid: int,
+    best_score: float,
+    best_title: str,
+) -> None:
+    """把未命中的最优候选沉淀到 Redis，供后续补别名使用。"""
+    if best_score < _ALIAS_CANDIDATE_MIN_SCORE:
+        return
+    candidate_home, candidate_away = _extract_title_teams(best_title)
+    if not candidate_home or not candidate_away:
+        return
+    candidate_key = _alias_candidate_key(sport, home, away, candidate_home, candidate_away)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    try:
+        from app.core.cache import cache
+
+        current = await cache.hget(_ALIAS_CANDIDATE_HASH_KEY, candidate_key)
+        if not isinstance(current, dict):
+            current = {
+                "id": candidate_key,
+                "sport": _sport_cache_key(sport),
+                "source_home": home,
+                "source_away": away,
+                "candidate_home": candidate_home,
+                "candidate_away": candidate_away,
+                "candidate_title": best_title,
+                "schedule_id": int(best_sid),
+                "best_score": float(best_score),
+                "count": 0,
+                "first_seen_at": now_iso,
+                "last_seen_at": now_iso,
+                "home_variants": home_variants[:8],
+                "away_variants": away_variants[:8],
+            }
+        current["count"] = int(current.get("count") or 0) + 1
+        current["last_seen_at"] = now_iso
+        current["schedule_id"] = int(best_sid)
+        current["candidate_title"] = best_title
+        current["best_score"] = max(float(current.get("best_score") or 0.0), float(best_score))
+        current["home_variants"] = _dedupe_keep_order(list(current.get("home_variants") or []) + home_variants)[:8]
+        current["away_variants"] = _dedupe_keep_order(list(current.get("away_variants") or []) + away_variants)[:8]
+        await cache.hset(_ALIAS_CANDIDATE_HASH_KEY, candidate_key, current)
+    except Exception as e:
+        logger.debug("nowscore alias candidate store failed: %s", e)
+
+
+async def _get_runtime_alias_index(
+    sport: str = "football",
+    *,
+    force_refresh: bool = False,
+) -> dict[str, list[str]]:
+    import time
+
+    now = time.time()
+    cache_key = _sport_cache_key(sport)
+    cached = _alias_override_cache.get("data") if isinstance(_alias_override_cache, dict) else None
+    cached_ts = float(_alias_override_cache.get("ts") or 0.0) if isinstance(_alias_override_cache, dict) else 0.0
+    if (
+        not force_refresh
+        and isinstance(cached, dict)
+        and now - cached_ts < _ALIAS_OVERRIDE_CACHE_TTL
+        and cache_key in cached
+    ):
+        return cached.get(cache_key) or {}
+
+    index_by_sport: dict[str, dict[str, list[str]]] = {
+        "football": {},
+        "basketball": {},
+    }
+    try:
+        from app.core.cache import cache
+
+        raw = await cache.hgetall(_ALIAS_OVERRIDE_HASH_KEY)
+        for item in raw.values():
+            if not isinstance(item, dict):
+                continue
+            item_sport = _sport_cache_key(str(item.get("sport") or "football"))
+            bucket = index_by_sport.setdefault(item_sport, {})
+            for field in ("home_alias_group", "away_alias_group"):
+                aliases = _dedupe_keep_order(list(item.get(field) or []))
+                if len(aliases) < 2:
+                    continue
+                for alias in aliases:
+                    norm = _norm_team(alias)
+                    if not norm:
+                        continue
+                    bucket[norm] = _dedupe_keep_order(list(bucket.get(norm) or []) + aliases)
+    except Exception as e:
+        logger.debug("nowscore alias overrides load failed: %s", e)
+
+    _alias_override_cache["ts"] = now
+    _alias_override_cache["data"] = index_by_sport
+    return index_by_sport.get(cache_key) or {}
+
+
+async def list_alias_candidates(
+    *,
+    sport: str = "all",
+    limit: int = 100,
+    min_score: float = 0.0,
+) -> list[dict[str, Any]]:
+    """读取未命中候选别名清单，按命中价值排序。"""
+    try:
+        from app.core.cache import cache
+
+        raw = await cache.hgetall(_ALIAS_CANDIDATE_HASH_KEY)
+    except Exception as e:
+        logger.debug("nowscore alias candidates load failed: %s", e)
+        return []
+
+    items = []
+    wanted_sport = _sport_cache_key(sport) if sport != "all" else "all"
+    for item in raw.values():
+        if not isinstance(item, dict):
+            continue
+        item_sport = str(item.get("sport") or "").strip()
+        score = float(item.get("best_score") or 0.0)
+        if wanted_sport != "all" and item_sport != wanted_sport:
+            continue
+        if score < float(min_score or 0.0):
+            continue
+        items.append(item)
+
+    items.sort(
+        key=lambda x: (
+            -int(x.get("count") or 0),
+            -float(x.get("best_score") or 0.0),
+            str(x.get("last_seen_at") or ""),
+        )
+    )
+    return items[: max(1, min(int(limit or 100), 500))]
+
+
+async def clear_alias_candidates() -> int:
+    try:
+        from app.core.cache import cache
+
+        return int(await cache.delete(_ALIAS_CANDIDATE_HASH_KEY) or 0)
+    except Exception as e:
+        logger.debug("nowscore alias candidates clear failed: %s", e)
+        return 0
+
+
+async def approve_alias_candidate(
+    candidate_id: str,
+    *,
+    approved_by: str = "",
+    delete_candidate: bool = True,
+) -> Optional[dict[str, Any]]:
+    candidate_id = str(candidate_id or "").strip()
+    if not candidate_id:
+        return None
+    try:
+        from app.core.cache import cache
+
+        candidate = await cache.hget(_ALIAS_CANDIDATE_HASH_KEY, candidate_id)
+        if not isinstance(candidate, dict):
+            return None
+        now_iso = datetime.now(timezone.utc).isoformat()
+        record = {
+            "id": candidate_id,
+            "sport": _sport_cache_key(str(candidate.get("sport") or "football")),
+            "source_home": str(candidate.get("source_home") or "").strip(),
+            "source_away": str(candidate.get("source_away") or "").strip(),
+            "candidate_home": str(candidate.get("candidate_home") or "").strip(),
+            "candidate_away": str(candidate.get("candidate_away") or "").strip(),
+            "candidate_title": str(candidate.get("candidate_title") or "").strip(),
+            "schedule_id": int(candidate.get("schedule_id") or 0),
+            "best_score": float(candidate.get("best_score") or 0.0),
+            "approved_at": now_iso,
+            "approved_by": approved_by,
+            "source_count": int(candidate.get("count") or 0),
+            "home_alias_group": _dedupe_keep_order(
+                [
+                    str(candidate.get("source_home") or "").strip(),
+                    str(candidate.get("candidate_home") or "").strip(),
+                    *list(candidate.get("home_variants") or []),
+                ]
+            ),
+            "away_alias_group": _dedupe_keep_order(
+                [
+                    str(candidate.get("source_away") or "").strip(),
+                    str(candidate.get("candidate_away") or "").strip(),
+                    *list(candidate.get("away_variants") or []),
+                ]
+            ),
+        }
+        await cache.hset(_ALIAS_OVERRIDE_HASH_KEY, candidate_id, record)
+        if delete_candidate:
+            await cache.hdel(_ALIAS_CANDIDATE_HASH_KEY, candidate_id)
+        _invalidate_alias_override_cache()
+        await _emit_alias_audit_log(
+            "approve_candidate",
+            actor=approved_by,
+            payload={
+                "record_id": record["id"],
+                "sport": record["sport"],
+                "source_home": record["source_home"],
+                "source_away": record["source_away"],
+                "candidate_home": record["candidate_home"],
+                "candidate_away": record["candidate_away"],
+                "delete_candidate": bool(delete_candidate),
+            },
+        )
+        return record
+    except Exception as e:
+        logger.debug("nowscore alias candidate approve failed: %s", e)
+        return None
+
+
+async def approve_alias_candidates(
+    candidate_ids: list[str],
+    *,
+    approved_by: str = "",
+    delete_candidate: bool = True,
+) -> dict[str, Any]:
+    approved_items: list[dict[str, Any]] = []
+    missed_ids: list[str] = []
+    for candidate_id in _dedupe_keep_order(list(candidate_ids or [])):
+        item = await approve_alias_candidate(
+            candidate_id,
+            approved_by=approved_by,
+            delete_candidate=delete_candidate,
+        )
+        if item:
+            approved_items.append(item)
+        else:
+            missed_ids.append(candidate_id)
+    return {
+        "approved_count": len(approved_items),
+        "missed_count": len(missed_ids),
+        "approved_items": approved_items,
+        "missed_ids": missed_ids,
+    }
+
+
+async def list_alias_overrides(
+    *,
+    sport: str = "all",
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    try:
+        from app.core.cache import cache
+
+        raw = await cache.hgetall(_ALIAS_OVERRIDE_HASH_KEY)
+    except Exception as e:
+        logger.debug("nowscore alias overrides load failed: %s", e)
+        return []
+
+    wanted_sport = _sport_cache_key(sport) if sport != "all" else "all"
+    items = []
+    for item in raw.values():
+        if not isinstance(item, dict):
+            continue
+        item_sport = str(item.get("sport") or "").strip()
+        if wanted_sport != "all" and item_sport != wanted_sport:
+            continue
+        items.append(item)
+
+    items.sort(
+        key=lambda x: (
+            str(x.get("sport") or ""),
+            -float(x.get("best_score") or 0.0),
+            str(x.get("approved_at") or ""),
+        )
+    )
+    return items[: max(1, min(int(limit or 100), 500))]
+
+
+def _build_alias_override_record(
+    payload: dict[str, Any],
+    *,
+    approved_by: str = "",
+) -> Optional[dict[str, Any]]:
+    sport = _sport_cache_key(str(payload.get("sport") or "football"))
+    source_home = str(payload.get("source_home") or "").strip()
+    source_away = str(payload.get("source_away") or "").strip()
+    candidate_home = str(payload.get("candidate_home") or "").strip()
+    candidate_away = str(payload.get("candidate_away") or "").strip()
+    if not source_home or not source_away or not candidate_home or not candidate_away:
+        return None
+    home_group = _dedupe_keep_order(
+        [
+            source_home,
+            candidate_home,
+            *list(payload.get("home_alias_group") or []),
+            *list(payload.get("home_variants") or []),
+        ]
+    )
+    away_group = _dedupe_keep_order(
+        [
+            source_away,
+            candidate_away,
+            *list(payload.get("away_alias_group") or []),
+            *list(payload.get("away_variants") or []),
+        ]
+    )
+    if len(home_group) < 2 or len(away_group) < 2:
+        return None
+    record_id = str(payload.get("id") or "").strip() or _alias_candidate_key(
+        sport,
+        source_home,
+        source_away,
+        candidate_home,
+        candidate_away,
+    )
+    approved_at = str(payload.get("approved_at") or "").strip() or datetime.now(timezone.utc).isoformat()
+    return {
+        "id": record_id,
+        "sport": sport,
+        "source_home": source_home,
+        "source_away": source_away,
+        "candidate_home": candidate_home,
+        "candidate_away": candidate_away,
+        "candidate_title": str(payload.get("candidate_title") or f"{candidate_home} vs {candidate_away}").strip(),
+        "schedule_id": int(payload.get("schedule_id") or 0),
+        "best_score": float(payload.get("best_score") or 0.0),
+        "approved_at": approved_at,
+        "approved_by": str(payload.get("approved_by") or approved_by).strip(),
+        "source_count": int(payload.get("source_count") or payload.get("count") or 0),
+        "home_alias_group": home_group,
+        "away_alias_group": away_group,
+    }
+
+
+async def upsert_alias_override(
+    payload: dict[str, Any],
+    *,
+    approved_by: str = "",
+) -> Optional[dict[str, Any]]:
+    record = _build_alias_override_record(payload, approved_by=approved_by)
+    if not record:
+        return None
+    try:
+        from app.core.cache import cache
+
+        old = await cache.hget(_ALIAS_OVERRIDE_HASH_KEY, record["id"])
+        await cache.hset(_ALIAS_OVERRIDE_HASH_KEY, record["id"], record)
+        _invalidate_alias_override_cache()
+        await _emit_alias_audit_log(
+            "import_override" if approved_by else "upsert_override",
+            actor=approved_by,
+            payload={
+                "record_id": record["id"],
+                "sport": record["sport"],
+                "change_type": "update" if isinstance(old, dict) else "create",
+                "source_home": record["source_home"],
+                "source_away": record["source_away"],
+            },
+        )
+        return record
+    except Exception as e:
+        logger.debug("nowscore alias override upsert failed: %s", e)
+        return None
+
+
+async def import_alias_overrides(
+    items: list[dict[str, Any]],
+    *,
+    approved_by: str = "",
+) -> dict[str, Any]:
+    saved_items: list[dict[str, Any]] = []
+    skipped_items: list[dict[str, Any]] = []
+    for idx, raw in enumerate(list(items or [])):
+        payload = raw if isinstance(raw, dict) else {}
+        saved = await upsert_alias_override(payload, approved_by=approved_by)
+        if saved:
+            saved_items.append(saved)
+        else:
+            skipped_items.append({"index": idx, "item": payload})
+    return {
+        "saved_count": len(saved_items),
+        "skipped_count": len(skipped_items),
+        "saved_items": saved_items,
+        "skipped_items": skipped_items,
+    }
+
+
+async def export_alias_overrides(
+    *,
+    sport: str = "all",
+    limit: int = 5000,
+) -> dict[str, Any]:
+    items = await list_alias_overrides(sport=sport, limit=max(1, min(int(limit or 5000), 5000)))
+    return {
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "sport": sport,
+        "count": len(items),
+        "items": items,
+    }
+
+
+async def preview_alias_overrides_import(
+    items: list[dict[str, Any]],
+    *,
+    approved_by: str = "",
+) -> dict[str, Any]:
+    try:
+        from app.core.cache import cache
+
+        raw = await cache.hgetall(_ALIAS_OVERRIDE_HASH_KEY)
+    except Exception as e:
+        logger.debug("nowscore alias override preview load failed: %s", e)
+        raw = {}
+
+    existing = {str(k): v for k, v in (raw or {}).items() if isinstance(v, dict)}
+    preview_items: list[dict[str, Any]] = []
+    counts = {"create": 0, "update": 0, "nochange": 0, "invalid": 0}
+    for idx, raw_item in enumerate(list(items or [])):
+        payload = raw_item if isinstance(raw_item, dict) else {}
+        record = _build_alias_override_record(payload, approved_by=approved_by)
+        if not record:
+            counts["invalid"] += 1
+            preview_items.append({"index": idx, "action": "invalid", "item": payload})
+            continue
+        before = existing.get(record["id"])
+        before_view = _alias_override_compare_view(before) if isinstance(before, dict) else None
+        after_view = _alias_override_compare_view(record)
+        if not before_view:
+            action = "create"
+        elif before_view == after_view:
+            action = "nochange"
+        else:
+            action = "update"
+        counts[action] += 1
+        preview_items.append({
+            "index": idx,
+            "id": record["id"],
+            "action": action,
+            "sport": record["sport"],
+            "source_home": record["source_home"],
+            "source_away": record["source_away"],
+            "before": before_view,
+            "after": after_view,
+        })
+    return {
+        "summary": counts,
+        "items": preview_items,
+    }
+
+
+async def delete_alias_override(record_id: str, *, actor: str = "") -> int:
+    try:
+        from app.core.cache import cache
+
+        old = await cache.hget(_ALIAS_OVERRIDE_HASH_KEY, str(record_id or "").strip())
+        deleted = int(await cache.hdel(_ALIAS_OVERRIDE_HASH_KEY, str(record_id or "").strip()) or 0)
+        if deleted:
+            _invalidate_alias_override_cache()
+            await _emit_alias_audit_log(
+                "delete_override",
+                actor=actor,
+                payload={
+                    "record_id": str(record_id or "").strip(),
+                    "sport": str((old or {}).get("sport") or ""),
+                    "source_home": str((old or {}).get("source_home") or ""),
+                    "source_away": str((old or {}).get("source_away") or ""),
+                },
+            )
+        return deleted
+    except Exception as e:
+        logger.debug("nowscore alias override delete failed: %s", e)
+        return 0
+
+
+async def delete_alias_overrides(record_ids: list[str], *, actor: str = "") -> dict[str, Any]:
+    deleted_ids: list[str] = []
+    missed_ids: list[str] = []
+    for record_id in _dedupe_keep_order(list(record_ids or [])):
+        deleted = await delete_alias_override(record_id, actor=actor)
+        if deleted:
+            deleted_ids.append(record_id)
+        else:
+            missed_ids.append(record_id)
+    return {
+        "deleted_count": len(deleted_ids),
+        "missed_count": len(missed_ids),
+        "deleted_ids": deleted_ids,
+        "missed_ids": missed_ids,
+    }
+
+
+async def clear_alias_overrides(*, actor: str = "") -> int:
+    try:
+        from app.core.cache import cache
+
+        count = 0
+        try:
+            count = await cache.client.hlen(_ALIAS_OVERRIDE_HASH_KEY)
+        except Exception:
+            count = 0
+        deleted = int(await cache.delete(_ALIAS_OVERRIDE_HASH_KEY) or 0)
+        _invalidate_alias_override_cache()
+        if deleted:
+            await _emit_alias_audit_log(
+                "clear_overrides",
+                actor=actor,
+                payload={"records": int(count or 0)},
+            )
+        return deleted
+    except Exception as e:
+        logger.debug("nowscore alias overrides clear failed: %s", e)
+        return 0
+
+
+def _team_alias_variants(
+    team: str,
+    sport: str = "football",
+    runtime_alias_index: Optional[dict[str, list[str]]] = None,
+) -> list[str]:
+    """返回队名别名候选，统一在这里维护跨源翻译差异。"""
+    base = str(team or "").strip()
+    if not base:
+        return []
+
+    variants = [base]
+    compact = re.sub(r"\s+", "", base)
+    if compact and compact != base:
+        variants.append(compact)
+
+    normalized_brackets = base.replace("（", "(").replace("）", ")")
+    if normalized_brackets != base:
+        variants.append(normalized_brackets)
+
+    without_brackets = re.sub(r"[()（）]", "", base)
+    if without_brackets != base:
+        variants.append(without_brackets)
+
+    women_plain = (
+        base.replace("(女)", "女")
+        .replace("（女）", "女")
+        .replace("(男)", "男")
+        .replace("（男）", "男")
+    )
+    if women_plain != base:
+        variants.append(women_plain)
+
+    women_hoops = base.replace("(女)", "女篮").replace("（女）", "女篮")
+    if women_hoops != base:
+        variants.append(women_hoops)
+
+    youth_reordered = re.sub(r"^(.+?)U(\d+)[女男]$", r"\1女篮U\2", women_hoops)
+    if youth_reordered != women_hoops:
+        variants.append(youth_reordered)
+
+    if base.endswith("B队") and len(base) > 2:
+        variants.append(base[:-2] + "B")
+
+    norm_base = _norm_team(base)
+    for group in _NOWSCORE_TEAM_ALIAS_GROUPS.get("all", ()):
+        if norm_base in {_norm_team(item) for item in group}:
+            variants.extend(group)
+    for group in _NOWSCORE_TEAM_ALIAS_GROUPS.get(_sport_cache_key(sport), ()):
+        if norm_base in {_norm_team(item) for item in group}:
+            variants.extend(group)
+
+    if runtime_alias_index and norm_base in runtime_alias_index:
+        variants.extend(runtime_alias_index.get(norm_base) or [])
+
+    return _dedupe_keep_order(variants)
+
+
+def _feed_path_for_sport(sport: str) -> str:
+    return "/txt/Schedule_0_0.txt" if "basket" in (sport or "").lower() else "/phone/Schedule_0_0.txt"
+
+
+def _decode_nowscore_text(raw: bytes) -> str:
+    for encoding in ("utf-8", "gb18030", "gbk"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="ignore")
+
+
+def _parse_schedule_feed(body: str, sport: str = "football") -> dict[int, dict[str, Any]]:
+    """解析捷报完整即时/赛程列表文本，返回 {schedule_id: metadata}。"""
+    if "$$" in body:
+        body = body.split("$$", 1)[1]
+    items = [item.strip() for item in body.split("!") if item.strip()]
+    is_basketball = "basket" in (sport or "").lower()
+    matches: dict[int, dict[str, Any]] = {}
+    for item in items:
+        fields = item.split("^")
+        try:
+            schedule_id = int(fields[0])
+        except Exception:
+            continue
+        home_idx = 6 if is_basketball else 5
+        away_idx = 7 if is_basketball else 6
+        start_idx = 3
+        state_idx = 4 if is_basketball else 2
+        league_idx = 1
+        home_team = (fields[home_idx] if len(fields) > home_idx else "").strip()
+        away_team = (fields[away_idx] if len(fields) > away_idx else "").strip()
+        if not home_team or not away_team:
+            continue
+        matches[schedule_id] = {
+            "schedule_id": schedule_id,
+            "sport": _sport_cache_key(sport),
+            "league_id": (fields[league_idx] if len(fields) > league_idx else "").strip(),
+            "match_state": (fields[state_idx] if len(fields) > state_idx else "").strip(),
+            "start_time": (fields[start_idx] if len(fields) > start_idx else "").strip(),
+            "home_team": home_team,
+            "away_team": away_team,
+            "title": f"{home_team} vs {away_team}",
+            "raw_fields": fields,
+        }
+    return matches
+
+
+async def _get_schedule_feed_matches(
+    sport: str = "football",
+    *,
+    force_refresh: bool = False,
+) -> dict[int, dict[str, Any]]:
+    """获取捷报完整即时/赛程列表，优先覆盖推荐列表。"""
+    import time
+
+    now = time.time()
+    cache_key = _sport_cache_key(sport)
+    cached = _schedule_feed_cache.get(cache_key) or {}
+    if (
+        not force_refresh
+        and cached.get("data")
+        and now - float(cached.get("ts") or 0) < _SCHEDULE_FEED_CACHE_TTL
+    ):
+        return cached["data"]
+
+    try:
+        c = await _get_client()
+        resp = await c.get(f"{_BASE}{_feed_path_for_sport(sport)}")
+        if resp.status_code == 200 and resp.content:
+            matches = _parse_schedule_feed(_decode_nowscore_text(resp.content), sport)
+            if matches:
+                _schedule_feed_cache[cache_key] = {"ts": now, "data": matches}
+                logger.info(
+                    "nowscore: loaded %d full-list matches for sport=%s",
+                    len(matches),
+                    cache_key,
+                )
+                return matches
+    except Exception as e:
+        logger.warning("nowscore full-list fetch failed sport=%s err=%s", sport, e)
+
+    if cached.get("data"):
+        logger.info(
+            "nowscore: reuse stale full-list cache sport=%s count=%d",
+            cache_key,
+            len(cached["data"]),
+        )
+        return cached["data"]
+    return {}
+
+
 async def _get_today_schedule_ids(sport_type: int = 1) -> list[int]:
     """获取今日推荐比赛 ID 列表。sport_type: 1=足球, 2=篮球。"""
+    sport = "basketball" if int(sport_type or 1) == 2 else "football"
+    full_matches = await _get_schedule_feed_matches(sport)
+    if full_matches:
+        return list(full_matches.keys())
     try:
         c = await _get_client()
         resp = await c.get(f"{_BASE}/mvc/match/GetRecommendSchedules?sportType={sport_type}")
@@ -156,6 +953,22 @@ async def _get_all_titles(sport: str = "football") -> dict[int, str]:
     cached = _title_cache.get(cache_key) or {}
     if cached.get("data") and now - float(cached.get("ts") or 0) < _CACHE_TTL:
         return cached["data"]
+
+    full_matches = await _get_schedule_feed_matches(sport)
+    if full_matches:
+        titles = {
+            sid: str(meta.get("title") or "").strip()
+            for sid, meta in full_matches.items()
+            if str(meta.get("title") or "").strip()
+        }
+        if titles:
+            _title_cache[cache_key] = {"ts": now, "data": titles}
+            logger.info(
+                "nowscore: cached %d full-list titles for sport=%s",
+                len(titles),
+                cache_key,
+            )
+            return titles
 
     sport_type = 2 if "basket" in (sport or "").lower() else 1
     ids = await _get_today_schedule_ids(sport_type)
@@ -187,38 +1000,87 @@ async def _find_schedule_id(
         logger.warning("nowscore: no schedule IDs available")
         return None
 
-    home_lower = home.lower().strip()
-    away_lower = away.lower().strip()
+    runtime_alias_index = await _get_runtime_alias_index(sport)
+    home_variants = _team_alias_variants(home, sport, runtime_alias_index)
+    away_variants = _team_alias_variants(away, sport, runtime_alias_index)
+    home_lowers = [v.lower().strip() for v in home_variants if v.strip()]
+    away_lowers = [v.lower().strip() for v in away_variants if v.strip()]
 
     for sid, title in titles.items():
         title_lower = title.lower()
         # 1. 精确子串匹配
-        if home_lower in title_lower and away_lower in title_lower:
+        if (
+            any(v and v in title_lower for v in home_lowers)
+            and any(v and v in title_lower for v in away_lowers)
+        ):
             logger.info("nowscore: matched %s vs %s -> sid=%s", home, away, sid)
             return sid
 
     # 2. 模糊匹配：取名字中连续 2+ 字符进行匹配
     for sid, title in titles.items():
-        if _fuzzy_team_match(home, title) and _fuzzy_team_match(away, title):
+        if (
+            any(_fuzzy_team_match(v, title) for v in home_variants)
+            and any(_fuzzy_team_match(v, title) for v in away_variants)
+        ):
             logger.info("nowscore: fuzzy matched %s vs %s -> sid=%s", home, away, sid)
             return sid
+
+    # 2.5 对阵相似度匹配：覆盖译名差异 / 主客文本带额外后缀
+    best_sid: Optional[int] = None
+    best_score = 0.0
+    for sid, title in titles.items():
+        score = _best_title_pair_score(home_variants, away_variants, title)
+        if score > best_score:
+            best_sid = sid
+            best_score = score
+    if best_sid is not None and best_score >= 0.74:
+        logger.info(
+            "nowscore: pair matched %s vs %s -> sid=%s score=%.3f",
+            home,
+            away,
+            best_sid,
+            best_score,
+        )
+        return best_sid
 
     # 3. 单字匹配（中文球队名取每个字检查，过滤常见无意义字符）
     _COMMON_CHARS = set("FCfc队女()（）男女队足球俱乐部体育股份有限")
     for sid, title in titles.items():
-        home_chars = [c for c in home if c.strip() and c not in _COMMON_CHARS]
-        away_chars = [c for c in away if c.strip() and c not in _COMMON_CHARS]
-        # 根据名字长度自适应阈值：长名字要求 3 字，短名字要求 2 字
-        home_thresh = min(3, len(home_chars))
-        away_thresh = min(3, len(away_chars))
-        if home_thresh >= 2 and away_thresh >= 2:
-            home_match = sum(1 for c in home_chars if c in title) >= home_thresh
-            away_match = sum(1 for c in away_chars if c in title) >= away_thresh
-            if home_match and away_match:
-                logger.info("nowscore: char matched %s vs %s -> sid=%s", home, away, sid)
-                return sid
+        for home_variant in home_variants:
+            for away_variant in away_variants:
+                home_chars = [c for c in home_variant if c.strip() and c not in _COMMON_CHARS]
+                away_chars = [c for c in away_variant if c.strip() and c not in _COMMON_CHARS]
+                # 根据名字长度自适应阈值：长名字要求 3 字，短名字要求 2 字
+                home_thresh = min(3, len(home_chars))
+                away_thresh = min(3, len(away_chars))
+                if home_thresh >= 2 and away_thresh >= 2:
+                    home_match = sum(1 for c in home_chars if c in title) >= home_thresh
+                    away_match = sum(1 for c in away_chars if c in title) >= away_thresh
+                    if home_match and away_match:
+                        logger.info("nowscore: char matched %s vs %s -> sid=%s", home, away, sid)
+                        return sid
 
-    logger.warning("nowscore: no match found for %s vs %s", home, away)
+    if best_sid is not None:
+        await _record_alias_candidate(
+            sport=sport,
+            home=home,
+            away=away,
+            home_variants=home_variants,
+            away_variants=away_variants,
+            best_sid=best_sid,
+            best_score=best_score,
+            best_title=titles.get(best_sid) or "",
+        )
+        logger.warning(
+            "nowscore: no match found for %s vs %s | best_sid=%s best_score=%.3f title=%s",
+            home,
+            away,
+            best_sid,
+            best_score,
+            titles.get(best_sid) or "",
+        )
+    else:
+        logger.warning("nowscore: no match found for %s vs %s", home, away)
     return None
 
 
@@ -236,6 +1098,52 @@ def _fuzzy_team_match(team: str, title: str) -> bool:
         if team_lower[i : i + 3] in title_lower:
             return True
     return False
+
+
+def _normalize_title_for_match(title: str) -> str:
+    s = (title or "").strip().lower()
+    s = s.replace("\u200e", "").replace("\u200f", "").replace("\xa0", " ")
+    s = re.sub(r"\s+", " ", s)
+    s = re.sub(r"\s*[-_|]\s*分析.*$", "", s)
+    return s.strip()
+
+
+def _extract_title_teams(title: str) -> tuple[str, str]:
+    s = _normalize_title_for_match(title)
+    s = re.sub(r"\s+(vs\.?|v\.?)\s+", " vs ", s, flags=re.I)
+    s = re.sub(r"\s*（[^）]*）\s*", " ", s)
+    s = re.sub(r"\s*\([^)]*\)\s*", " ", s)
+    parts = [
+        p.strip(" -_|")
+        for p in re.split(r"\s*(?:vs\.?|v\.?|对阵|对|—|–|-)\s*", s, maxsplit=1, flags=re.I)
+        if p.strip(" -_|")
+    ]
+    if len(parts) >= 2:
+        return parts[0], parts[1]
+    return "", ""
+
+
+def _title_pair_score(home: str, away: str, title: str) -> float:
+    th, ta = _extract_title_teams(title)
+    if th and ta:
+        return _pair_similarity(home, away, th, ta)
+
+    title_n = _norm_team(_normalize_title_for_match(title))
+    home_n = _norm_team(home)
+    away_n = _norm_team(away)
+    if not title_n or not home_n or not away_n:
+        return 0.0
+    home_score = _team_similarity(home_n, title_n)
+    away_score = _team_similarity(away_n, title_n)
+    return min(home_score, away_score) * ((home_score + away_score) / 2.0)
+
+
+def _best_title_pair_score(home_variants: list[str], away_variants: list[str], title: str) -> float:
+    best = 0.0
+    for home in home_variants or [""]:
+        for away in away_variants or [""]:
+            best = max(best, _title_pair_score(home, away, title))
+    return best
 
 
 async def _get_match_title(schedule_id: int, sport: str = "football") -> str:
@@ -307,21 +1215,7 @@ async def _fetch_live_page(schedule_id: int, sport: str = "football") -> str:
 
 
 async def _fetch_trend_page(schedule_id: int, sport: str = "football") -> str:
-    """获取走势/初指页 HTML。"""
-    try:
-        c = await _get_client()
-        candidates = [
-            f"{_BASE}/Analy/Analysis/{schedule_id}.htm",
-            f"{_BASE}/AnalyLq/Analysis/{schedule_id}.htm",
-        ]
-        for url in candidates:
-            resp = await c.get(url)
-            if resp.status_code == 200 and resp.text and (
-                "赛前指数" in resp.text or "初指" in resp.text or "公司" in resp.text
-            ):
-                return resp.text
-    except Exception as e:
-        logger.warning("nowscore: trend page fetch failed sid=%s err=%s", schedule_id, e)
+    """走势页不存在独立 URL——赛前指数数据在分析页内。返回空，由调用方用分析页 HTML 解析。"""
     return ""
 
 
@@ -887,6 +1781,52 @@ def _tables_with_keywords(tables: list[list[list[str]]], keywords: tuple[str, ..
     return out
 
 
+def _tables_after_marker(html: str, keyword: str, max_tables: int = 2) -> list[list[list[str]]]:
+    """按 HTML 位置查找关键词后面的 table。
+    关键词通常在 <div> 标签中，不在 <table> 内。
+    查找 keyword 出现位置后的 max_tables 个 <table>，直到下一个 section 标记。
+    """
+    result: list[list[list[str]]] = []
+    pos = html.find(keyword)
+    if pos < 0:
+        return result
+
+    # section 标记：下一个 fenxiBar / up div（subBar 是子标题，不作为边界）
+    section_end = len(html)
+    for marker in (
+        '<div class="fenxiBar"',
+        '<div class="up"></div>',
+    ):
+        idx = html.find(marker, pos + len(keyword))
+        if 0 <= idx < section_end:
+            section_end = idx
+
+    # 在 [pos, section_end) 范围内找所有 <table>
+    search_pos = pos
+    for _ in range(max_tables):
+        tbl_start = html.find("<table", search_pos)
+        if tbl_start < 0 or tbl_start >= section_end:
+            break
+        tbl_end = html.find("</table>", tbl_start)
+        if tbl_end < 0:
+            break
+        tbl_end += 8
+        tbl_html = html[tbl_start:tbl_end]
+        rows: list[list[str]] = []
+        for tr in re.findall(r"<tr[^>]*>(.*?)</tr>", tbl_html, re.S):
+            cells = [
+                _strip_html(c)
+                for c in re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", tr, re.S)
+            ]
+            if any(c for c in cells):
+                rows.append(cells)
+        if rows:
+            result.append(rows)
+        search_pos = tbl_end
+
+    return result
+
+
 def _rows_from_tables(tables: list[list[list[str]]]) -> list[list[str]]:
     rows: list[list[str]] = []
     for tbl in tables:
@@ -917,33 +1857,66 @@ def _parse_named_rows(tables: list[list[list[str]]]) -> list[dict[str, Any]]:
 
 
 def _parse_odds_trend_tables(html: str) -> dict[str, Any]:
-    tables = _tables_with_keywords(_parse_tables(html), ("赛前指数", "初指", "初盘", "公司", "盘口"))
+    """解析赛前指数/各公司初指。数据在分析页的"赛前指数" section。"""
+    tables = _tables_after_marker(html, "赛前指数", max_tables=1)
+    if not tables:
+        # 回退：尝试旧方式
+        tables = _tables_with_keywords(_parse_tables(html), ("初指", "初盘", "盘口"))
     if not tables:
         return {"tables": [], "initial_odds": []}
+    named = _parse_named_rows(tables)
     return {
-        "tables": _parse_named_rows(tables),
-        "initial_odds": _parse_named_rows(tables[:4]),
-        "note": "走势/初指数据已抓取",
+        "tables": named,
+        "initial_odds": named,
+        "note": "赛前指数（欧赔/亚盘/大小）已抓取",
     }
 
 
 def _parse_injuries_and_features(html: str) -> dict[str, Any]:
-    tables = _parse_tables(html)
-    injuries = _tables_with_keywords(tables, ("伤停", "伤缺", "停赛"))
-    features = _tables_with_keywords(tables, ("战绩特征", "数据对比", "联赛走势"))
-    compare = _tables_with_keywords(tables, ("数据对比", "对比"))
+    """解析伤停情况（伤员+停赛）和战绩特征、数据对比。
+    足球有伤停/特征/对比；篮球有盘路走势/近期走势。
+    """
+    # 伤停 section 包含伤员和停赛两个子表（仅足球）
+    injury_tables = _tables_after_marker(html, "伤停情况", max_tables=4)
+    if not injury_tables:
+        injury_tables = _tables_after_marker(html, "伤停", max_tables=4)
+
+    # 战绩特征（足球）
+    feature_tables = _tables_after_marker(html, "战绩特征", max_tables=1)
+    # 盘路走势（篮球）— 汇总表 + 逐场走势
+    if not feature_tables:
+        feature_tables = _tables_after_marker(html, "盘路走势", max_tables=6)
+    # 近期走势（篮球 W/L 汇总）
+    recent_trend = _tables_after_marker(html, "近期走势", max_tables=1)
+    if recent_trend:
+        feature_tables = feature_tables + recent_trend
+
+    # 数据对比（足球）
+    compare_tables = _tables_after_marker(html, "数据对比", max_tables=1)
+
     return {
-        "injuries": _parse_named_rows(injuries),
-        "features": _parse_named_rows(features),
-        "compare": _parse_named_rows(compare),
+        "injuries": _parse_named_rows(injury_tables),
+        "features": _parse_named_rows(feature_tables),
+        "compare": _parse_named_rows(compare_tables),
     }
 
 
 def _parse_live_data(html: str) -> dict[str, Any]:
-    tables = _parse_tables(html)
-    lineup_tbls = _tables_with_keywords(tables, ("首发", "阵容", "预计首发", "替补"))
-    prob_tbls = _tables_with_keywords(tables, ("进失球概率", "进球概率", "失球概率"))
-    hf_tbls = _tables_with_keywords(tables, ("半场", "全场", "胜负统计", "半全场"))
+    """解析直播页：首发阵容、进失球概率、半场/全场胜负统计。"""
+    # 首发阵容：主队和客队各一个表
+    lineup_tables = _tables_after_marker(html, "首发阵容", max_tables=2)
+    if not lineup_tables:
+        lineup_tables = _tables_after_marker(html, "首发", max_tables=2)
+
+    # 进失球概率：可能有两个表（汇总 + 时间段分布）
+    prob_tables = _tables_after_marker(html, "进失球概率", max_tables=2)
+    if not prob_tables:
+        prob_tables = _tables_after_marker(html, "进球概率", max_tables=2)
+
+    # 半场/全场胜负统计
+    hf_tables = _tables_after_marker(html, "半场/全场胜负统计", max_tables=1)
+    if not hf_tables:
+        hf_tables = _tables_after_marker(html, "半全场", max_tables=1)
 
     def _maybe_team_block(tbls: list[list[list[str]]]) -> dict[str, Any]:
         named = _parse_named_rows(tbls)
@@ -955,10 +1928,10 @@ def _parse_live_data(html: str) -> dict[str, Any]:
         }
 
     return {
-        "lineup": _maybe_team_block(lineup_tbls),
-        "probabilities": _maybe_team_block(prob_tbls),
-        "half_full_stats": _maybe_team_block(hf_tbls),
-        "tables": _parse_named_rows(lineup_tbls + prob_tbls + hf_tbls),
+        "lineup": _maybe_team_block(lineup_tables),
+        "probabilities": _maybe_team_block(prob_tables),
+        "half_full_stats": _maybe_team_block(hf_tables),
+        "tables": _parse_named_rows(lineup_tables + prob_tables + hf_tables),
     }
 
 
@@ -973,23 +1946,39 @@ def _build_context_payload(
     qingbao_html: str,
     live_html: str,
     trend_html: str,
+    analysis_tables: Optional[list[list[list[str]]]] = None,
+    qingbao_tables: Optional[list[list[list[str]]]] = None,
+    h2h: Optional[dict[str, Any]] = None,
+    home_form: Optional[dict[str, Any]] = None,
+    away_form: Optional[dict[str, Any]] = None,
+    standings: Optional[dict[str, Any]] = None,
+    analysis_extra: Optional[dict[str, Any]] = None,
+    live_data: Optional[dict[str, Any]] = None,
+    trend_data: Optional[dict[str, Any]] = None,
 ) -> Optional[dict[str, Any]]:
-    analysis_tables = _parse_tables(analysis_html)
-    qingbao_tables = _parse_tables(qingbao_html)
-    h2h = _parse_h2h(analysis_html, home_team, away_team)
-    home_form = _parse_recent_form(analysis_html, "home", team_name=home_team, _tables=analysis_tables)
-    away_form = _parse_recent_form(analysis_html, "away", team_name=away_team, _tables=analysis_tables)
-    standings = _parse_standings(
-        analysis_html,
-        qingbao_html,
-        _analysis_tables=analysis_tables,
-        _qingbao_tables=qingbao_tables,
-        home_team=home_team,
-        away_team=away_team,
-    )
-    analysis_extra = _parse_injuries_and_features(analysis_html)
-    live_data = _parse_live_data(live_html)
-    trend_data = _parse_odds_trend_tables(trend_html or analysis_html)
+    analysis_tables = analysis_tables if analysis_tables is not None else _parse_tables(analysis_html)
+    qingbao_tables = qingbao_tables if qingbao_tables is not None else _parse_tables(qingbao_html)
+    if h2h is None:
+        h2h = _parse_h2h(analysis_html, home_team, away_team)
+    if home_form is None:
+        home_form = _parse_recent_form(analysis_html, "home", team_name=home_team, _tables=analysis_tables)
+    if away_form is None:
+        away_form = _parse_recent_form(analysis_html, "away", team_name=away_team, _tables=analysis_tables)
+    if standings is None:
+        standings = _parse_standings(
+            analysis_html,
+            qingbao_html,
+            _analysis_tables=analysis_tables,
+            _qingbao_tables=qingbao_tables,
+            home_team=home_team,
+            away_team=away_team,
+        )
+    if analysis_extra is None:
+        analysis_extra = _parse_injuries_and_features(analysis_html)
+    if live_data is None:
+        live_data = _parse_live_data(live_html)
+    if trend_data is None:
+        trend_data = _parse_odds_trend_tables(trend_html or analysis_html)
 
     if not _context_matches_declared_sport(
         sport=sport,
@@ -1005,6 +1994,12 @@ def _build_context_payload(
         )
         return None
 
+    # 合并 analysis_extra 中的所有表
+    analysis_all_tables = []
+    for key in ("injuries", "features", "compare"):
+        for item in (analysis_extra.get(key) or []):
+            analysis_all_tables.append(item)
+
     ctx = {
         "source": "nowscore",
         "schedule_id": schedule_id,
@@ -1013,7 +2008,7 @@ def _build_context_payload(
         "away_team": away_team,
         "match_title": title,
         "analysis": {
-            "analysis_tables": _parse_named_rows(_section_tables(analysis_html, ("伤停", "战绩特征", "数据对比", "联赛走势"))),
+            "analysis_tables": analysis_all_tables,
             "injuries": analysis_extra.get("injuries") or [],
             "features": analysis_extra.get("features") or [],
             "compare": analysis_extra.get("compare") or [],
@@ -1096,26 +2091,45 @@ async def fetch_match_context_via_nowscore(
     trend_data = _parse_odds_trend_tables(trend_html or analysis_html)
 
     # 4. 构建返回
-    ctx = {
-        "source": "nowscore",
-        "schedule_id": schedule_id,
-        "sport": sport,
-        "home_team": home_team,
-        "away_team": away_team,
-        "match_title": title,
-        "analysis": {
-            "injuries": analysis_extra.get("injuries") or [],
-            "features": analysis_extra.get("features") or [],
-            "compare": analysis_extra.get("compare") or [],
-        },
-        "live": live_data,
-        "trend": trend_data,
-        "h2h": h2h,
-        "home_form": home_form,
-        "away_form": away_form,
-        "standings": standings,
-        "fetched_at": datetime.now(timezone.utc).isoformat(),
-    }
+    analysis_all_tables = []
+    for key in ("injuries", "features", "compare"):
+        for item in (analysis_extra.get(key) or []):
+            analysis_all_tables.append(item)
+    ctx = _build_context_payload(
+        schedule_id=schedule_id,
+        sport=sport,
+        home_team=home_team,
+        away_team=away_team,
+        title=title,
+        analysis_html=analysis_html,
+        qingbao_html=qingbao_html,
+        live_html=live_html,
+        trend_html=trend_html,
+        analysis_tables=analysis_tables,
+        qingbao_tables=qingbao_tables,
+        h2h=h2h,
+        home_form=home_form,
+        away_form=away_form,
+        standings=standings,
+        analysis_extra=analysis_extra,
+        live_data=live_data,
+        trend_data=trend_data,
+    )
+    if not ctx:
+        return None
+    ctx.setdefault("analysis", {})
+    if isinstance(ctx.get("analysis"), dict):
+        ctx["analysis"]["analysis_tables"] = analysis_all_tables
+        ctx["analysis"]["injuries"] = analysis_extra.get("injuries") or []
+        ctx["analysis"]["features"] = analysis_extra.get("features") or []
+        ctx["analysis"]["compare"] = analysis_extra.get("compare") or []
+    ctx["live"] = live_data
+    ctx["trend"] = trend_data
+    ctx["h2h"] = h2h
+    ctx["home_form"] = home_form
+    ctx["away_form"] = away_form
+    ctx["standings"] = standings
+    ctx["fetched_at"] = datetime.now(timezone.utc).isoformat()
     ctx = _sync_context_dimensions(ctx)
     if not (ctx.get("dimensions_present") or []):
         logger.warning(
@@ -1210,26 +2224,45 @@ async def _parse_one_schedule(
     live_data = _parse_live_data(live_html)
     trend_data = _parse_odds_trend_tables(trend_html or analysis_html)
 
-    ctx = {
-        "source": "nowscore",
-        "schedule_id": schedule_id,
-        "sport": sport,
-        "home_team": home_team,
-        "away_team": away_team,
-        "match_title": title,
-        "analysis": {
-            "injuries": analysis_extra.get("injuries") or [],
-            "features": analysis_extra.get("features") or [],
-            "compare": analysis_extra.get("compare") or [],
-        },
-        "live": live_data,
-        "trend": trend_data,
-        "h2h": h2h,
-        "home_form": home_form,
-        "away_form": away_form,
-        "standings": standings,
-        "fetched_at": datetime.now(timezone.utc).isoformat(),
-    }
+    analysis_all_tables = []
+    for key in ("injuries", "features", "compare"):
+        for item in (analysis_extra.get(key) or []):
+            analysis_all_tables.append(item)
+    ctx = _build_context_payload(
+        schedule_id=schedule_id,
+        sport=sport,
+        home_team=home_team,
+        away_team=away_team,
+        title=title,
+        analysis_html=analysis_html,
+        qingbao_html=qingbao_html,
+        live_html=live_html,
+        trend_html=trend_html,
+        analysis_tables=analysis_tables,
+        qingbao_tables=qingbao_tables,
+        h2h=h2h,
+        home_form=home_form,
+        away_form=away_form,
+        standings=standings,
+        analysis_extra=analysis_extra,
+        live_data=live_data,
+        trend_data=trend_data,
+    )
+    if not ctx:
+        return None
+    ctx.setdefault("analysis", {})
+    if isinstance(ctx.get("analysis"), dict):
+        ctx["analysis"]["analysis_tables"] = analysis_all_tables
+        ctx["analysis"]["injuries"] = analysis_extra.get("injuries") or []
+        ctx["analysis"]["features"] = analysis_extra.get("features") or []
+        ctx["analysis"]["compare"] = analysis_extra.get("compare") or []
+    ctx["live"] = live_data
+    ctx["trend"] = trend_data
+    ctx["h2h"] = h2h
+    ctx["home_form"] = home_form
+    ctx["away_form"] = away_form
+    ctx["standings"] = standings
+    ctx["fetched_at"] = datetime.now(timezone.utc).isoformat()
     ctx = _sync_context_dimensions(ctx)
     if not (ctx.get("dimensions_present") or []):
         return None
@@ -1249,23 +2282,40 @@ async def prefetch_today_all_contexts(
     Returns:
         成功缓存的数量
     """
-    sport_type = 2 if "basket" in (sport or "").lower() else 1
+    full_matches = await _get_schedule_feed_matches(sport, force_refresh=True)
+    titles: dict[int, str] = {}
+    match_meta: dict[int, dict[str, Any]] = {}
 
-    # 1. 获取今日所有 scheduleId（1 次 HTTP）
-    ids = await _get_today_schedule_ids(sport_type)
-    if not ids:
+    if full_matches:
+        match_meta = full_matches
+        titles = {
+            sid: str(meta.get("title") or "").strip()
+            for sid, meta in full_matches.items()
+            if str(meta.get("title") or "").strip()
+        }
+
+    if not titles:
+        sport_type = 2 if "basket" in (sport or "").lower() else 1
+        ids = await _get_today_schedule_ids(sport_type)
+        if ids:
+            titles = await _get_all_titles(sport)
+            for sid, title in titles.items():
+                home, away = _extract_title_teams(title)
+                match_meta[sid] = {
+                    "schedule_id": sid,
+                    "sport": _sport_cache_key(sport),
+                    "home_team": home,
+                    "away_team": away,
+                    "title": title,
+                }
+
+    if not titles:
         logger.warning("nowscore prefetch: no schedule IDs for sport=%s", sport)
         return 0
 
-    logger.info("nowscore prefetch: %d matches for sport=%s", len(ids), sport)
+    logger.info("nowscore prefetch: %d matches for sport=%s", len(titles), sport)
 
-    # 2. 批量获取标题（会填充 _html_cache）
-    titles = await _get_all_titles(sport)
-    if not titles:
-        logger.warning("nowscore prefetch: no titles fetched")
-        return 0
-
-    # 3. 并发解析所有比赛的上下文
+    # 2. 并发解析所有比赛的上下文
     sem = asyncio.Semaphore(concurrency)
     success_count = 0
     total = len(titles)
@@ -1288,17 +2338,11 @@ async def prefetch_today_all_contexts(
         nonlocal success_count
         async with sem:
             try:
-                # 从标题解析球队名
-                home, away = "", ""
-                if title:
-                    # 清理标题：去掉日期前缀和后缀
-                    clean = re.sub(r"\d+月\d+日\s*[:：]\s*", "", title)
-                    clean = re.sub(r"数据分析.*$", "", clean)
-                    clean = clean.strip()
-                    parts = re.split(r"\s*[Vv][Ss]\s*", clean, maxsplit=1)
-                    if len(parts) == 2:
-                        home = parts[0].strip()
-                        away = parts[1].strip()
+                meta = match_meta.get(sid) or {}
+                home = str(meta.get("home_team") or "").strip()
+                away = str(meta.get("away_team") or "").strip()
+                if not home or not away:
+                    home, away = _extract_title_teams(title)
 
                 ctx = await _parse_one_schedule(sid, home, away, sport=sport)
                 if not ctx:
@@ -1326,6 +2370,6 @@ async def prefetch_today_all_contexts(
 
     logger.info(
         "nowscore prefetch done: sport=%s total=%d cached=%d",
-        sport, len(ids), success_count,
+        sport, total, success_count,
     )
     return success_count

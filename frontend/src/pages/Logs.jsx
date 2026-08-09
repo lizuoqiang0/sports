@@ -69,8 +69,8 @@ export default function LogsPage() {
   return (
     <>
       <PageHeader
-        title="AI 日志"
-        description="AI 分析结果 · 下单记录 · 风控触发"
+        title="运行日志"
+        description="分析、下单、风控"
       />
 
       {/* 筛选栏 */}
@@ -117,8 +117,8 @@ export default function LogsPage() {
         {filtered.length === 0 ? (
           <div className="text-center py-16 text-ink-400">
             <ScrollText size={40} className="mx-auto mb-3 opacity-30" />
-            <p className="text-sm">暂无日志记录</p>
-            <p className="text-xs mt-1">启动 AI 分析后将自动记录</p>
+            <p className="text-sm">暂无日志</p>
+            <p className="text-xs mt-1">开始分析后会自动记录</p>
           </div>
         ) : (
           <div className="divide-y divide-ink-100">

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Optional
 
 from app.config import settings
 from app.services.sports_data import compute_quality
@@ -85,6 +85,9 @@ def _ctx_has_stats(ctx: dict) -> bool:
     lineup = ctx.get("lineup") or {}
     standings = ctx.get("standings") or {}
     weather = ctx.get("weather") or {}
+    analysis = ctx.get("analysis") or {}
+    live = ctx.get("live") or {}
+    trend = ctx.get("trend") or {}
     return bool(
         h2n
         or hf
@@ -93,6 +96,18 @@ def _ctx_has_stats(ctx: dict) -> bool:
         or lineup.get("away")
         or standings.get("home")
         or standings.get("away")
+        or (
+            isinstance(analysis, dict)
+            and any(analysis.get(k) for k in ("injuries", "features", "compare", "analysis_tables"))
+        )
+        or (
+            isinstance(live, dict)
+            and any(
+                (live.get(k) or {}).get("count") or (live.get(k) or {}).get("tables")
+                for k in ("lineup", "probabilities", "half_full_stats")
+            )
+        )
+        or (isinstance(trend, dict) and (trend.get("tables") or trend.get("initial_odds")))
         or (
             isinstance(weather, dict)
             and any(weather.get(k) not in (None, "") for k in ("condition", "temp_c", "pitch", "venue"))
@@ -122,8 +137,54 @@ async def _persist(match_info: dict, fixture_key: str, ctx: dict) -> dict:
     return saved
 
 
-async def fetch_match_context(match_info: dict) -> dict:
-    """优先读 DB / Redis，再 AI 搜索 → 空。"""
+async def _load_cached_context(match_info: dict) -> tuple[Optional[dict], str]:
+    """只读取 Redis / DB 的缓存上下文，绝不触发网络抓取。"""
+    fixture_keys = _fixture_key_aliases(match_info)
+    from app.services.match_context_store import load_from_db, load_from_redis
+
+    for fk in fixture_keys:
+        try:
+            redis_ctx = await load_from_redis(fk)
+            if redis_ctx and redis_ctx.get("source") == "nowscore" and _ctx_has_stats(redis_ctx):
+                return _finalize(redis_ctx), "redis"
+        except Exception as e:
+            logger.debug("match_context redis: %s", e)
+
+    for fk in fixture_keys:
+        try:
+            db_ctx = await load_from_db(fk)
+            if db_ctx and db_ctx.get("source") == "nowscore" and _ctx_has_stats(db_ctx):
+                return _finalize(db_ctx), "db"
+        except Exception as e:
+            logger.debug("match_context db: %s", e)
+
+    return None, "miss"
+
+
+async def fetch_match_context_fast(match_info: dict) -> dict:
+    """快路径：只读缓存，Redis/DB 未命中就直接返回空上下文。"""
+    if not bool(getattr(settings, "AI_MATCH_CONTEXT_ENABLED", True)):
+        return empty_match_context(source="disabled", note="AI_MATCH_CONTEXT_ENABLED=false")
+
+    home = str(match_info.get("home_team") or "").strip()
+    away = str(match_info.get("away_team") or "").strip()
+    if not home or not away:
+        return empty_match_context(note="缺少主客队名")
+
+    cached, source = await _load_cached_context(match_info)
+    if cached:
+        cached["cache_source"] = source
+        cached["context_mode"] = "fast_cache_only"
+        return cached
+    return empty_match_context(
+        source="none",
+        note="缓存未命中，已快速跳过抓取",
+        context_mode="fast_cache_only",
+    )
+
+
+async def fetch_match_context(match_info: dict, *, refresh_on_miss: bool = True) -> dict:
+    """优先读 DB / Redis；默认允许慢速抓取补全，关闭时直接快速跳过。"""
     if not bool(getattr(settings, "AI_MATCH_CONTEXT_ENABLED", True)):
         return empty_match_context(source="disabled", note="AI_MATCH_CONTEXT_ENABLED=false")
 
@@ -133,24 +194,15 @@ async def fetch_match_context(match_info: dict) -> dict:
         return empty_match_context(note="缺少主客队名")
 
     fixture_key = _fixture_key_of(match_info)
-    fixture_keys = _fixture_key_aliases(match_info)
-    from app.services.match_context_store import load_from_db, load_from_redis
-
-    for fk in fixture_keys:
-        try:
-            redis_ctx = await load_from_redis(fk)
-            if redis_ctx and redis_ctx.get("source") == "nowscore" and _ctx_has_stats(redis_ctx):
-                return _finalize(redis_ctx)
-        except Exception as e:
-            logger.debug("match_context redis: %s", e)
-
-    for fk in fixture_keys:
-        try:
-            db_ctx = await load_from_db(fk)
-            if db_ctx and db_ctx.get("source") == "nowscore" and _ctx_has_stats(db_ctx):
-                return _finalize(db_ctx)
-        except Exception as e:
-            logger.debug("match_context db: %s", e)
+    cached, _ = await _load_cached_context(match_info)
+    if cached:
+        return cached
+    if not refresh_on_miss:
+        return empty_match_context(
+            source="none",
+            note="缓存未命中，已快速跳过抓取",
+            context_mode="fast_cache_only",
+        )
 
     search_ctx = None
     # 1. 优先用捷报比分（结构化数据，覆盖8大维度）

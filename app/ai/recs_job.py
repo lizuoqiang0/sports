@@ -50,9 +50,9 @@ def filter_recs_by_bet_mode(
     recommendations: list[dict],
     *,
     bet_mode: str = "manual",
-    min_confidence: float = 0.0,
-    min_odds: float = 1.1,
-    max_odds: float | None = 10.0,
+    min_confidence: float = settings.AI_MIN_CONFIDENCE,
+    min_odds: float = settings.AI_MIN_ODDS,
+    max_odds: float | None = settings.AI_MAX_ODDS,
     preferred_sports: list[str] | None = None,
     excluded_teams: list[str] | None = None,
     strat=None,
@@ -138,6 +138,14 @@ async def is_analysis_watching(user_id: int, sport: str) -> bool:
     return str(v or "").strip() in ("1", "true", "yes", "on")
 
 
+async def list_analysis_watching_sports(user_id: int) -> list[str]:
+    sports: list[str] = []
+    for sport in ("football", "basketball"):
+        if await is_analysis_watching(user_id, sport):
+            sports.append(sport)
+    return sports
+
+
 async def _is_cancelled(user_id: int, sport: str) -> bool:
     try:
         v = await cache.get(_cancel_key(user_id, sport))
@@ -198,6 +206,18 @@ async def stop_analysis_watch(*, user_id: int, sport: str) -> dict[str, Any]:
         "sport": sport_norm,
         "progress": 0,
         "total": 0,
+    }
+
+
+async def stop_all_analysis_watches(*, user_id: int) -> dict[str, Any]:
+    stopped: list[str] = []
+    for sport in ("football", "basketball"):
+        if await is_analysis_watching(user_id, sport):
+            await stop_analysis_watch(user_id=user_id, sport=sport)
+            stopped.append(sport)
+    return {
+        "stopped_sports": stopped,
+        "analysis_enabled": False,
     }
 
 
@@ -826,9 +846,9 @@ async def _requeue_analysis_round(
     wait = float(
         delay_sec
         if delay_sec is not None
-        else getattr(settings, "AI_SCAN_INTERVAL_SEC", 60) or 60
+        else getattr(settings, "AI_SCAN_INTERVAL_SEC", 120) or 120
     )
-    wait = max(15.0, min(wait, 300.0))
+    wait = max(120.0, min(wait, 600.0))
     try:
         await asyncio.sleep(wait)
         if not await is_analysis_watching(user_id, sport):

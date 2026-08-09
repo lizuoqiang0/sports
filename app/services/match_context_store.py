@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import Optional
 
 from sqlalchemy import select
 
@@ -21,6 +21,9 @@ TRACKED_DIMENSIONS = (
     "home_form",
     "away_form",
     "standings",
+    "analysis",
+    "live",
+    "trend",
 )
 
 
@@ -80,6 +83,15 @@ async def load_from_db(fixture_key: str) -> Optional[dict]:
                     select(MatchContextRow).where(MatchContextRow.fixture_key == fixture_key)
                 )
             ).scalar_one_or_none()
+            # 精确匹配未命中，尝试模糊匹配（去掉 bucket 后缀如 :82694）
+            if not row:
+                row = (
+                    await db.execute(
+                        select(MatchContextRow).where(
+                            MatchContextRow.fixture_key.like(fixture_key + ":%")
+                        )
+                    )
+                ).scalar_one_or_none()
             await db.commit()
             if not row:
                 return None

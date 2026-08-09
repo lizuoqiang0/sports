@@ -2,7 +2,6 @@
 安全模块 - JWT鉴权、密码哈希、权限控制
 """
 from datetime import datetime, timedelta, timezone
-from typing import Optional, List
 from enum import Enum
 
 import jwt

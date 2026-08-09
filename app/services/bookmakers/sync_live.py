@@ -289,12 +289,15 @@ async def sync_live_scores_odds(
                     text=f"{row.league or ''} {row.home_team or ''} {row.away_team or ''}",
                 ):
                     row.status = MatchStatus.FINISHED
+                    if getattr(row, "end_time", None) is None:
+                        row.end_time = now
                     extra.pop("clock", None)
                     extra.pop("period", None)
                     row.extra_data = extra
                     continue
                 if not local_match_started(row, now=now if getattr(now, "tzinfo", None) else now.replace(tzinfo=timezone.utc)):
                     row.status = MatchStatus.UPCOMING
+                    row.end_time = None
                     extra = dict(row.extra_data or {})
                     extra.pop("clock", None)
                     extra.pop("period", None)
@@ -305,6 +308,8 @@ async def sync_live_scores_odds(
                     ua_naive = ua.replace(tzinfo=None) if getattr(ua, "tzinfo", None) else ua
                     if ua_naive < cutoff:
                         row.status = MatchStatus.FINISHED
+                        if getattr(row, "end_time", None) is None:
+                            row.end_time = now
                         extra = dict(row.extra_data or {})
                         extra.pop("clock", None)
                         extra.pop("period", None)

@@ -105,7 +105,6 @@ export const aiAPI = {
       params: { sport, limit, refresh: false, provider: provider || undefined },
       timeout: 20000,
     }),
-  strategies: () => api.get('/ai/strategies'),
   history: (params) => api.get('/ai/history', { params }),
   oneClickBet: (matchId, stake = 100, markets = [], dryRun = false) =>
     api.post(`/ai/one-click-bet/${matchId}`, { stake, markets, dry_run: dryRun }, { timeout: 30000 }),
@@ -145,5 +144,31 @@ export const adminAPI = {
   setDataSourceSwitch: (enabled) => api.post(`/admin/nowscore/switch?enabled=${enabled}`),
   triggerPrefetch: (sport = 'all') => api.post(`/admin/nowscore/prefetch?sport=${sport}`),
   getPrefetchProgress: () => api.get('/admin/nowscore/progress'),
+  getAliasCandidates: (sport = 'all', limit = 100, minScore = 0) =>
+    api.get('/admin/nowscore/alias-candidates', { params: { sport, limit, min_score: minScore } }),
+  approveAliasCandidate: (candidateId, deleteCandidate = true) =>
+    api.post('/admin/nowscore/alias-candidates/approve', null, {
+      params: { candidate_id: candidateId, delete_candidate: deleteCandidate },
+    }),
+  approveAliasCandidatesBatch: (candidateIds = [], deleteCandidate = true) =>
+    api.post('/admin/nowscore/alias-candidates/approve-batch', {
+      candidate_ids: candidateIds,
+      delete_candidate: deleteCandidate,
+    }),
+  clearAliasCandidates: () => api.delete('/admin/nowscore/alias-candidates'),
+  getAliasOverrides: (sport = 'all', limit = 100) =>
+    api.get('/admin/nowscore/alias-overrides', { params: { sport, limit } }),
+  exportAliasOverrides: (sport = 'all', limit = 5000) =>
+    api.get('/admin/nowscore/alias-overrides/export', { params: { sport, limit } }),
+  previewAliasOverridesImport: (items = []) =>
+    api.post('/admin/nowscore/alias-overrides/import-preview', { items }),
+  importAliasOverrides: (items = []) =>
+    api.post('/admin/nowscore/alias-overrides/import', { items }),
+  getAliasAuditLogs: (limit = 100) =>
+    api.get('/admin/nowscore/alias-audit-logs', { params: { limit } }),
+  deleteAliasOverride: (recordId) =>
+    api.delete('/admin/nowscore/alias-overrides', { params: { record_id: recordId } }),
+  deleteAliasOverridesBatch: (recordIds = []) =>
+    api.delete('/admin/nowscore/alias-overrides', { data: { record_ids: recordIds } }),
+  clearAliasOverrides: () => api.delete('/admin/nowscore/alias-overrides'),
 }
-

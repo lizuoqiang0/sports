@@ -3,7 +3,7 @@
 """
 import asyncio
 import logging
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Body, Depends, Query
 
 from app.config import settings
 from app.core.security import get_current_user
@@ -13,6 +13,14 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/admin", tags=["管理"])
 
 _SWITCH_KEY = "nowscore:prefetch:enabled"
+
+
+def _actor_label(user: object) -> str:
+    return str(
+        getattr(user, "username", None)
+        or getattr(user, "email", None)
+        or getattr(user, "id", "")
+    ).strip()
 
 
 async def _get_switch() -> bool:
@@ -118,6 +126,22 @@ async def trigger_nowscore_prefetch(
             )
         except Exception:
             pass
+        try:
+            from app.core.websocket import manager
+            await manager.broadcast_all({
+                "type": "ai_prefetch_done",
+                "data": {
+                    "football": int(counts.get("football") or 0),
+                    "basketball": int(counts.get("basketball") or 0),
+                    "elapsed_sec": finished_at - started_at,
+                    "source": "manual",
+                    "ok": ok,
+                    "error": error_msg,
+                },
+                "timestamp": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
+            })
+        except Exception:
+            pass
 
     asyncio.create_task(_run())
     return APIResponse(
@@ -141,3 +165,219 @@ async def get_prefetch_progress(
         pass
     status = await _get_prefetch_status()
     return APIResponse(message="无进行中的预取任务", data={"running": False, **status})
+
+
+@router.get("/nowscore/alias-candidates", response_model=APIResponse)
+async def get_nowscore_alias_candidates(
+    sport: str = Query("all", description="all / football / basketball"),
+    limit: int = Query(100, ge=1, le=500),
+    min_score: float = Query(0.0, ge=0.0, le=1.0),
+    _: object = Depends(get_current_user),
+):
+    """查看未命中自动沉淀的候选别名清单。"""
+    from app.services.nowscore_scraper import list_alias_candidates
+
+    items = await list_alias_candidates(sport=sport, limit=limit, min_score=min_score)
+    return APIResponse(
+        message="候选别名清单",
+        data={
+            "sport": sport,
+            "limit": limit,
+            "min_score": min_score,
+            "count": len(items),
+            "items": items,
+        },
+    )
+
+
+@router.post("/nowscore/alias-candidates/approve", response_model=APIResponse)
+async def approve_nowscore_alias_candidate(
+    candidate_id: str = Query(..., description="候选记录 ID"),
+    delete_candidate: bool = Query(True, description="批准后是否从候选清单移除"),
+    current_user: object = Depends(get_current_user),
+):
+    """一键把候选别名转为正式别名，立即参与匹配。"""
+    from app.services.nowscore_scraper import approve_alias_candidate
+
+    approved_by = _actor_label(current_user)
+    item = await approve_alias_candidate(
+        candidate_id,
+        approved_by=approved_by,
+        delete_candidate=delete_candidate,
+    )
+    if not item:
+        return APIResponse(
+            success=False,
+            message="候选别名不存在或批准失败",
+            error_code="ALIAS_CANDIDATE_NOT_FOUND",
+        )
+    return APIResponse(
+        message="候选别名已转为正式别名",
+        data=item,
+    )
+
+
+@router.post("/nowscore/alias-candidates/approve-batch", response_model=APIResponse)
+async def approve_nowscore_alias_candidates_batch(
+    payload: dict = Body(...),
+    current_user: object = Depends(get_current_user),
+):
+    """批量批准候选别名，立即参与匹配。"""
+    from app.services.nowscore_scraper import approve_alias_candidates
+
+    candidate_ids = list(payload.get("candidate_ids") or [])
+    delete_candidate = bool(payload.get("delete_candidate", True))
+    result = await approve_alias_candidates(
+        candidate_ids,
+        approved_by=_actor_label(current_user),
+        delete_candidate=delete_candidate,
+    )
+    return APIResponse(
+        message="候选别名批量批准完成",
+        data=result,
+    )
+
+
+@router.delete("/nowscore/alias-candidates", response_model=APIResponse)
+async def clear_nowscore_alias_candidates(
+    _: object = Depends(get_current_user),
+):
+    """清空候选别名清单。"""
+    from app.services.nowscore_scraper import clear_alias_candidates
+
+    cleared = await clear_alias_candidates()
+    return APIResponse(
+        message="候选别名清单已清空",
+        data={"cleared": cleared},
+    )
+
+
+@router.get("/nowscore/alias-overrides", response_model=APIResponse)
+async def get_nowscore_alias_overrides(
+    sport: str = Query("all", description="all / football / basketball"),
+    limit: int = Query(100, ge=1, le=500),
+    _: object = Depends(get_current_user),
+):
+    """查看已经生效的正式别名。"""
+    from app.services.nowscore_scraper import list_alias_overrides
+
+    items = await list_alias_overrides(sport=sport, limit=limit)
+    return APIResponse(
+        message="正式别名清单",
+        data={
+            "sport": sport,
+            "limit": limit,
+            "count": len(items),
+            "items": items,
+        },
+    )
+
+
+@router.get("/nowscore/alias-overrides/export", response_model=APIResponse)
+async def export_nowscore_alias_overrides(
+    sport: str = Query("all", description="all / football / basketball"),
+    limit: int = Query(5000, ge=1, le=5000),
+    _: object = Depends(get_current_user),
+):
+    """导出正式别名。"""
+    from app.services.nowscore_scraper import export_alias_overrides
+
+    data = await export_alias_overrides(sport=sport, limit=limit)
+    return APIResponse(
+        message="正式别名导出成功",
+        data=data,
+    )
+
+
+@router.post("/nowscore/alias-overrides/import", response_model=APIResponse)
+async def import_nowscore_alias_overrides(
+    payload: dict = Body(...),
+    current_user: object = Depends(get_current_user),
+):
+    """导入正式别名。"""
+    from app.services.nowscore_scraper import import_alias_overrides
+
+    items = list(payload.get("items") or [])
+    result = await import_alias_overrides(
+        items,
+        approved_by=_actor_label(current_user),
+    )
+    return APIResponse(
+        message="正式别名导入完成",
+        data=result,
+    )
+
+
+@router.post("/nowscore/alias-overrides/import-preview", response_model=APIResponse)
+async def preview_import_nowscore_alias_overrides(
+    payload: dict = Body(...),
+    current_user: object = Depends(get_current_user),
+):
+    """预览正式别名导入差异。"""
+    from app.services.nowscore_scraper import preview_alias_overrides_import
+
+    items = list(payload.get("items") or [])
+    result = await preview_alias_overrides_import(
+        items,
+        approved_by=_actor_label(current_user),
+    )
+    return APIResponse(
+        message="正式别名导入预览完成",
+        data=result,
+    )
+
+
+@router.get("/nowscore/alias-audit-logs", response_model=APIResponse)
+async def get_nowscore_alias_audit_logs(
+    limit: int = Query(100, ge=1, le=500),
+    _: object = Depends(get_current_user),
+):
+    """查看别名管理操作日志。"""
+    from app.services.nowscore_scraper import list_alias_audit_logs
+
+    items = await list_alias_audit_logs(limit=limit)
+    return APIResponse(
+        message="别名操作日志",
+        data={
+            "limit": limit,
+            "count": len(items),
+            "items": items,
+        },
+    )
+
+
+@router.delete("/nowscore/alias-overrides", response_model=APIResponse)
+async def delete_nowscore_alias_overrides(
+    record_id: str | None = Query(None, description="正式别名记录 ID；不传则清空全部"),
+    payload: dict | None = Body(None),
+    current_user: object = Depends(get_current_user),
+):
+    """删除一条、批量删除或清空全部正式别名。"""
+    from app.services.nowscore_scraper import (
+        clear_alias_overrides,
+        delete_alias_override,
+        delete_alias_overrides,
+    )
+
+    actor = _actor_label(current_user)
+    record_ids = list((payload or {}).get("record_ids") or [])
+
+    if record_ids:
+        deleted = await delete_alias_overrides(record_ids, actor=actor)
+        return APIResponse(
+            message="正式别名批量删除完成",
+            data=deleted,
+        )
+
+    if record_id:
+        deleted = await delete_alias_override(record_id, actor=actor)
+        return APIResponse(
+            message="正式别名已删除",
+            data={"deleted": deleted, "record_id": record_id},
+        )
+
+    cleared = await clear_alias_overrides(actor=actor)
+    return APIResponse(
+        message="正式别名清单已清空",
+        data={"cleared": cleared},
+    )

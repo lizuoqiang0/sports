@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from datetime import datetime, timezone
 from typing import Optional
 
 from app.config import settings
@@ -124,16 +125,30 @@ async def _prefetch_loop() -> None:
             )
             logger.info("nowscore prefetch: basketball cached=%d", basketball_count)
             finished_at = int(time.time())
-            await _set_last_result(
-                {
-                    "started_at": started_at,
-                    "finished_at": finished_at,
-                    "football_cached": int(football_count),
-                    "basketball_cached": int(basketball_count),
-                    "ok": True,
-                    "error": None,
-                }
-            )
+            result = {
+                "started_at": started_at,
+                "finished_at": finished_at,
+                "football_cached": int(football_count),
+                "basketball_cached": int(basketball_count),
+                "ok": True,
+                "error": None,
+            }
+            await _set_last_result(result)
+            try:
+                from app.core.websocket import manager
+                await manager.broadcast_all({
+                    "type": "ai_prefetch_done",
+                    "data": {
+                        "football": int(football_count),
+                        "basketball": int(basketball_count),
+                        "elapsed_sec": finished_at - started_at,
+                        "source": "scheduled",
+                        "ok": True,
+                    },
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                })
+            except Exception:
+                pass
 
         except asyncio.CancelledError:
             raise
@@ -150,6 +165,22 @@ async def _prefetch_loop() -> None:
                     "error": str(e),
                 }
             )
+            try:
+                from app.core.websocket import manager
+                await manager.broadcast_all({
+                    "type": "ai_prefetch_done",
+                    "data": {
+                        "football": 0,
+                        "basketball": 0,
+                        "elapsed_sec": 0,
+                        "source": "scheduled",
+                        "ok": False,
+                        "error": str(e),
+                    },
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                })
+            except Exception:
+                pass
 
         await asyncio.sleep(_tick_sec)
 

@@ -124,6 +124,28 @@ export function ingestAiEventLog(detail) {
   const stamp = String(detail?.timestamp || data?.timestamp || new Date().toISOString())
   const eventKey = `${eventType}:${stamp}`
 
+  if (eventType === 'ai_cycle_start') {
+    const candidates = _num(data?.candidates, 0)
+    const groups = _num(data?.fixture_groups, 0)
+    const mode = data?.auto_place ? '自动' : '人工'
+    pushLogOnce(eventKey, 'cycle', `AI 开始新一轮分析：${candidates} 场候选 / ${groups} 组同场（${mode}模式）`, data)
+    return
+  }
+
+  if (eventType === 'ai_analysis_done') {
+    const sel = String(data?.selection || '-')
+    const market = String(data?.bet_type || 'total')
+    const marketLabel = market === 'total' ? '亚洲大小' : market === 'moneyline' ? '独赢' : market === 'spread' ? '亚洲让球' : market || '-'
+    const tag = data?.should_bet ? '✓推荐' : _fmtWinRate(_num(data?.confidence, 0) * 100)
+    pushLogOnce(
+      eventKey,
+      'analysis',
+      `${data?.home_team || '-'} vs ${data?.away_team || '-'}  ${marketLabel} ${sel} @ ${_fmtOdds(data?.odds)}  ${tag}`,
+      data,
+    )
+    return
+  }
+
   if (eventType === 'ai_cycle_complete') {
     const analyzed = _num(data?.analyzed, 0)
     const executed = _num(data?.executed, 0)
@@ -189,7 +211,7 @@ export function ingestAiEventLog(detail) {
     pushLogOnce(
       eventKey,
       'config',
-      `策略已更新：胜率≥${_fmtWinRate(_num(data?.min_confidence, 0) * 100)} · 赔率 ${String(data?.min_odds ?? '-')}~${String(data?.max_odds ?? '-')}`,
+      `AI 设置已更新：置信度≥${_fmtWinRate(_num(data?.min_confidence, 0) * 100)} · 赔率 ${String(data?.min_odds ?? '-')}~${String(data?.max_odds ?? '-')}`,
       data,
     )
     return
@@ -209,6 +231,29 @@ export function ingestAiEventLog(detail) {
 
   if (eventType === 'ai_bet_failed') {
     pushLogOnce(eventKey, 'bet_failed', `下单失败: ${String(data?.message || '未知原因')}`, data)
+    return
+  }
+
+  if (eventType === 'ai_prefetch_done') {
+    const football = _num(data?.football, 0)
+    const basketball = _num(data?.basketball, 0)
+    const elapsed = _num(data?.elapsed_sec, 0)
+    const source = data?.source === 'manual' ? '手动' : '定时'
+    if (data?.ok) {
+      pushLogOnce(
+        eventKey,
+        'prefetch',
+        `捷报数据预取完成（${source}）：足球 ${football} 场 / 篮球 ${basketball} 场${elapsed > 0 ? ` · 耗时 ${elapsed}s` : ''}`,
+        data,
+      )
+    } else {
+      pushLogOnce(
+        eventKey,
+        'prefetch',
+        `捷报数据预取失败（${source}）：${String(data?.error || '未知错误')}`,
+        data,
+      )
+    }
     return
   }
 }

@@ -74,6 +74,9 @@ class MatchResponse(BaseModel):
     home_team: str
     away_team: str
     start_time: datetime
+    end_time: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
     status: str
     home_score: int
     away_score: int
@@ -96,6 +99,8 @@ class MatchResponse(BaseModel):
             obj.clock = (extra.get("clock") or "") or None
         if not obj.period:
             obj.period = (extra.get("period") or "") or None
+        if not obj.finished_at and str(getattr(obj, "status", "") or "").lower() == "finished":
+            obj.finished_at = obj.end_time or obj.updated_at or obj.start_time
         return obj
 
 
@@ -150,19 +155,17 @@ class PlaceBetResponse(BaseModel):
 
 # === AI投注 ===
 class AIConfigRequest(BaseModel):
-    strategy: str = Field("high_win_rate", description="high_win_rate")
+    is_active: bool = False
     max_bet_amount: Decimal = Field(settings.AI_STRATEGY_MAX_BET_AMOUNT, gt=0)
     max_daily_bets: int = Field(settings.AI_STRATEGY_MAX_DAILY_BETS, ge=1, le=100)
-    min_confidence: float = Field(0.0, ge=0.1, le=0.99)
+    min_confidence: float = Field(settings.AI_MIN_CONFIDENCE, ge=0.0, le=0.99)
     preferred_sports: List[str] = []
     excluded_teams: List[str] = []
     stop_loss: Decimal = Field(settings.AI_STOP_LOSS, gt=0)
     take_profit: Decimal = Field(settings.AI_TAKE_PROFIT, gt=0)
-    max_odds: float = Field(10.0, gt=1.0)
-    min_odds: float = Field(1.1, gt=1.0)
+    max_odds: float = Field(settings.AI_MAX_ODDS, gt=1.0)
+    min_odds: float = Field(settings.AI_MIN_ODDS, gt=1.0)
     use_llm_analysis: bool = True
-    auto_cashout: bool = False
-    cashout_threshold: float = settings.AI_DEFAULT_CASHOUT_THRESHOLD
 
 
 class AIRecommendationResponse(BaseModel):

@@ -59,12 +59,12 @@ export default function PortfolioPage() {
       }
 
       if (failed === 2) {
-        toast.error(extractErrorMessage(portRes.reason || betsRes.reason, '投注记录加载失败，请稍后重试'))
+        toast.error(extractErrorMessage(portRes.reason || betsRes.reason, '投注记录加载失败，请重试'))
       } else if (failed === 1) {
-        toast.error('部分数据加载失败，页面已先显示可用内容')
+        toast.error('部分数据加载失败')
       }
     } catch (err) {
-      toast.error(extractErrorMessage(err, '投注记录加载失败，请稍后重试'))
+      toast.error(extractErrorMessage(err, '投注记录加载失败，请重试'))
     } finally {
       setLoading(false)
     }
@@ -77,7 +77,7 @@ export default function PortfolioPage() {
       <PageHeader
         eyebrow="持仓"
         title="投注记录"
-        description="展示本地下单成功记录；OB 已返回单号但待补录的订单也会显示"
+        description="只显示本地下单记录"
       />
 
       {/* 今日投注 / 总投注 */}
@@ -97,7 +97,7 @@ export default function PortfolioPage() {
             <div className="text-center">
               <div className="text-sm text-gray-400">总投注</div>
               <div className="text-2xl font-bold mt-1">{portfolio.total_bets} 笔</div>
-              <div className="text-xs text-ink-400 mt-0.5">自然月内本地成功订单 + 待补录订单</div>
+              <div className="text-xs text-ink-400 mt-0.5">自然月内订单</div>
             </div>
           </div>
         </div>
@@ -131,7 +131,7 @@ export default function PortfolioPage() {
           </div>
         ) : bets.length === 0 ? (
           <div className="text-center py-10 text-gray-500">
-            <div>暂无本地成功或待补录投注记录</div>
+            <div>暂无投注记录</div>
           </div>
         ) : (
           <>

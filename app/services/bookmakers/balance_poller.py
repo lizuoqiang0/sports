@@ -41,10 +41,13 @@ async def _list_user_ids() -> list[int]:
 async def _refresh_user(uid: int) -> None:
     from app.database import AsyncSessionLocal
     from app.services.balances import load_site_balances
+    from app.services.daily_pnl import sync_balance_snapshot
 
     async with AsyncSessionLocal() as db:
         try:
             sites = await load_site_balances(db, uid)
+            total_assets = sum(float(site.get("balance") or 0) for site in sites)
+            await sync_balance_snapshot(uid, total_assets)
             await db.commit()
             logger.info(
                 "balance poller user=%s sites=%s",

@@ -5,8 +5,8 @@ import { monitoringAPI } from '../lib/api.js'
 
 /**
  * 全局下单模式开关：人工 / 自动
- * - 人工：仅生成机会/推荐，需手动确认后真实下单
- * - 自动：扫描通过后自动真实下单
+ * - 人工：只出推荐，手动下单
+ * - 自动：命中后自动下单
  */
 export default function BetModeSwitch({ className = '', onChange }) {
   const [betMode, setBetMode] = useState(null)
@@ -39,7 +39,7 @@ export default function BetModeSwitch({ className = '', onChange }) {
       setBetMode(res.data?.bet_mode || next)
       setMeta(res.data || null)
       onChange?.(res.data)
-      toast.success(res.message || (next === 'active' ? '已切换为自动模式' : '已切换为人工模式'))
+      toast.success(res.message || (next === 'active' ? '已切换到自动' : '已切换到人工'))
     } catch (err) {
       toast.error(err?.detail || '切换失败')
     } finally {
