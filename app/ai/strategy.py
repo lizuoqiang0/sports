@@ -340,44 +340,56 @@ class StrategyEngine:
                 mid, conf_f, total_line, current_total, played_mins,
             )
 
-        # ── 闸门2.7：双向风控（over 严格 + under 约束）──
+        # ── 闸门2.7：双向风控（按运动类型分离参数）──
         ctx_source = str(analysis.get("context_source") or "none").strip().lower()
         has_fundamentals = ctx_source not in ("", "none")
 
+        # 运动类型风控参数
+        if sport_l == "basketball":
+            RISK = {
+                "over_no_fundamentals": True,      # 无基本面禁止 over
+                "over_max_line": 200.0,             # over 最大盘线
+                "over_min_conf": 0.40,              # over 最低置信度
+                "under_min_conf": 0.30,             # under 最低置信度（有基本面）
+                "under_min_conf_no_fund": 0.40,     # under 最低置信度（无基本面）
+                "under_max_line": 210.0,            # under 最大盘线（加时/罚球变数大）
+            }
+        else:  # football
+            RISK = {
+                "over_no_fundamentals": True,
+                "over_max_line": 3.0,
+                "over_min_conf": 0.40,
+                "under_min_conf": 0.30,
+                "under_min_conf_no_fund": 0.40,
+                "under_max_line": None,             # 足球 under 无高线限制
+                "under_min_line": 1.5,              # 足球低线 under 1球破盘
+            }
+
         if prediction == "over":
-            # 无基本面数据时禁止 over（纯节奏外推不可靠）
-            if not has_fundamentals:
-                logger.info("[闸门2.7/over风控] ❌ 拒绝 match=%s | 无基本面数据(ctx_source=none)，over方向禁止", mid)
+            if RISK["over_no_fundamentals"] and not has_fundamentals:
+                logger.info("[闸门2.7/over风控] ❌ 拒绝 match=%s | 无基本面数据，over方向禁止", mid)
                 return self._reject(match_info, analysis, "无基本面数据支撑，over方向禁止下单")
-            # 足球高盘线 over 直接拒绝（历史 over 足球仅 1W7L，line≥3.0 全输）
-            if sport_l == "football" and total_line is not None and total_line >= 3.0:
-                logger.info("[闸门2.7/over风控] ❌ 拒绝 match=%s | 足球高线over line=%.2f>=3.0", mid, total_line)
-                return self._reject(match_info, analysis, f"足球高线over（line={total_line:.2f}）历史胜率极低，拒绝")
-            # 篮球高盘线 over 直接拒绝
-            if sport_l == "basketball" and total_line is not None and total_line >= 200:
-                logger.info("[闸门2.7/over风控] ❌ 拒绝 match=%s | 篮球高线over line=%.1f>=200", mid, total_line)
-                return self._reject(match_info, analysis, f"篮球高线over（line={total_line:.1f}）历史胜率极低，拒绝")
-            # over 需要更高置信度（至少 0.40）
-            over_min_conf = max(min_conf, 0.40)
+            if total_line is not None and total_line >= RISK["over_max_line"]:
+                logger.info("[闸门2.7/over风控] ❌ 拒绝 match=%s | %s高线over line=%.2f>=%.2f",
+                            mid, sport_l, total_line, RISK["over_max_line"])
+                return self._reject(match_info, analysis, f"{sport_l}高线over（line={total_line:.2f}）历史胜率极低")
+            over_min_conf = max(min_conf, RISK["over_min_conf"])
             if conf_f < over_min_conf:
                 logger.info("[闸门2.7/over风控] ❌ 拒绝 match=%s | over置信度=%.4f < 要求=%.4f", mid, conf_f, over_min_conf)
                 return self._reject(match_info, analysis, f"over方向需更高置信度（当前{conf_f:.2f}，要求{over_min_conf:.2f}）")
 
         elif prediction == "under":
-            # under 置信度：有基本面 0.30，无基本面 0.40
-            under_min_conf = 0.30 if has_fundamentals else 0.40
+            under_min_conf = RISK["under_min_conf"] if has_fundamentals else RISK["under_min_conf_no_fund"]
             if conf_f < under_min_conf:
                 logger.info("[闸门2.7/under风控] ❌ 拒绝 match=%s | under置信度=%.4f < 要求=%.4f (fundamentals=%s)",
                             mid, conf_f, under_min_conf, has_fundamentals)
                 return self._reject(match_info, analysis, f"under置信度不足（当前{conf_f:.2f}，要求{under_min_conf:.2f}）")
-            # 足球超低盘线 under 风险高（1球即破盘）
-            if sport_l == "football" and total_line is not None and total_line <= 1.5:
-                logger.info("[闸门2.7/under风控] ❌ 拒绝 match=%s | 足球低线under line=%.2f<=1.5，1球即破盘", mid, total_line)
+            if sport_l == "football" and total_line is not None and total_line <= RISK.get("under_min_line", 1.5):
+                logger.info("[闸门2.7/under风控] ❌ 拒绝 match=%s | 足球低线under line=%.2f，1球即破盘", mid, total_line)
                 return self._reject(match_info, analysis, f"足球低线under（line={total_line:.2f}）1球即破盘，风险过高")
-            # 篮球高盘线 under 风险高（0W1L，加时/罚球易超）
-            if sport_l == "basketball" and total_line is not None and total_line >= 210:
-                logger.info("[闸门2.7/under风控] ❌ 拒绝 match=%s | 篮球高线under line=%.1f>=210，变数大", mid, total_line)
-                return self._reject(match_info, analysis, f"篮球高线under（line={total_line:.1f}）变数大，风险高")
+            if sport_l == "basketball" and total_line is not None and RISK.get("under_max_line") and total_line >= RISK["under_max_line"]:
+                logger.info("[闸门2.7/under风控] ❌ 拒绝 match=%s | 篮球高线under line=%.1f>=%.1f，变数大", mid, total_line, RISK["under_max_line"])
+                return self._reject(match_info, analysis, f"篮球高线under（line={total_line:.1f}）加时/罚球变数大")
 
         # ── 闸门2.8：盘口变化方向过滤 ──
         line_moves_raw = match_info.get("line_movements") or match_info.get("line_movement") or {}

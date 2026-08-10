@@ -1884,34 +1884,40 @@ def _parse_odds_trend_tables(html: str) -> dict[str, Any]:
     }
 
 
-def _parse_injuries_and_features(html: str) -> dict[str, Any]:
-    """解析伤停情况（伤员+停赛）和战绩特征、数据对比。
-    足球有伤停/特征/对比；篮球有盘路走势/近期走势。
+def _parse_injuries_and_features(html: str, sport: str = "football") -> dict[str, Any]:
+    """解析伤停和战绩特征/数据对比。
+    足球：伤停/战绩特征/数据对比
+    篮球：伤停/盘路走势/近期走势/数据对比
     """
-    # 伤停 section 包含伤员和停赛两个子表（仅足球）
+    sport_l = (sport or "").lower()
+    is_basketball = "basket" in sport_l
+
+    # 伤停
     injury_tables = _tables_after_marker(html, "伤停情况", max_tables=4)
     if not injury_tables:
         injury_tables = _tables_after_marker(html, "伤停", max_tables=4)
+    if not injury_tables and is_basketball:
+        injury_tables = _tables_after_marker(html, "伤病", max_tables=4)
 
-    # 战绩特征（足球）
-    feature_tables = _tables_after_marker(html, "战绩特征", max_tables=1)
-    # 盘路走势（篮球）— 汇总表 + 逐场走势
-    if not feature_tables:
+    if is_basketball:
+        # 篮球：盘路走势 + 近期走势 + 数据对比
         feature_tables = _tables_after_marker(html, "盘路走势", max_tables=6)
-    # 近期走势（篮球 W/L 汇总）
-    recent_trend = _tables_after_marker(html, "近期走势", max_tables=1)
-    if recent_trend:
-        feature_tables = feature_tables + recent_trend
-
-    # 数据对比（足球）
-    compare_tables = _tables_after_marker(html, "数据对比", max_tables=1)
+        recent_trend = _tables_after_marker(html, "近期走势", max_tables=1)
+        if recent_trend:
+            feature_tables = feature_tables + recent_trend
+        compare_tables = _tables_after_marker(html, "数据对比", max_tables=1)
+        if not compare_tables:
+            compare_tables = _tables_after_marker(html, "场均数据", max_tables=1)
+    else:
+        # 足球：战绩特征 + 数据对比
+        feature_tables = _tables_after_marker(html, "战绩特征", max_tables=1)
+        compare_tables = _tables_after_marker(html, "数据对比", max_tables=1)
 
     return {
         "injuries": _parse_named_rows(injury_tables),
         "features": _parse_named_rows(feature_tables),
         "compare": _parse_named_rows(compare_tables),
     }
-
 
 def _build_context_payload(
     *,
@@ -1950,7 +1956,7 @@ def _build_context_payload(
             away_team=away_team,
         )
     if analysis_extra is None:
-        analysis_extra = _parse_injuries_and_features(analysis_html)
+        analysis_extra = _parse_injuries_and_features(analysis_html, sport)
     if trend_data is None:
         trend_data = _parse_odds_trend_tables(trend_html or analysis_html)
 
@@ -2058,7 +2064,7 @@ async def fetch_match_context_via_nowscore(
         return None
 
     # 解析额外维度
-    analysis_extra = _parse_injuries_and_features(analysis_html)
+    analysis_extra = _parse_injuries_and_features(analysis_html, sport)
     # trend: 依次尝试 trend_html -> analysis_html -> qingbao_html
     trend_data = _parse_odds_trend_tables(trend_html or analysis_html or qingbao_html)
     if not (trend_data.get("tables") or trend_data.get("initial_odds")):
@@ -2190,7 +2196,7 @@ async def _parse_one_schedule(
         return None
 
     # 解析额外维度
-    analysis_extra = _parse_injuries_and_features(analysis_html)
+    analysis_extra = _parse_injuries_and_features(analysis_html, sport)
     # trend: 依次尝试 trend_html -> analysis_html -> qingbao_html
     trend_data = _parse_odds_trend_tables(trend_html or analysis_html or qingbao_html)
     if not (trend_data.get("tables") or trend_data.get("initial_odds")):
