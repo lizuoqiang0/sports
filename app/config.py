@@ -96,8 +96,8 @@ class Settings(BaseSettings):
 
     # --- GPT API（唯一模型） ---
     GPT_API_KEY: Optional[str] = None
-    GPT_BASE_URL: str = "https://www.juaiapi.com/v1"
-    GPT_MODEL: str = "gpt-5.4"
+    GPT_BASE_URL: str = "https://xfastapi.ai/v1"
+    GPT_MODEL: str = "gpt-5.6-terra"
 
     # --- AI 分析配置 ---
     LLM_CLIENT_TIMEOUT_SEC: float = 90.0   # GPT API 调用超时（大 prompt 需要更长时间）
@@ -109,11 +109,11 @@ class Settings(BaseSettings):
     LLM_CACHE_TTL: int = 600               # 10分钟
     # Prompt 压缩：截断冗余数据，控制 prompt 在 8KB 以内
     PROMPT_MAX_CHARS: int = 8000           # prompt 最大字符数
-    H2H_MAX_MATCHES: int = 5               # 历史交锋最多保留场次
-    FORM_MAX_MATCHES: int = 5               # 近况最多保留场次
+    H2H_MAX_MATCHES: int = 3               # 历史交锋最多保留场次
+    FORM_MAX_MATCHES: int = 3               # 近况最多保留场次
     # 下单门槛（从 settings 读取，不写死）
     AI_MIN_CONFIDENCE: float = 0.47        # 下单最低置信度（含纯盘口模式）
-    AI_MIN_ODDS: float = 1.80              # 下单最低赔率
+    AI_MIN_ODDS: float = 1.65              # 下单最低赔率
     AI_MAX_ODDS: float = 5.00              # 下单最高赔率
 
     AI_SCAN_INTERVAL_SEC: int = 120        # AI 引擎扫描间隔（秒）

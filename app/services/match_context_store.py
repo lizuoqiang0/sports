@@ -22,7 +22,6 @@ TRACKED_DIMENSIONS = (
     "away_form",
     "standings",
     "analysis",
-    "live",
     "trend",
 )
 

@@ -257,10 +257,9 @@ class MatchAnalyzer:
 
         prompt = self._build_analysis_prompt(match_info, historical_data, market_odds)
         logger.info(
-            "[AI分析] Prompt 构建完成 match=%s | 长度=%d 字符 | 含analysis=%s 含live=%s 含trend=%s",
+            "[AI分析] Prompt 构建完成 match=%s | 长度=%d 字符 | 含analysis=%s 含trend=%s",
             match_info.get("id"), len(prompt),
             bool(isinstance(historical_data, dict) and historical_data.get("analysis")),
-            bool(isinstance(historical_data, dict) and historical_data.get("live")),
             bool(isinstance(historical_data, dict) and historical_data.get("trend")),
         )
 
@@ -323,7 +322,8 @@ class MatchAnalyzer:
 
             latency_ms = float((raw.get("_meta") or {}).get("latency_ms") or 0)
 
-            consensus_reached = conf >= 0.5
+            # 单模型模式：GPT 返回 over/under 即视为共识达成
+            consensus_reached = pred in ("over", "under")
 
             analysis = {
                 "prediction": pred,
@@ -372,12 +372,8 @@ class MatchAnalyzer:
             triad_ready = bool(review.get("triad_ready"))
             verdict = str(review.get("verdict") or "").strip().lower()
             final_conf = _to_float(analysis.get("confidence"), 0.0)
-            consensus_reached = bool(
-                pred in ("over", "under")
-                and triad_ready
-                and verdict == "supportive"
-                and final_conf >= 0.58
-            )
+            # 单模型模式：GPT 返回 over/under 即为最终共识，三重门禁仅作参考标注
+            consensus_reached = pred in ("over", "under")
             analysis["consensus_reached"] = consensus_reached
 
             if not consensus_reached:
@@ -390,7 +386,7 @@ class MatchAnalyzer:
             # 维度分析日志：核心维度逐项 + 盘口解读
             _hd = historical_data if isinstance(historical_data, dict) else {}
             _core_n = sum(1 for k in ("h2h", "home_form", "away_form", "standings", "trend") if _hd.get(k))
-            _aux_n = sum(1 for k in ("analysis", "live") if _hd.get(k))
+            _aux_n = sum(1 for k in ("analysis",) if _hd.get(k))
             _aux_n += 2 if isinstance(market_odds, dict) and market_odds.get("markets") else 1 if isinstance(market_odds, dict) and market_odds else 0
             _aux_n += 1 if isinstance(market_odds, dict) and market_odds.get("line_movements") else 0
             _ca = analysis.get("core_analysis") or {}
@@ -578,28 +574,6 @@ class MatchAnalyzer:
             points += 1
             reasons.append("伤停/特征/对比维度覆盖较好")
         return {"supportive": True, "points": points, "reason": "；".join(reasons)}
-
-    @staticmethod
-    def _live_page_signal(live: Any) -> dict[str, Any]:
-        if not isinstance(live, dict):
-            return {"supportive": False, "points": 0, "reason": ""}
-        sections = []
-        for key in ("lineup", "probabilities", "half_full_stats"):
-            sec = live.get(key)
-            if isinstance(sec, dict) and (sec.get("count") or sec.get("tables")):
-                sections.append(key)
-        if not sections:
-            return {"supportive": False, "points": 0, "reason": ""}
-        points = 1
-        if len(sections) >= 2:
-            points += 1
-        if len(sections) >= 3:
-            points += 1
-        return {
-            "supportive": True,
-            "points": points,
-            "reason": f"直播页已覆盖{len(sections)}项：" + "/".join(sections),
-        }
 
     @staticmethod
     def _trend_page_signal(trend: Any) -> dict[str, Any]:
@@ -835,7 +809,6 @@ class MatchAnalyzer:
         source = str(quality.get("source") or ctx.get("source") or "none").strip().lower()
         stat_signals = self._build_statistical_signals(ctx, market_odds, info, ctx.get("h2h") if isinstance(ctx.get("h2h"), dict) else None)
         analysis_signal = self._analysis_page_signal(ctx.get("analysis"))
-        live_signal = self._live_page_signal(ctx.get("live"))
         trend_signal = self._trend_page_signal(ctx.get("trend"))
         triad_status = self._market_triad_status(market_odds, ctx)
         opening_live_signal = self._opening_live_signal(market_odds, selection=selection, bet_type=bet_type)
@@ -947,10 +920,6 @@ class MatchAnalyzer:
             fundamental_points += int(analysis_signal.get("points") or 0)
             if analysis_signal.get("reason"):
                 support_reasons.append(analysis_signal["reason"])
-        if live_signal["supportive"]:
-            fundamental_points += int(live_signal.get("points") or 0)
-            if live_signal.get("reason"):
-                support_reasons.append(live_signal["reason"])
         if trend_signal["supportive"]:
             market_points += int(trend_signal.get("points") or 0)
             if trend_signal.get("reason"):
@@ -1234,7 +1203,7 @@ class MatchAnalyzer:
         h2h_max = int(settings.H2H_MAX_MATCHES)
         form_max = int(settings.FORM_MAX_MATCHES)
 
-        # h2h: 只保留最近 N 场，去掉冗余字段
+        # h2h: 只保留最近 N 场，保留进球数据
         h2h = result.get("h2h")
         if isinstance(h2h, dict):
             matches = h2h.get("matches")
@@ -1243,10 +1212,10 @@ class MatchAnalyzer:
             for m in (h2h.get("matches") or []):
                 if isinstance(m, dict):
                     for k in list(m.keys()):
-                        if k not in ("date", "home", "away", "score", "result"):
+                        if k not in ("date", "home", "away", "score", "result", "home_goals", "away_goals", "competition"):
                             m.pop(k, None)
 
-        # home_form / away_form: 只保留最近 N 场
+        # home_form / away_form: 只保留最近 N 场，保留进球和对手数据
         for fk in ("home_form", "away_form"):
             fd = result.get(fk)
             if isinstance(fd, dict):
@@ -1256,7 +1225,7 @@ class MatchAnalyzer:
                 for m in (fd.get("matches") or []):
                     if isinstance(m, dict):
                         for k in list(m.keys()):
-                            if k not in ("date", "opponent", "result", "score", "gf", "ga"):
+                            if k not in ("date", "home", "away", "result", "score", "home_goals", "away_goals", "competition"):
                                 m.pop(k, None)
 
         # trend: 保留前几组表格的结构化摘要
@@ -1313,29 +1282,14 @@ class MatchAnalyzer:
             }
             result["analysis"] = compact_analysis
 
-        # live: 保留首发 / 概率 / 半全场
-        live = result.get("live")
-        if isinstance(live, dict):
-            compact_live = {}
-            for key in ("lineup", "probabilities", "half_full_stats"):
-                value = live.get(key)
-                if isinstance(value, dict) and value:
-                    compact_live[key] = {
-                        "count": int(value.get("count") or 0),
-                        "home": value.get("home"),
-                        "away": value.get("away"),
-                        "tables": (value.get("tables") or [])[:2],
-                    }
-            result["live"] = compact_live
-
-        # standings: 去掉冗余字段
+        # standings: 保留解析器返回的所有有效字段
         standings = result.get("standings")
         if isinstance(standings, dict):
             for sk in ("home", "away"):
                 sd = standings.get(sk)
                 if isinstance(sd, dict):
                     for k in list(sd.keys()):
-                        if k not in ("rank", "played", "won", "drawn", "lost", "gf", "ga", "gd", "pts", "goals_for", "goals_against", "points"):
+                        if k not in ("team", "scope", "played", "win", "draw", "lose", "goals_for", "goals_against", "points", "win_rate", "rank"):
                             sd.pop(k, None)
 
         return result
@@ -1384,7 +1338,6 @@ class MatchAnalyzer:
             dim_data["球队近期状态"] = {"home": home_form, "away": away_form} if (home_form or away_form) else None
             dim_data["联赛积分排名"] = historical_data.get("standings") or None
             dim_data["分析页"] = historical_data.get("analysis") or None
-            dim_data["直播页"] = historical_data.get("live") or None
             dim_data["走势页"] = historical_data.get("trend") or None
 
         # 盘口维度
@@ -1399,7 +1352,7 @@ class MatchAnalyzer:
         dim_lines = []
         dim_available = 0
         dim_names = [
-            "历史交锋", "球队近期状态", "联赛积分排名", "分析页", "直播页", "走势页", "亚洲盘", "盘口变化",
+            "历史交锋", "球队近期状态", "联赛积分排名", "分析页", "走势页", "亚洲盘", "盘口变化",
         ]
         for dn in dim_names:
             dv = dim_data.get(dn)
@@ -1439,14 +1392,11 @@ class MatchAnalyzer:
                     f"missing={dims_missing}\n"
                 )
 
-        # 分析页 / 直播页 / 走势页额外数据
+        # 分析页 / 走势页额外数据
         if isinstance(historical_data, dict):
             analysis_data = historical_data.get("analysis")
             if analysis_data:
                 prompt += f"\n## 分析页额外数据\n{json.dumps(analysis_data, ensure_ascii=False, separators=(',', ':'))}\n"
-            live_data = historical_data.get("live")
-            if live_data:
-                prompt += f"\n## 直播页数据（首发/概率/统计）\n{json.dumps(live_data, ensure_ascii=False, separators=(',', ':'))}\n"
             trend_data = historical_data.get("trend")
             if trend_data:
                 prompt += f"\n## 走势页数据（各公司初指）\n{json.dumps(trend_data, ensure_ascii=False, separators=(',', ':'))}\n"
@@ -1537,8 +1487,8 @@ class MatchAnalyzer:
 7. **水位变化**：变化<5%视为噪音
 
 #### 置信度
-- 6-8/8维度+信号一致→0.62-0.78
-- 4-5/8维度+信号一致→0.50-0.66
+- 5-7/7维度+信号一致→0.62-0.78
+- 3-4/7维度+信号一致→0.50-0.66
 - 盘口与基本面矛盾→≤0.42或skip"""
         else:
             analysis_mode = "盘口优先分析"
@@ -1561,15 +1511,17 @@ class MatchAnalyzer:
 5. **反向思维**：盘口已大幅变化(>0.75球)后，市场可能过度反应，reverse方向反而有价值
 
 #### 置信度（纯盘口模式严格限制）
-- 盘口信号+节奏信号方向一致→0.47-0.53
-- 仅单一信号→0.42-0.47
-- 信号矛盾或弱→0.35-0.42或skip
+- 盘口信号+节奏信号方向一致→0.42-0.48
+- 仅单一信号→0.35-0.42
+- 信号矛盾或弱→skip
 - 无盘口变化数据且无实时比分→必须skip
 
 #### Skip条件
 - 盘口变化≤0.25球且无实时节奏信号→skip
 - 赔率变化<8%且无节奏信号→skip
 - 节奏偏差<15%且盘口信号弱→skip
+- 无基本面数据时选over→必须skip
+- 无基本面数据时under需盘口+节奏双信号一致→否则skip
 - skip时confidence=0.0, key_factors=["数据不足，无法判断"]"""
 
         prompt += f"""
@@ -1595,8 +1547,24 @@ class MatchAnalyzer:
 注意：prediction只能是over/under/skip；skip时confidence=0.0；reasoning必须包含具体数字；只输出JSON。
 """
         prompt += (
-            "\n强制规则：必须同时结合 初指 + 实时盘口 + 基本面 三类信息判断大小球方向。"
-            "若任一类缺失，或三类方向不一致，必须返回 skip，禁止勉强给 over/under。\n"
+            "\n## 双向严格分析规则\n"
+            "### Over 方向（历史胜率<20%，极高风险）\n"
+            "选 over 必须同时满足：\n"
+            "1) 有基本面数据（交锋/近况/排名至少2项）\n"
+            "2) 实时进球节奏显著快于盘口预期（偏差>40%）\n"
+            "3) 盘口方向支持 over（升盘或大球水位下降>5%）\n"
+            "不满足以上任一条件 -> skip\n\n"
+            "### Under 方向（历史胜率75%，但需防范假信号）\n"
+            "选 under 必须满足以下至少2项：\n"
+            "1) 盘口方向支持 under（降盘或小球水位下降>5%）\n"
+            "2) 实时进球节奏慢于盘口预期（偏差>25%）\n"
+            "3) 基本面支持 under（交锋场均低/近况进球少/防守型球队）\n"
+            "仅满足1项或0项 -> skip\n"
+            "4) 注意：比赛后段（足球75'+/篮球第4节后段）进球概率上升，under 需更谨慎\n\n"
+            "### 通用规则\n"
+            "- 无基本面数据时，under 也需 conf>=0.40 且至少2项盘口+节奏信号\n"
+            "- 三类信号（初指/实时盘口/基本面）全矛盾 -> 必须 skip\n"
+            "- confidence 必须与信号强度匹配，不得虚高\n"
         )
 
         try:
@@ -1708,7 +1676,7 @@ class MatchAnalyzer:
                 except (TypeError, ValueError):
                     pass
 
-        # --- 2. 交锋胜率统计基线 ---
+        # --- 2. 交锋胜率统计基线 + 进球统计 ---
         if isinstance(h2h_block, dict):
             summary = h2h_block.get("summary") or {}
             played = summary.get("played") or 0
@@ -1721,27 +1689,85 @@ class MatchAnalyzer:
                     "home_win_rate": round(hw / played, 3),
                     "draw_rate": round(d / played, 3),
                     "away_win_rate": round(aw / played, 3),
+                    "avg_total_goals": summary.get("avg_total_goals", 0),
+                    "over_2_5_rate": summary.get("over_2_5_rate", 0),
                 }
 
-        # --- 3. 盘口水位变化信号 ---
+        # --- 2b. 近期状态进球统计 ---
+        if isinstance(historical_data, dict):
+            for side, key in (("home", "home_form"), ("away", "away_form")):
+                form = historical_data.get(key)
+                if isinstance(form, dict):
+                    fs = form.get("summary") or {}
+                    if fs:
+                        signals[f"{side}_form_stats"] = {
+                            "played": fs.get("played", 0),
+                            "win_rate": fs.get("win_rate", 0),
+                            "avg_total_goals": fs.get("avg_total_goals", 0),
+                            "over_2_5_rate": fs.get("over_2_5_rate", 0),
+                        }
+            # 综合两队近期进球预期
+            hf = (signals.get("home_form_stats") or {}).get("avg_total_goals", 0)
+            af = (signals.get("away_form_stats") or {}).get("avg_total_goals", 0)
+            if hf and af:
+                signals["form_combined_expected_goals"] = round((hf + af) / 2, 2)
+
+        # --- 3. 盘口变化信号（line_movements 是 dict，key=bet_type） ---
         if isinstance(market_odds, dict):
             line_moves = market_odds.get("line_movements")
-            if isinstance(line_moves, list) and len(line_moves) >= 2:
-                first = line_moves[0] if isinstance(line_moves[0], dict) else {}
-                last = line_moves[-1] if isinstance(line_moves[-1], dict) else {}
-                try:
-                    first_odds = float(first.get("odds") or first.get("price") or 0)
-                    last_odds = float(last.get("odds") or last.get("price") or 0)
-                    if first_odds > 0 and last_odds > 0:
-                        change_pct = round((last_odds - first_odds) / first_odds * 100, 1)
-                        signals["odds_movement"] = {
-                            "first_odds": first_odds,
-                            "latest_odds": last_odds,
-                            "change_pct": change_pct,
-                            "direction": "上升(不利-买方)" if change_pct > 0 else "下降(有利-买方)" if change_pct < 0 else "稳定",
-                        }
-                except (TypeError, ValueError):
-                    pass
+            # 方式1：从 line_movements dict 中取 total 的变化数据
+            total_move = None
+            if isinstance(line_moves, dict):
+                total_move = line_moves.get("total") or {}
+            elif isinstance(line_moves, list) and line_moves:
+                total_move = line_moves[-1] if isinstance(line_moves[-1], dict) else {}
+
+            if isinstance(total_move, dict) and total_move:
+                line_delta = total_move.get("line_delta")
+                odds_delta = total_move.get("odds_delta")
+                direction = str(total_move.get("direction") or "").lower()
+                change_count = total_move.get("change_count") or 0
+                opening = total_move.get("opening") or {}
+                open_line = opening.get("line") if isinstance(opening, dict) else None
+                open_odds = opening.get("odds") if isinstance(opening, dict) else None
+
+                mkt_signal: dict[str, Any] = {
+                    "change_count": change_count,
+                    "direction": direction,
+                    "line_delta": line_delta,
+                    "odds_delta": odds_delta,
+                    "opening_line": open_line,
+                    "opening_odds": open_odds,
+                }
+
+                # 市场方向判断
+                market_support = "neutral"
+                signal_strength = "weak"
+                if line_delta is not None:
+                    try:
+                        ld = float(line_delta)
+                        if ld <= -0.25:
+                            market_support = "under"
+                            signal_strength = "strong" if abs(ld) >= 0.5 else "medium"
+                        elif ld >= 0.25:
+                            market_support = "over"
+                            signal_strength = "strong" if abs(ld) >= 0.5 else "medium"
+                    except (TypeError, ValueError):
+                        pass
+
+                # 赔率变化增强信号
+                if odds_delta is not None:
+                    try:
+                        od = float(odds_delta)
+                        if market_support == "neutral" and abs(od) >= 0.08:
+                            market_support = "under" if od > 0 else "over"
+                            signal_strength = "medium"
+                    except (TypeError, ValueError):
+                        pass
+
+                mkt_signal["market_support"] = market_support
+                mkt_signal["signal_strength"] = signal_strength
+                signals["market_movement"] = mkt_signal
 
         # --- 4. 比赛阶段权重 ---
         period = str(match_info.get("period") or "").lower()
@@ -1786,42 +1812,49 @@ class MatchAnalyzer:
         """纯盘口模式：从赔率和比分中提取量化信号"""
         signals: dict[str, Any] = {}
 
-        # 1. 盘口变化幅度
+        # 1. 盘口变化幅度（line_movements 是 dict，key=bet_type）
         if isinstance(market_odds, dict):
             line_moves = market_odds.get("line_movements")
-            if isinstance(line_moves, list) and len(line_moves) >= 2:
-                first = line_moves[0] if isinstance(line_moves[0], dict) else {}
-                last = line_moves[-1] if isinstance(line_moves[-1], dict) else {}
-                try:
-                    first_line = float(first.get("line") or first.get("total") or 0)
-                    last_line = float(last.get("line") or last.get("total") or 0)
-                    if first_line > 0 and last_line > 0:
-                        line_change = round(last_line - first_line, 2)
-                        signals["line_change"] = {
-                            "initial": first_line,
-                            "current": last_line,
-                            "delta": line_change,
-                            "magnitude": abs(line_change),
-                            "direction": "line_up(市场看好大球)" if line_change > 0 else "line_down(市场看淡大球)" if line_change < 0 else "stable",
-                        }
-                except (TypeError, ValueError):
-                    pass
+            total_move = None
+            if isinstance(line_moves, dict):
+                total_move = line_moves.get("total") or {}
+            elif isinstance(line_moves, list) and line_moves:
+                total_move = line_moves[-1] if isinstance(line_moves[-1], dict) else {}
 
-            # 2. 赔率变化
-            if isinstance(line_moves, list) and len(line_moves) >= 2:
-                try:
-                    first_odds = float(first.get("odds") or first.get("price") or 0)
-                    last_odds = float(last.get("odds") or last.get("price") or 0)
-                    if first_odds > 0 and last_odds > 0:
-                        odds_change_pct = round((last_odds - first_odds) / first_odds * 100, 1)
-                        signals["odds_change"] = {
-                            "initial_odds": first_odds,
-                            "current_odds": last_odds,
-                            "change_pct": odds_change_pct,
-                            "signal": "大球赔率下降(市场看好大球)" if odds_change_pct < -8 else "大球赔率上升(市场看淡大球)" if odds_change_pct > 8 else "赔率变化不大(弱信号)",
+            if isinstance(total_move, dict) and total_move:
+                line_delta = total_move.get("line_delta")
+                odds_delta = total_move.get("odds_delta")
+                direction = str(total_move.get("direction") or "").lower()
+                opening = total_move.get("opening") or {}
+                open_line = opening.get("line") if isinstance(opening, dict) else None
+                open_odds = opening.get("odds") if isinstance(opening, dict) else None
+
+                if line_delta is not None:
+                    try:
+                        ld = float(line_delta)
+                        market_support = "under" if ld <= -0.25 else "over" if ld >= 0.25 else "neutral"
+                        signals["line_change"] = {
+                            "initial": open_line,
+                            "current": total_line,
+                            "delta": ld,
+                            "magnitude": abs(ld),
+                            "direction": "line_up(市场看好大球)" if ld > 0 else "line_down(市场看淡大球)" if ld < 0 else "stable",
+                            "market_support": market_support,
+                            "signal_strength": "strong" if abs(ld) >= 0.5 else "medium" if abs(ld) >= 0.25 else "weak",
                         }
-                except (TypeError, ValueError):
-                    pass
+                    except (TypeError, ValueError):
+                        pass
+
+                if odds_delta is not None:
+                    try:
+                        od = float(odds_delta)
+                        if abs(od) >= 0.05:
+                            signals["odds_change"] = {
+                                "odds_delta": od,
+                                "signal": "大球赔率下降(市场看好大球)" if od < -0.05 else "大球赔率上升(市场看淡大球)" if od > 0.05 else "赔率变化不大(弱信号)",
+                            }
+                    except (TypeError, ValueError):
+                        pass
 
         # 3. 实时比分节奏分析
         hs = match_info.get("home_score")

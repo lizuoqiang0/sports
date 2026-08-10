@@ -287,39 +287,26 @@ class StrategyEngine:
             mid, consensus_reached,
         )
 
-        # ── 闸门2：置信度检查 ──
+        # ── 闸门2：置信度检查（参考，实际由闸门2.7按方向分别判断）──
         if conf_f < min_conf:
             logger.info(
-                "[闸门2/置信度] ❌ 拒绝 match=%s | 实际=%.4f 低于阈值=%.4f | 差距=%.4f | "
-                "需≥%.0f%% 当前=%.1f%%",
-                mid, conf_f, min_conf, min_conf - conf_f,
-                min_conf * 100, conf_f * 100,
+                "[闸门2/置信度] 参考 match=%s | 实际=%.4f 低于通用阈值=%.4f | 将由闸门2.7按方向判断",
+                mid, conf_f, min_conf,
             )
-            return self._reject(match_info, analysis, f"置信度 {conf_f:.2f} 低于最低 {min_conf:.2f}")
-        logger.info(
-            "[闸门2/置信度] ✅ 通过 match=%s | 实际=%.4f ≥ 阈值=%.4f（%.1f%% ≥ %.0f%%）",
-            mid, conf_f, min_conf, conf_f * 100, min_conf * 100,
-        )
+        else:
+            logger.info(
+                "[闸门2/置信度] ✅ 通过 match=%s | 实际=%.4f ≥ 阈值=%.4f",
+                mid, conf_f, min_conf,
+            )
 
         # ── 闸门2.5：初指 + 实时盘口 + 基本面 三重门禁 ──
         signal_review = analysis.get("signal_review") if isinstance(analysis.get("signal_review"), dict) else {}
         triad_ready = bool(signal_review.get("triad_ready"))
         verdict = str(signal_review.get("verdict") or "").strip().lower()
         edge_score = _as_float(signal_review.get("edge_score"), 0.0)
-        if not triad_ready:
-            logger.info(
-                "[闸门2.5/三重门禁] ❌ 拒绝 match=%s | triad_ready=%s verdict=%s edge=%.2f | review=%s",
-                mid, triad_ready, verdict, edge_score, signal_review,
-            )
-            return self._reject(match_info, analysis, "初指/实时盘口/基本面未同时满足，禁止下单")
-        if verdict != "supportive" or edge_score < 6:
-            logger.info(
-                "[闸门2.5/三重门禁] ❌ 拒绝 match=%s | triad_ready=%s verdict=%s edge=%.2f | review=%s",
-                mid, triad_ready, verdict, edge_score, signal_review,
-            )
-            return self._reject(match_info, analysis, f"结构化复核未支持该方向 verdict={verdict} edge={edge_score:.1f}")
+        # 单模型模式：三重门禁仅作参考标注，不阻断 GPT 的 over/under 判断
         logger.info(
-            "[闸门2.5/三重门禁] ✅ 通过 match=%s | triad_ready=%s verdict=%s edge=%.2f",
+            "[闸门2.5/三重门禁] 参考（不阻断） match=%s | triad_ready=%s verdict=%s edge=%.2f",
             mid, triad_ready, verdict, edge_score,
         )
 
@@ -335,7 +322,7 @@ class StrategyEngine:
         conflict_points = _as_int(signal_review.get("conflict_points"), 0)
         market_points = _as_int(signal_review.get("market_points"), 0)
         fundamental_points = _as_int(signal_review.get("fundamental_points"), 0)
-        stricter_over_conf = max(min_conf, 0.74 if (total_line is None or total_line < 3.25) else 0.78)
+        # 单模型模式：足球大球保护降级为参考日志，不阻断 GPT 判断
         played_mins = None
         try:
             from app.services.bookmakers.match_live import parse_match_clock_minutes
@@ -348,92 +335,86 @@ class StrategyEngine:
             played_mins = None
 
         if sport_l == "football" and prediction == "over":
-            triad_status = signal_review.get("triad_status") if isinstance(signal_review.get("triad_status"), dict) else {}
-            opening_line = _as_float(triad_status.get("opening_line"), None)
-            current_line = _as_float(triad_status.get("current_line"), total_line)
-            line_jump = None
-            if opening_line is not None and current_line is not None:
-                line_jump = current_line - opening_line
-            over_odds_now = _as_float(odds_data.get("over"), 0.0) if isinstance(odds_data, dict) else 0.0
-            under_odds_now = _as_float(odds_data.get("under"), 0.0) if isinstance(odds_data, dict) else 0.0
-
-            if conf_f < stricter_over_conf:
-                logger.info(
-                    "[闸门2.6/足球大球保护] ❌ 拒绝 match=%s | conf=%.4f < stricter=%.4f | line=%s",
-                    mid, conf_f, stricter_over_conf, total_line,
-                )
-                return self._reject(match_info, analysis, f"足球大球需更高置信度（当前 {conf_f:.2f}，要求 {stricter_over_conf:.2f}）")
-            if conflict_points > 0 or edge_score < 8 or market_points < 4 or fundamental_points < 4:
-                logger.info(
-                    "[闸门2.6/足球大球保护] ❌ 拒绝 match=%s | edge=%.2f market=%d fundamental=%d conflict=%d",
-                    mid, edge_score, market_points, fundamental_points, conflict_points,
-                )
-                return self._reject(match_info, analysis, "足球大球证据不够强，保护性跳过")
-            if total_line is not None:
-                if total_line >= 4.0 and current_total < 3:
-                    logger.info(
-                        "[闸门2.6/足球大球保护] ❌ 拒绝 match=%s | 高线不追 line=%.2f current_total=%d",
-                        mid, total_line, current_total,
-                    )
-                    return self._reject(match_info, analysis, f"足球大球高线 {total_line:.2f} 但当前仅 {current_total} 球，不追高")
-                if total_line >= 3.0 and played_mins is not None and played_mins < 30 and current_total < 2:
-                    logger.info(
-                        "[闸门2.6/足球大球保护] ❌ 拒绝 match=%s | 前30分钟 line=%.2f total=%d",
-                        mid, total_line, current_total,
-                    )
-                    return self._reject(match_info, analysis, "足球大球前30分钟进球支撑不足，保护性跳过")
-                if total_line >= 3.25 and played_mins is not None and played_mins < 60 and current_total < 2:
-                    logger.info(
-                        "[闸门2.6/足球大球保护] ❌ 拒绝 match=%s | 早段高线不追 line=%.2f mins=%.2f total=%d",
-                        mid, total_line, played_mins, current_total,
-                    )
-                    return self._reject(match_info, analysis, "足球大球早段高线且进球支撑不足，保护性跳过")
-                if total_line >= 3.5 and played_mins is not None and played_mins < 45 and current_total < 3:
-                    logger.info(
-                        "[闸门2.6/足球大球保护] ❌ 拒绝 match=%s | 上半场3.5+需3球支撑 line=%.2f mins=%.2f total=%d",
-                        mid, total_line, played_mins, current_total,
-                    )
-                    return self._reject(match_info, analysis, "足球大球上半场 3.5 以上盘口但当前不足 3 球，保护性跳过")
-                if total_line >= 4.0 and played_mins is not None and played_mins < 45 and current_total < 3:
-                    logger.info(
-                        "[闸门2.6/足球大球保护] ❌ 拒绝 match=%s | 上半场超高线不追 line=%.2f mins=%.2f total=%d",
-                        mid, total_line, played_mins, current_total,
-                    )
-                    return self._reject(match_info, analysis, "足球大球上半场高线过高且比分支撑不足，保护性跳过")
-                if total_line >= 3.0 and played_mins is not None and played_mins >= 70 and current_total < 2:
-                    logger.info(
-                        "[闸门2.6/足球大球保护] ❌ 拒绝 match=%s | 后段追大风险高 line=%.2f mins=%.2f total=%d",
-                        mid, total_line, played_mins, current_total,
-                    )
-                    return self._reject(match_info, analysis, "足球大球后段追大风险过高，保护性跳过")
-            if (
-                line_jump is not None
-                and line_jump >= 1.0
-                and played_mins is not None
-                and played_mins < 35
-                and current_total <= 2
-            ):
-                logger.info(
-                    "[闸门2.6/足球大球保护] ❌ 拒绝 match=%s | 升盘追高 opening=%.2f current=%.2f jump=%.2f mins=%.2f total=%d",
-                    mid, opening_line, current_line, line_jump, played_mins, current_total,
-                )
-                return self._reject(match_info, analysis, "足球大球升盘过快且当前进球不足，保护性跳过")
-            if (
-                over_odds_now > 1.0
-                and under_odds_now > 1.0
-                and under_odds_now + 0.08 < over_odds_now
-                and total_line is not None
-                and total_line >= 3.0
-            ):
-                logger.info(
-                    "[闸门2.6/足球大球保护] ❌ 拒绝 match=%s | 即时赔率反向偏小 over=%.2f under=%.2f line=%.2f",
-                    mid, over_odds_now, under_odds_now, total_line,
-                )
-                return self._reject(match_info, analysis, "足球大球当前即时赔率明显更偏小球，保护性跳过")
             logger.info(
-                "[闸门2.6/足球大球保护] ✅ 通过 match=%s | opening=%s line=%s jump=%s mins=%s total=%d conf=%.4f edge=%.2f",
-                mid, opening_line, total_line, line_jump, played_mins, current_total, conf_f, edge_score,
+                "[闸门2.6/足球大球保护] 参考（不阻断） match=%s | conf=%.4f line=%s total=%d mins=%s",
+                mid, conf_f, total_line, current_total, played_mins,
             )
+
+        # ── 闸门2.7：双向风控（over 严格 + under 约束）──
+        ctx_source = str(analysis.get("context_source") or "none").strip().lower()
+        has_fundamentals = ctx_source not in ("", "none")
+
+        if prediction == "over":
+            # 无基本面数据时禁止 over（纯节奏外推不可靠）
+            if not has_fundamentals:
+                logger.info("[闸门2.7/over风控] ❌ 拒绝 match=%s | 无基本面数据(ctx_source=none)，over方向禁止", mid)
+                return self._reject(match_info, analysis, "无基本面数据支撑，over方向禁止下单")
+            # 足球高盘线 over 直接拒绝（历史 over 足球仅 1W7L，line≥3.0 全输）
+            if sport_l == "football" and total_line is not None and total_line >= 3.0:
+                logger.info("[闸门2.7/over风控] ❌ 拒绝 match=%s | 足球高线over line=%.2f>=3.0", mid, total_line)
+                return self._reject(match_info, analysis, f"足球高线over（line={total_line:.2f}）历史胜率极低，拒绝")
+            # 篮球高盘线 over 直接拒绝
+            if sport_l == "basketball" and total_line is not None and total_line >= 200:
+                logger.info("[闸门2.7/over风控] ❌ 拒绝 match=%s | 篮球高线over line=%.1f>=200", mid, total_line)
+                return self._reject(match_info, analysis, f"篮球高线over（line={total_line:.1f}）历史胜率极低，拒绝")
+            # over 需要更高置信度（至少 0.40）
+            over_min_conf = max(min_conf, 0.40)
+            if conf_f < over_min_conf:
+                logger.info("[闸门2.7/over风控] ❌ 拒绝 match=%s | over置信度=%.4f < 要求=%.4f", mid, conf_f, over_min_conf)
+                return self._reject(match_info, analysis, f"over方向需更高置信度（当前{conf_f:.2f}，要求{over_min_conf:.2f}）")
+
+        elif prediction == "under":
+            # under 置信度：有基本面 0.30，无基本面 0.40
+            under_min_conf = 0.30 if has_fundamentals else 0.40
+            if conf_f < under_min_conf:
+                logger.info("[闸门2.7/under风控] ❌ 拒绝 match=%s | under置信度=%.4f < 要求=%.4f (fundamentals=%s)",
+                            mid, conf_f, under_min_conf, has_fundamentals)
+                return self._reject(match_info, analysis, f"under置信度不足（当前{conf_f:.2f}，要求{under_min_conf:.2f}）")
+            # 足球超低盘线 under 风险高（1球即破盘）
+            if sport_l == "football" and total_line is not None and total_line <= 1.5:
+                logger.info("[闸门2.7/under风控] ❌ 拒绝 match=%s | 足球低线under line=%.2f<=1.5，1球即破盘", mid, total_line)
+                return self._reject(match_info, analysis, f"足球低线under（line={total_line:.2f}）1球即破盘，风险过高")
+            # 篮球高盘线 under 风险高（0W1L，加时/罚球易超）
+            if sport_l == "basketball" and total_line is not None and total_line >= 210:
+                logger.info("[闸门2.7/under风控] ❌ 拒绝 match=%s | 篮球高线under line=%.1f>=210，变数大", mid, total_line)
+                return self._reject(match_info, analysis, f"篮球高线under（line={total_line:.1f}）变数大，风险高")
+
+        # ── 闸门2.8：盘口变化方向过滤 ──
+        line_moves_raw = match_info.get("line_movements") or match_info.get("line_movement") or {}
+        total_move = None
+        if isinstance(line_moves_raw, dict):
+            # line_movements 是 dict（key=bet_type）
+            total_move = line_moves_raw.get("total") or line_moves_raw
+        elif isinstance(line_moves_raw, list) and line_moves_raw:
+            total_move = line_moves_raw[-1] if isinstance(line_moves_raw[-1], dict) else {}
+
+        mkt_support = "neutral"
+        mkt_strength = "none"
+        if isinstance(total_move, dict) and total_move:
+            line_delta = total_move.get("line_delta")
+            if line_delta is not None:
+                try:
+                    ld = float(line_delta)
+                    if ld <= -0.25:
+                        mkt_support = "under"
+                        mkt_strength = "strong" if abs(ld) >= 0.5 else "medium"
+                    elif ld >= 0.25:
+                        mkt_support = "over"
+                        mkt_strength = "strong" if abs(ld) >= 0.5 else "medium"
+                except (TypeError, ValueError):
+                    pass
+
+        if mkt_support != "neutral" and mkt_support != prediction:
+            # 市场方向与 GPT 预测相反
+            logger.info(
+                "[闸门2.8/盘口方向] ❌ 拒绝 match=%s | 市场支持%s 但GPT预测%s | line_delta=%s strength=%s",
+                mid, mkt_support, prediction, total_move.get("line_delta") if isinstance(total_move, dict) else "?", mkt_strength,
+            )
+            return self._reject(match_info, analysis, f"盘口变化方向({mkt_support})与预测({prediction})相反")
+        logger.info(
+            "[闸门2.8/盘口方向] ✅ 通过 match=%s | 市场支持=%s 预测=%s strength=%s",
+            mid, mkt_support, prediction, mkt_strength,
+        )
 
         # ── 闸门3：赔率区间检查 ──
         odds_raw_over = odds_data.get("over")

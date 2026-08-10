@@ -3,7 +3,6 @@
 
 直接抓取并缓存：
 - 分析页：积分排名、对赛往绩、近期战绩、联赛走势、伤停、战绩特征、数据对比
-- 直播页：首发阵容、进失球概率、半场/全场胜负统计
 - 走势页：各公司初指/赛前指数
 
 最终上下文落 Redis，供 AI 只读实时盘口 + 基本面。
@@ -23,6 +22,7 @@ import httpx
 from app.config import settings
 from app.services.bookmakers.match_resolve import _norm_team, _pair_similarity, _team_similarity
 from app.services.bookmakers.sport_classify import classify_sport, normalize_sport, reject_sport_mismatch
+from app.services.match_context_store import TRACKED_DIMENSIONS as _TRACKED_DIMENSIONS
 from app.services.sports_data import compute_quality
 
 logger = logging.getLogger(__name__)
@@ -44,15 +44,6 @@ _shared_client: Optional[httpx.AsyncClient] = None
 
 # 分析页 HTML 缓存 {(sport, schedule_id): html}，避免足球/篮球互串
 _html_cache: dict[tuple[str, int], str] = {}
-_TRACKED_DIMENSIONS = (
-    "h2h",
-    "home_form",
-    "away_form",
-    "standings",
-    "analysis",
-    "live",
-    "trend",
-)
 
 
 async def _get_client() -> httpx.AsyncClient:
@@ -60,7 +51,7 @@ async def _get_client() -> httpx.AsyncClient:
     global _shared_client
     if _shared_client is None or _shared_client.is_closed:
         _shared_client = httpx.AsyncClient(
-            timeout=15.0,
+            timeout=8.0,
             headers={"User-Agent": _UA, "Referer": f"{_BASE}/"},
             proxy=_PROXY,
         )
@@ -1197,23 +1188,6 @@ async def _fetch_qingbao_page(schedule_id: int, sport: str = "football") -> str:
     return ""
 
 
-async def _fetch_live_page(schedule_id: int, sport: str = "football") -> str:
-    """获取直播页 HTML。"""
-    try:
-        c = await _get_client()
-        live_path = "/AnalyLq/ShiJian/" if "basket" in (sport or "").lower() else "/Analy/ShiJian/"
-        for url in (
-            f"{_BASE}{live_path}{schedule_id}.htm",
-            f"{_BASE}/Analy/ShiJian/{schedule_id}.htm",
-        ):
-            resp = await c.get(url)
-            if resp.status_code == 200 and resp.text:
-                return resp.text
-    except Exception as e:
-        logger.warning("nowscore: live page fetch failed sid=%s err=%s", schedule_id, e)
-    return ""
-
-
 async def _fetch_trend_page(schedule_id: int, sport: str = "football") -> str:
     """走势页不存在独立 URL——赛前指数数据在分析页内。返回空，由调用方用分析页 HTML 解析。"""
     return ""
@@ -1330,7 +1304,7 @@ def _sync_context_dimensions(ctx: dict[str, Any]) -> dict[str, Any]:
         for x in (quality.get("fields_present") or [])
         if str(x).strip() in _TRACKED_DIMENSIONS
     ]
-    # analysis / live / trend 不在 compute_quality 的 fields_present 中，
+    # analysis / trend 不在 compute_quality 的 fields_present 中，
     # 需依据 ctx 中的实际内容判定是否呈现，避免新增维度被永久归入 missing
     analysis = ctx.get("analysis") if isinstance(ctx, dict) else None
     if isinstance(analysis, dict) and (
@@ -1341,15 +1315,6 @@ def _sync_context_dimensions(ctx: dict[str, Any]) -> dict[str, Any]:
     ):
         if "analysis" not in present:
             present.append("analysis")
-    live = ctx.get("live") if isinstance(ctx, dict) else None
-    if isinstance(live, dict) and (
-        (live.get("lineup") or {}).get("count")
-        or (live.get("probabilities") or {}).get("count")
-        or (live.get("half_full_stats") or {}).get("count")
-        or live.get("tables")
-    ):
-        if "live" not in present:
-            present.append("live")
     trend = ctx.get("trend") if isinstance(ctx, dict) else None
     if isinstance(trend, dict) and (trend.get("tables") or trend.get("initial_odds")):
         if "trend" not in present:
@@ -1515,6 +1480,21 @@ def _parse_h2h(html: str, home_team: str = "", away_team: str = "") -> dict[str,
                 draws += 1
             else:
                 away_wins += 1
+    # 进球统计
+    total_goals_list = []
+    over_2_5 = 0
+    for row in unique:
+        hg = row.get("home_goals")
+        ag = row.get("away_goals")
+        if hg is not None and ag is not None:
+            total = int(hg) + int(ag)
+            total_goals_list.append(total)
+            if total > 2:
+                over_2_5 += 1
+
+    avg_goals = round(sum(total_goals_list) / len(total_goals_list), 2) if total_goals_list else 0
+    over_rate = round(over_2_5 / len(total_goals_list), 3) if total_goals_list else 0
+
     return {
         "matches": unique[:10],
         "summary": {
@@ -1522,6 +1502,8 @@ def _parse_h2h(html: str, home_team: str = "", away_team: str = "") -> dict[str,
             "home_wins": home_wins,
             "draws": draws,
             "away_wins": away_wins,
+            "avg_total_goals": avg_goals,
+            "over_2_5_rate": over_rate,
         },
     }
 
@@ -1569,7 +1551,33 @@ def _parse_recent_form(
                 result = "胜" if away_goals > home_goals else ("平" if away_goals == home_goals else "负")
         parsed["result"] = result
         matches.append(parsed)
-    return {"matches": matches[:10]}
+
+    # 统计摘要
+    wins = sum(1 for m in matches if m.get("result") == "胜")
+    draws_f = sum(1 for m in matches if m.get("result") == "平")
+    losses = sum(1 for m in matches if m.get("result") == "负")
+    total_goals_list = []
+    for m in matches:
+        hg = m.get("home_goals")
+        ag = m.get("away_goals")
+        if hg is not None and ag is not None:
+            total_goals_list.append(int(hg) + int(ag))
+    avg_goals = round(sum(total_goals_list) / len(total_goals_list), 2) if total_goals_list else 0
+    over_2_5 = sum(1 for t in total_goals_list if t > 2)
+    over_rate = round(over_2_5 / len(total_goals_list), 3) if total_goals_list else 0
+
+    return {
+        "matches": matches[:10],
+        "summary": {
+            "played": len(matches),
+            "wins": wins,
+            "draws": draws_f,
+            "losses": losses,
+            "win_rate": round(wins / len(matches), 3) if matches else 0,
+            "avg_total_goals": avg_goals,
+            "over_2_5_rate": over_rate,
+        },
+    }
 
 
 def _parse_standings(
@@ -1857,11 +1865,15 @@ def _parse_named_rows(tables: list[list[list[str]]]) -> list[dict[str, Any]]:
 
 
 def _parse_odds_trend_tables(html: str) -> dict[str, Any]:
-    """解析赛前指数/各公司初指。数据在分析页的"赛前指数" section。"""
+    """解析赛前指数/各公司初指/盘路走势。"""
     tables = _tables_after_marker(html, "赛前指数", max_tables=1)
     if not tables:
-        # 回退：尝试旧方式
         tables = _tables_with_keywords(_parse_tables(html), ("初指", "初盘", "盘口"))
+    if not tables:
+        tables = _tables_with_keywords(_parse_tables(html), ("赔率", "亚盘", "大小", "欧赔", "盘路"))
+    if not tables:
+        # 盘路走势：分析页中的赢/走/输/大球统计
+        tables = _tables_after_marker(html, "盘路走势", max_tables=6)
     if not tables:
         return {"tables": [], "initial_odds": []}
     named = _parse_named_rows(tables)
@@ -1901,40 +1913,6 @@ def _parse_injuries_and_features(html: str) -> dict[str, Any]:
     }
 
 
-def _parse_live_data(html: str) -> dict[str, Any]:
-    """解析直播页：首发阵容、进失球概率、半场/全场胜负统计。"""
-    # 首发阵容：主队和客队各一个表
-    lineup_tables = _tables_after_marker(html, "首发阵容", max_tables=2)
-    if not lineup_tables:
-        lineup_tables = _tables_after_marker(html, "首发", max_tables=2)
-
-    # 进失球概率：可能有两个表（汇总 + 时间段分布）
-    prob_tables = _tables_after_marker(html, "进失球概率", max_tables=2)
-    if not prob_tables:
-        prob_tables = _tables_after_marker(html, "进球概率", max_tables=2)
-
-    # 半场/全场胜负统计
-    hf_tables = _tables_after_marker(html, "半场/全场胜负统计", max_tables=1)
-    if not hf_tables:
-        hf_tables = _tables_after_marker(html, "半全场", max_tables=1)
-
-    def _maybe_team_block(tbls: list[list[list[str]]]) -> dict[str, Any]:
-        named = _parse_named_rows(tbls)
-        return {
-            "home": named[0] if len(named) > 0 else None,
-            "away": named[1] if len(named) > 1 else None,
-            "tables": named,
-            "count": len(named),
-        }
-
-    return {
-        "lineup": _maybe_team_block(lineup_tables),
-        "probabilities": _maybe_team_block(prob_tables),
-        "half_full_stats": _maybe_team_block(hf_tables),
-        "tables": _parse_named_rows(lineup_tables + prob_tables + hf_tables),
-    }
-
-
 def _build_context_payload(
     *,
     schedule_id: int,
@@ -1944,7 +1922,6 @@ def _build_context_payload(
     title: str,
     analysis_html: str,
     qingbao_html: str,
-    live_html: str,
     trend_html: str,
     analysis_tables: Optional[list[list[list[str]]]] = None,
     qingbao_tables: Optional[list[list[list[str]]]] = None,
@@ -1953,7 +1930,6 @@ def _build_context_payload(
     away_form: Optional[dict[str, Any]] = None,
     standings: Optional[dict[str, Any]] = None,
     analysis_extra: Optional[dict[str, Any]] = None,
-    live_data: Optional[dict[str, Any]] = None,
     trend_data: Optional[dict[str, Any]] = None,
 ) -> Optional[dict[str, Any]]:
     analysis_tables = analysis_tables if analysis_tables is not None else _parse_tables(analysis_html)
@@ -1975,8 +1951,6 @@ def _build_context_payload(
         )
     if analysis_extra is None:
         analysis_extra = _parse_injuries_and_features(analysis_html)
-    if live_data is None:
-        live_data = _parse_live_data(live_html)
     if trend_data is None:
         trend_data = _parse_odds_trend_tables(trend_html or analysis_html)
 
@@ -2013,7 +1987,6 @@ def _build_context_payload(
             "features": analysis_extra.get("features") or [],
             "compare": analysis_extra.get("compare") or [],
         },
-        "live": live_data,
         "trend": trend_data,
         "h2h": h2h,
         "home_form": home_form,
@@ -2042,11 +2015,10 @@ async def fetch_match_context_via_nowscore(
         logger.warning("nowscore: scheduleId not found for %s vs %s", home_team, away_team)
         return None
 
-    # 2. 并发获取分析页 + 情报页 + 直播页 + 走势页
-    analysis_html, qingbao_html, live_html, trend_html = await asyncio.gather(
+    # 2. 并发获取分析页 + 情报页 + 走势页
+    analysis_html, qingbao_html, trend_html = await asyncio.gather(
         _fetch_analysis_page(schedule_id, sport),
         _fetch_qingbao_page(schedule_id, sport),
-        _fetch_live_page(schedule_id, sport),
         _fetch_trend_page(schedule_id, sport),
     )
 
@@ -2087,8 +2059,10 @@ async def fetch_match_context_via_nowscore(
 
     # 解析额外维度
     analysis_extra = _parse_injuries_and_features(analysis_html)
-    live_data = _parse_live_data(live_html)
-    trend_data = _parse_odds_trend_tables(trend_html or analysis_html)
+    # trend: 依次尝试 trend_html -> analysis_html -> qingbao_html
+    trend_data = _parse_odds_trend_tables(trend_html or analysis_html or qingbao_html)
+    if not (trend_data.get("tables") or trend_data.get("initial_odds")):
+        logger.debug("nowscore: trend_data empty after parse sid=%s", schedule_id)
 
     # 4. 构建返回
     analysis_all_tables = []
@@ -2103,7 +2077,6 @@ async def fetch_match_context_via_nowscore(
         title=title,
         analysis_html=analysis_html,
         qingbao_html=qingbao_html,
-        live_html=live_html,
         trend_html=trend_html,
         analysis_tables=analysis_tables,
         qingbao_tables=qingbao_tables,
@@ -2112,7 +2085,6 @@ async def fetch_match_context_via_nowscore(
         away_form=away_form,
         standings=standings,
         analysis_extra=analysis_extra,
-        live_data=live_data,
         trend_data=trend_data,
     )
     if not ctx:
@@ -2123,7 +2095,6 @@ async def fetch_match_context_via_nowscore(
         ctx["analysis"]["injuries"] = analysis_extra.get("injuries") or []
         ctx["analysis"]["features"] = analysis_extra.get("features") or []
         ctx["analysis"]["compare"] = analysis_extra.get("compare") or []
-    ctx["live"] = live_data
     ctx["trend"] = trend_data
     ctx["h2h"] = h2h
     ctx["home_form"] = home_form
@@ -2163,9 +2134,8 @@ async def _parse_one_schedule(
     analysis_html = _html_cache.get(_html_cache_key(schedule_id, sport), "")
     if not analysis_html:
         analysis_html = await _fetch_analysis_page(schedule_id, sport)
-    qingbao_html, live_html, trend_html = await asyncio.gather(
+    qingbao_html, trend_html = await asyncio.gather(
         _fetch_qingbao_page(schedule_id, sport),
-        _fetch_live_page(schedule_id, sport),
         _fetch_trend_page(schedule_id, sport),
     )
 
@@ -2221,8 +2191,10 @@ async def _parse_one_schedule(
 
     # 解析额外维度
     analysis_extra = _parse_injuries_and_features(analysis_html)
-    live_data = _parse_live_data(live_html)
-    trend_data = _parse_odds_trend_tables(trend_html or analysis_html)
+    # trend: 依次尝试 trend_html -> analysis_html -> qingbao_html
+    trend_data = _parse_odds_trend_tables(trend_html or analysis_html or qingbao_html)
+    if not (trend_data.get("tables") or trend_data.get("initial_odds")):
+        logger.debug("nowscore prefetch: trend_data empty sid=%s", schedule_id)
 
     analysis_all_tables = []
     for key in ("injuries", "features", "compare"):
@@ -2236,7 +2208,6 @@ async def _parse_one_schedule(
         title=title,
         analysis_html=analysis_html,
         qingbao_html=qingbao_html,
-        live_html=live_html,
         trend_html=trend_html,
         analysis_tables=analysis_tables,
         qingbao_tables=qingbao_tables,
@@ -2245,7 +2216,6 @@ async def _parse_one_schedule(
         away_form=away_form,
         standings=standings,
         analysis_extra=analysis_extra,
-        live_data=live_data,
         trend_data=trend_data,
     )
     if not ctx:
@@ -2256,7 +2226,6 @@ async def _parse_one_schedule(
         ctx["analysis"]["injuries"] = analysis_extra.get("injuries") or []
         ctx["analysis"]["features"] = analysis_extra.get("features") or []
         ctx["analysis"]["compare"] = analysis_extra.get("compare") or []
-    ctx["live"] = live_data
     ctx["trend"] = trend_data
     ctx["h2h"] = h2h
     ctx["home_form"] = home_form

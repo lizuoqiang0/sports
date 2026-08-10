@@ -173,8 +173,8 @@ services:
       DOUBAO_BASE_URL: ${DOUBAO_BASE_URL:-https://ark.cn-beijing.volces.com/api/plan/v3}
       DOUBAO_MODEL: ${DOUBAO_MODEL:-doubao-seed-2.0-lite}
       GPT_API_KEY: ${GPT_API_KEY:-}
-      GPT_BASE_URL: ${GPT_BASE_URL:-https://www.juaiapi.com/v1}
-      GPT_MODEL: ${GPT_MODEL:-gpt-5.4}
+      GPT_BASE_URL: ${GPT_BASE_URL:-https://xfastapi.ai/v1}
+      GPT_MODEL: ${GPT_MODEL:-gpt-5.6-terra}
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
       DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://ark.cn-beijing.volces.com/api/plan/v3}
       DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-v4-pro}
@@ -299,8 +299,8 @@ services:
       DOUBAO_BASE_URL: ${DOUBAO_BASE_URL:-https://ark.cn-beijing.volces.com/api/plan/v3}
       DOUBAO_MODEL: ${DOUBAO_MODEL:-doubao-seed-2.0-lite}
       GPT_API_KEY: ${GPT_API_KEY:-}
-      GPT_BASE_URL: ${GPT_BASE_URL:-https://www.juaiapi.com/v1}
-      GPT_MODEL: ${GPT_MODEL:-gpt-5.4}
+      GPT_BASE_URL: ${GPT_BASE_URL:-https://xfastapi.ai/v1}
+      GPT_MODEL: ${GPT_MODEL:-gpt-5.6-terra}
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
       DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://ark.cn-beijing.volces.com/api/plan/v3}
       DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-v4-pro}

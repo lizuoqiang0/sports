@@ -17,7 +17,6 @@ def compute_quality(ctx: dict) -> dict:
         "away_form": 0.20,
         "standings": 0.30,
         "analysis": 0.12,
-        "live": 0.12,
         "trend": 0.08,
     }
     score = 0.0
@@ -39,7 +38,6 @@ def compute_quality(ctx: dict) -> dict:
         fields.append("standings")
         score += weights["standings"]
     analysis = ctx.get("analysis") if isinstance(ctx.get("analysis"), dict) else {}
-    live = ctx.get("live") if isinstance(ctx.get("live"), dict) else {}
     trend = ctx.get("trend") if isinstance(ctx.get("trend"), dict) else {}
 
     if analysis and any(
@@ -48,12 +46,6 @@ def compute_quality(ctx: dict) -> dict:
     ):
         fields.append("analysis")
         score += weights["analysis"]
-    if live and any(
-        bool((live.get(k) or {}).get("count")) or bool((live.get(k) or {}).get("tables"))
-        for k in ("lineup", "probabilities", "half_full_stats")
-    ):
-        fields.append("live")
-        score += weights["live"]
     if trend and (trend.get("tables") or trend.get("initial_odds")):
         fields.append("trend")
         score += weights["trend"]

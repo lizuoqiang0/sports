@@ -21,18 +21,16 @@ _EMPTY = {
     "h2h": {"matches": [], "summary": {}, "note": "暂无交锋数据"},
     "home_form": {"matches": [], "summary": {}, "note": "暂无近况数据"},
     "away_form": {"matches": [], "summary": {}, "note": "暂无近况数据"},
-    "lineup": {"home": [], "away": [], "formations": {}, "note": ""},
     "standings": {"home": None, "away": None, "note": ""},
-    "weather": {"condition": "", "temp_c": None, "humidity": None, "wind": None, "pitch": "", "venue": ""},
     "venue": "",
     "dimensions_present": [],
     "dimensions_missing": [
         "h2h",
         "home_form",
         "away_form",
-        "lineup",
-        "weather",
         "standings",
+        "analysis",
+        "trend",
     ],
     "source": "none",
     "fetched_at": None,
@@ -82,36 +80,20 @@ def _ctx_has_stats(ctx: dict) -> bool:
     h2n = len((ctx.get("h2h") or {}).get("matches") or [])
     hf = len((ctx.get("home_form") or {}).get("matches") or [])
     af = len((ctx.get("away_form") or {}).get("matches") or [])
-    lineup = ctx.get("lineup") or {}
     standings = ctx.get("standings") or {}
-    weather = ctx.get("weather") or {}
     analysis = ctx.get("analysis") or {}
-    live = ctx.get("live") or {}
     trend = ctx.get("trend") or {}
     return bool(
         h2n
         or hf
         or af
-        or lineup.get("home")
-        or lineup.get("away")
         or standings.get("home")
         or standings.get("away")
         or (
             isinstance(analysis, dict)
             and any(analysis.get(k) for k in ("injuries", "features", "compare", "analysis_tables"))
         )
-        or (
-            isinstance(live, dict)
-            and any(
-                (live.get(k) or {}).get("count") or (live.get(k) or {}).get("tables")
-                for k in ("lineup", "probabilities", "half_full_stats")
-            )
-        )
         or (isinstance(trend, dict) and (trend.get("tables") or trend.get("initial_odds")))
-        or (
-            isinstance(weather, dict)
-            and any(weather.get(k) not in (None, "") for k in ("condition", "temp_c", "pitch", "venue"))
-        )
     )
 
 
