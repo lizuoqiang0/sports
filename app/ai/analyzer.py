@@ -1458,9 +1458,9 @@ class MatchAnalyzer:
             if total_line:
                 goals_needed_over = max(0, total_line - current_goals + 0.5)
                 goals_needed_under = max(0, current_goals - total_line + 0.5)
-                score_analysis = f"""当前总进球 {current_goals}，盘口线 {total_line}。
-- 大球需要再进 {goals_needed_over} 球才能赢
-- 小球最多还能再进 {goals_needed_under} 球（含当前已进{current_goals}球）
+                score_analysis = f"""当前总得分 {current_goals}，盘口线 {total_line}。
+- 大分需要再得 {goals_needed_over} 分才能赢
+- 小分最多还能再得 {goals_needed_under} 分（含当前已得{current_goals}分）
 
 """
             clock_str = str(match_info.get("clock") or "")
@@ -1469,7 +1469,8 @@ class MatchAnalyzer:
                 elapsed = int(mins_match.group(1))
                 if elapsed > 0 and current_goals > 0:
                     pace = round(current_goals / elapsed, 3)
-                    score_analysis += f"进球节奏: {current_goals}球/{elapsed}分钟 = {pace}球/分钟。若维持此节奏，全场预计 {round(pace * 90, 1)} 球。\n"
+                    full_mins = 40 if sport == "basketball" else 90
+                    score_analysis += f"得分节奏: {current_goals}分/{elapsed}分钟 = {pace}分/分钟。若维持此节奏，全场预计 {round(pace * full_mins, 1)} 分。\n"
 
         # 确定分析模式
         if dim_available >= 6:
@@ -1562,26 +1563,51 @@ class MatchAnalyzer:
 
 注意：prediction只能是over/under/skip；skip时confidence=0.0；reasoning必须包含具体数字；只输出JSON。
 """
-        prompt += (
-            "\n## 双向严格分析规则\n"
-            "### Over 方向（历史胜率<20%，极高风险）\n"
-            "选 over 必须同时满足：\n"
-            "1) 有基本面数据（交锋/近况/排名至少2项）\n"
-            "2) 实时进球节奏显著快于盘口预期（偏差>40%）\n"
-            "3) 盘口方向支持 over（升盘或大球水位下降>5%）\n"
-            "不满足以上任一条件 -> skip\n\n"
-            "### Under 方向（历史胜率75%，但需防范假信号）\n"
-            "选 under 必须满足以下至少2项：\n"
-            "1) 盘口方向支持 under（降盘或小球水位下降>5%）\n"
-            "2) 实时进球节奏慢于盘口预期（偏差>25%）\n"
-            "3) 基本面支持 under（交锋场均低/近况进球少/防守型球队）\n"
-            "仅满足1项或0项 -> skip\n"
-            "4) 注意：比赛后段（足球75'+/篮球第4节后段）进球概率上升，under 需更谨慎\n\n"
-            "### 通用规则\n"
-            "- 无基本面数据时，under 也需 conf>=0.40 且至少2项盘口+节奏信号\n"
-            "- 三类信号（初指/实时盘口/基本面）全矛盾 -> 必须 skip\n"
-            "- confidence 必须与信号强度匹配，不得虚高\n"
-        )
+        # 双向严格分析规则（按运动类型分离）
+        if sport == "basketball":
+            prompt += (
+                "\n## 双向严格分析规则 - 篮球\n"
+                "### Over 方向（大分，高风险）\n"
+                "选 over 必须同时满足：\n"
+                "1) 有基本面数据（交锋/近况/排名至少2项）\n"
+                "2) 实时得分节奏显著快于盘口预期（偏差>40%）\n"
+                "3) 盘口方向支持 over（升盘或大分水位下降>5%）\n"
+                "4) 交锋场均或近况场均>190分\n"
+                "不满足以上任一条件 -> skip\n\n"
+                "### Under 方向（小分）\n"
+                "选 under 必须满足以下至少2项：\n"
+                "1) 盘口方向支持 under（降盘或小分水位下降>5%）\n"
+                "2) 实时得分节奏慢于盘口预期（偏差>25%）\n"
+                "3) 基本面支持 under（交锋场均<160/近况得分低/防守型球队）\n"
+                "4) 盘路走势大球率<40%\n"
+                "仅满足1项或0项 -> skip\n"
+                "5) 注意：Q4后段犯规战术+罚球易刷分，under 需更谨慎\n\n"
+                "### 通用规则\n"
+                "- 无基本面数据时，over 必须 skip，under 需 conf>=0.40 且双信号一致\n"
+                "- 三类信号全矛盾 -> 必须 skip\n"
+                "- confidence 必须与信号强度匹配，不得虚高\n"
+            )
+        else:
+            prompt += (
+                "\n## 双向严格分析规则 - 足球\n"
+                "### Over 方向（大球，历史胜率<20%，极高风险）\n"
+                "选 over 必须同时满足：\n"
+                "1) 有基本面数据（交锋/近况/排名至少2项）\n"
+                "2) 实时进球节奏显著快于盘口预期（偏差>40%）\n"
+                "3) 盘口方向支持 over（升盘或大球水位下降>5%）\n"
+                "不满足以上任一条件 -> skip\n\n"
+                "### Under 方向（小球，历史胜率75%）\n"
+                "选 under 必须满足以下至少2项：\n"
+                "1) 盘口方向支持 under（降盘或小球水位下降>5%）\n"
+                "2) 实时进球节奏慢于盘口预期（偏差>25%）\n"
+                "3) 基本面支持 under（交锋场均<1.5球/近况进球少/防守型球队）\n"
+                "仅满足1项或0项 -> skip\n"
+                "4) 注意：75分钟后进球概率上升，under 需更谨慎\n\n"
+                "### 通用规则\n"
+                "- 无基本面数据时，over 必须 skip，under 需 conf>=0.40 且双信号一致\n"
+                "- 三类信号（初指/实时盘口/基本面）全矛盾 -> 必须 skip\n"
+                "- confidence 必须与信号强度匹配，不得虚高\n"
+            )
 
         try:
             from app.services.sports_data import confidence_cap_for_quality, compute_quality
@@ -1667,6 +1693,22 @@ class MatchAnalyzer:
         5. 比赛阶段权重
         """
         signals: dict[str, Any] = {}
+        sport = str(match_info.get("sport") or "football").lower()
+        is_basketball = sport == "basketball"
+
+        # 阈值按运动类型分离
+        if is_basketball:
+            OVER_THRESHOLD = 190.0
+            UNDER_THRESHOLD = 160.0
+            HIGH_OVER_RATE = 0.60
+            LOW_OVER_RATE = 0.40
+            UNIT = "分"
+        else:
+            OVER_THRESHOLD = 3.0
+            UNDER_THRESHOLD = 1.5
+            HIGH_OVER_RATE = 0.60
+            LOW_OVER_RATE = 0.40
+            UNIT = "球"
 
         # --- 1. 积分榜期望进球差 ---
         if isinstance(historical_data, dict):
@@ -1789,28 +1831,33 @@ class MatchAnalyzer:
         period = str(match_info.get("period") or "").lower()
         clock = str(match_info.get("clock") or "")
         if period or clock:
-            # 足球阶段权重：0-15' 开局(低进球), 15-45' 中段, 45-60' 下半场开局, 60-75' 高发期, 75+' 冲刺期
-            # 篮球阶段权重：Q1 低, Q2 中, Q3 中, Q4 高
             stage_weight = "unknown"
-            if period in ("1h", "first_half", "ht"):
-                stage_weight = "上半场(进球率较低)"
-            elif period in ("2h", "second_half", "ft"):
-                stage_weight = "下半场(进球率高发)"
-            elif "q1" in period:
-                stage_weight = "Q1(节奏偏慢)"
-            elif "q4" in period:
-                stage_weight = "Q4(得分爆发期)"
-            # 尝试从 clock 提取分钟数
-            try:
-                mins = re.search(r"(\d+)", clock)
-                if mins:
-                    m = int(mins.group(1))
-                    if m >= 60 and m <= 75:
-                        stage_weight = "60-75分钟(足球进球高发期)"
-                    elif m >= 75:
-                        stage_weight = "75分钟+(冲刺期,大小球突变)"
-            except Exception:
-                pass
+            if is_basketball:
+                # 篮球：Q1 节奏偏慢, Q2-Q3 中段, Q4 得分爆发期
+                if "q1" in period or "1q" in period:
+                    stage_weight = "Q1(节奏偏慢,得分率低)"
+                elif "q2" in period or "2q" in period:
+                    stage_weight = "Q2(进入状态,得分稳定)"
+                elif "q3" in period or "3q" in period:
+                    stage_weight = "Q3(中段,战术调整期)"
+                elif "q4" in period or "4q" in period:
+                    stage_weight = "Q4(得分爆发期,犯规多)"
+            else:
+                # 足球：0-15' 开局, 15-45' 中段, 60-75' 高发期, 75+' 冲刺
+                if period in ("1h", "first_half", "ht"):
+                    stage_weight = "上半场(进球率较低)"
+                elif period in ("2h", "second_half", "ft"):
+                    stage_weight = "下半场(进球率高发)"
+                try:
+                    mins = re.search(r"(\d+)", clock)
+                    if mins:
+                        m = int(mins.group(1))
+                        if m >= 60 and m <= 75:
+                            stage_weight = "60-75分钟(足球进球高发期)"
+                        elif m >= 75:
+                            stage_weight = "75分钟+(冲刺期,大小球突变)"
+                except Exception:
+                    pass
             signals["match_stage"] = {
                 "period": period,
                 "clock": clock,
