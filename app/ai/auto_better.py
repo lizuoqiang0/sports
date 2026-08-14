@@ -1778,13 +1778,21 @@ async def analyze_and_recommend(
 
         from app.ai.strategy_gates import check_daily_risk
 
-        sug_stake = Decimal(str(strat_cfg.max_bet_amount or 1))
-        if stake is not None and Decimal(str(stake)) > 0:
-            sug_stake = Decimal(str(stake))
+        # 仓位：用户显式指定金额 > 策略动态仓位；封顶单笔上限；拒绝单归零
+        user_stake = Decimal(str(stake)) if stake is not None and Decimal(str(stake)) > 0 else None
+        if user_stake is not None:
+            sug_stake = user_stake
+        else:
+            sug_stake = Decimal(str(decision.suggested_stake or 0))
         if decision.should_bet:
+            if sug_stake <= 0:
+                sug_stake = Decimal(str(strat_cfg.max_bet_amount or 1))
+            sug_stake = min(sug_stake, Decimal(str(strat_cfg.max_bet_amount or 1)))
             if sug_stake < Decimal("1"):
                 sug_stake = Decimal("1")
             decision = decision.model_copy(update={"suggested_stake": sug_stake})
+        else:
+            sug_stake = Decimal("0")
         if decision.should_bet:
             risk_hit, risk_why = await check_daily_risk(db, user_id, strat_cfg)
             if risk_hit:

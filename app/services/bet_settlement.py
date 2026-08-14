@@ -25,9 +25,6 @@ logger = logging.getLogger(__name__)
 _SETTLED_CACHE_KEY = "bets:stats:recent"
 _SETTLED_CACHE_TTL = 300  # 5 分钟
 
-# 比赛完场后多久强制结算（数据源偶发不更新终场比分时的兜底）
-_FINALIZE_GRACE_HOURS = 6
-
 
 def _decide_total_outcome(*, selection: str, line: Optional[float], total: float) -> str:
     """判定大小球单输赢：won / lost / push。"""

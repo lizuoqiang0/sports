@@ -6,7 +6,7 @@ AI 投注策略引擎
 from __future__ import annotations
 
 import logging
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Optional
 
 from pydantic import BaseModel
@@ -34,6 +34,39 @@ class StrategyConfig(BaseModel):
 
 DEFAULT_STRATEGY = StrategyConfig(name="simple")
 AI_MIN_STAKE = 1.0
+
+# ── 运动类型风控参数（单一配置源：闸门2.7 双向风控 + 闸门2.9 under余量）──
+SPORT_RISK: dict[str, dict] = {
+    "basketball": {
+        "over_no_fundamentals": True,      # 无基本面禁止 over
+        "over_max_line": 200.0,            # over 最大盘线
+        "over_min_conf": 0.40,             # over 最低置信度
+        "under_min_conf": 0.30,            # under 最低置信度（有基本面）
+        "under_min_conf_no_fund": 0.40,    # under 最低置信度（无基本面）
+        "under_max_line": 210.0,           # under 最大盘线（加时/罚球变数大）
+        # 闸门2.9 under 余量（全场48分钟按盘口线等比折算剩余期望）
+        "margin_min_mins": 20.0,           # 最早生效时间
+        "margin_full_mins": 48.0,
+        "margin_avg_goals": None,          # None=按盘口线折算
+        "margin_factor": 1.25,
+    },
+    "football": {
+        "over_no_fundamentals": True,
+        "over_max_line": 3.0,
+        "over_min_conf": 0.40,
+        "under_min_conf": 0.30,
+        "under_min_conf_no_fund": 0.40,
+        "under_max_line": None,            # 足球 under 无高线限制
+        "under_min_line": 1.5,             # 足球低线 under 1球破盘
+        # 闸门2.9 under 余量（全场90分钟按联赛均值2.75球折算剩余期望）
+        "margin_min_mins": 40.0,
+        "margin_full_mins": 90.0,
+        "margin_avg_goals": 2.75,
+        "margin_factor": 1.3,
+    },
+}
+# 兜底：未知运动按足球参数处理
+SPORT_RISK["default"] = SPORT_RISK["football"]
 
 
 def effective_strategy_from_ai_config(ai_config) -> StrategyConfig:
@@ -340,30 +373,10 @@ class StrategyEngine:
                 mid, conf_f, total_line, current_total, played_mins,
             )
 
-        # ── 闸门2.7：双向风控（按运动类型分离参数）──
+        # ── 闸门2.7：双向风控（参数见模块级 SPORT_RISK）──
         ctx_source = str(analysis.get("context_source") or "none").strip().lower()
         has_fundamentals = ctx_source not in ("", "none")
-
-        # 运动类型风控参数
-        if sport_l == "basketball":
-            RISK = {
-                "over_no_fundamentals": True,      # 无基本面禁止 over
-                "over_max_line": 200.0,             # over 最大盘线
-                "over_min_conf": 0.40,              # over 最低置信度
-                "under_min_conf": 0.30,             # under 最低置信度（有基本面）
-                "under_min_conf_no_fund": 0.40,     # under 最低置信度（无基本面）
-                "under_max_line": 210.0,            # under 最大盘线（加时/罚球变数大）
-            }
-        else:  # football
-            RISK = {
-                "over_no_fundamentals": True,
-                "over_max_line": 3.0,
-                "over_min_conf": 0.40,
-                "under_min_conf": 0.30,
-                "under_min_conf_no_fund": 0.40,
-                "under_max_line": None,             # 足球 under 无高线限制
-                "under_min_line": 1.5,              # 足球低线 under 1球破盘
-            }
+        RISK = SPORT_RISK.get(sport_l, SPORT_RISK["default"])
 
         if prediction == "over":
             if RISK["over_no_fundamentals"] and not has_fundamentals:
@@ -428,35 +441,22 @@ class StrategyEngine:
             mid, mkt_support, prediction, mkt_strength,
         )
 
-        # ── 闸门2.9：under 余量检查（实盘教训：bet58 下半场48' 1球押 under2.5，终场3球破线）──
+        # ── 闸门2.9：under 余量检查（参数见 SPORT_RISK；实盘教训：bet58 下48' 1球押 under2.5，终场3球破线）──
         if prediction == "under" and total_line is not None and played_mins is not None:
             margin = total_line - current_total
-            if sport_l == "basketball":
-                # 篮球：全场48分钟，按盘口线等比折算剩余期望得分
-                if played_mins >= 20 and played_mins < 48:
-                    expected_remaining = (48.0 - played_mins) / 48.0 * total_line
-                    if margin < expected_remaining * 1.25:
-                        logger.info(
-                            "[闸门2.9/under余量] ❌ 拒绝 match=%s | 篮球%d' 余量%.1f < 剩余期望%.1f×1.25",
-                            mid, played_mins, margin, expected_remaining,
-                        )
-                        return self._reject(
-                            match_info, analysis,
-                            f"篮球under余量不足（{played_mins:.0f}'剩{margin:.1f}分，期望还需{expected_remaining:.1f}分）",
-                        )
-            else:
-                # 足球：全场90分钟，联赛平均约2.75球等比折算剩余期望
-                if played_mins >= 40 and played_mins < 90:
-                    expected_remaining = (90.0 - played_mins) / 90.0 * 2.75
-                    if margin < expected_remaining * 1.3:
-                        logger.info(
-                            "[闸门2.9/under余量] ❌ 拒绝 match=%s | 足球%d' 余量%.2f < 剩余期望%.2f×1.3",
-                            mid, played_mins, margin, expected_remaining,
-                        )
-                        return self._reject(
-                            match_info, analysis,
-                            f"足球under余量不足（{played_mins:.0f}'剩{margin:.2f}球，期望还需{expected_remaining:.2f}球）",
-                        )
+            m_cfg = RISK
+            if m_cfg["margin_min_mins"] <= played_mins < m_cfg["margin_full_mins"]:
+                base = m_cfg["margin_avg_goals"] if m_cfg["margin_avg_goals"] else total_line
+                expected_remaining = (m_cfg["margin_full_mins"] - played_mins) / m_cfg["margin_full_mins"] * base
+                if margin < expected_remaining * m_cfg["margin_factor"]:
+                    logger.info(
+                        "[闸门2.9/under余量] ❌ 拒绝 match=%s | %s %.0f' 余量%.2f < 剩余期望%.2f×%.2f",
+                        mid, sport_l, played_mins, margin, expected_remaining, m_cfg["margin_factor"],
+                    )
+                    return self._reject(
+                        match_info, analysis,
+                        f"{sport_l} under余量不足（{played_mins:.0f}'剩{margin:.2f}，期望还需{expected_remaining:.2f}）",
+                    )
         if prediction == "under":
             logger.info(
                 "[闸门2.9/under余量] ✅ 通过 match=%s | %s line=%s total=%d mins=%s margin=%s",
@@ -542,16 +542,31 @@ class StrategyEngine:
             mid, odds, min_odds_cfg, max_odds_cfg, odds_source,
         )
 
-        # 投注金额：固定按策略单笔上限出手，不再做动态调仓
+        # 投注金额：动态仓位 = 单笔上限 × 置信度缩放 × 风险折扣
+        # - 置信度缩放：达标线 50% → conf≥0.70 满仓（线性）
+        # - 风险折扣：risk_score 0→不打折，1→七折（低置信/高赔率/多持仓自动降仓）
         max_amt = Decimal(str(self.config.max_bet_amount or 1))
-        suggested_stake = max(max_amt, Decimal("1.00")).quantize(Decimal("0.01"))
-
+        min_stake = Decimal(str(AI_MIN_STAKE))
         risk_score = self._calc_risk_score(confidence, odds, active_bets_count)
 
+        conf_lo = max(min_conf, 0.40)
+        if conf_f <= conf_lo:
+            conf_scale = 0.5
+        elif conf_f >= 0.70:
+            conf_scale = 1.0
+        else:
+            conf_scale = 0.5 + 0.5 * (conf_f - conf_lo) / (0.70 - conf_lo)
+        risk_factor = 1.0 - min(max(risk_score, 0.0), 1.0) * 0.30
+        suggested_stake = (
+            max_amt * Decimal(str(round(conf_scale * risk_factor, 3)))
+        ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        suggested_stake = max(min(suggested_stake, max_amt), min_stake)
+
         logger.info(
-            "[策略评估] ✅ match=%s 通过 | sel=%s conf=%.2f odds=%.2f | 下注=%.2f risk=%.2f max_bet=%.2f",
+            "[策略评估] ✅ match=%s 通过 | sel=%s conf=%.2f odds=%.2f | 下注=%.2f（conf_scale=%.2f risk=%.2f→×%.2f）max_bet=%.2f",
             mid, prediction, float(confidence or 0), odds,
-            float(suggested_stake), risk_score, float(self.config.max_bet_amount or 0),
+            float(suggested_stake), conf_scale, risk_score, risk_factor,
+            float(self.config.max_bet_amount or 0),
         )
 
         return BetDecision(
