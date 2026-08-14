@@ -22,7 +22,6 @@ from app.core.cache import cache
 logger = logging.getLogger(__name__)
 
 VALID_PREDICTIONS = {"over", "under", "skip"}
-VALID_BET_TYPES = {"total"}
 
 _PRED_ALIASES = {
     "over": "over",
@@ -72,10 +71,6 @@ def normalize_prediction(raw, *, bet_type: str = "") -> str:
     if pred not in VALID_PREDICTIONS:
         return ""
     return pred
-
-
-def _infer_bet_type(prediction: str, declared: str = "") -> str:
-    return "total"
 
 
 def _flatten_market_odds(market_odds: Optional[dict]) -> dict[str, float]:
@@ -222,12 +217,17 @@ class MatchAnalyzer:
                 start_time=st,
             )
         sport = str(match_info.get("sport") or "football").lower()
-        line_tag = (
+        # 盘口线量化到 0.5 档进缓存 key：滚球 2.5→2.75 的小幅漂移不换 key，避免缓存全失效重打 LLM
+        raw_line = (
             match_info.get("total_line")
             or match_info.get("spread_line")
             or match_info.get("line")
-            or ""
+            or 0
         )
+        try:
+            line_tag = round(float(raw_line) * 2) / 2 if raw_line else ""
+        except (TypeError, ValueError):
+            line_tag = str(raw_line)
         cache_key = f"ai:gpt:v1:{fk}:{sport}:{line_tag}"
         try:
             cached = await cache.get_json(cache_key)
@@ -264,17 +264,16 @@ class MatchAnalyzer:
         )
 
         try:
-            timeout = float(getattr(settings, "GPT_TIMEOUT_SEC", 60))
+            timeout = float(settings.GPT_TIMEOUT_SEC)
             raw = await asyncio.wait_for(self._call_gpt(prompt), timeout=timeout)
             content = raw.get("content", "")
             parsed = self._parse_analysis_result(content)
 
-            bt = normalize_bet_type(parsed.get("bet_type"))
-            pred = normalize_prediction(parsed.get("prediction"), bet_type=bt)
-            if not bt:
-                bt = _infer_bet_type(pred, "")
+            # 单市场模式：仅大小球，bet_type 恒 total
+            pred = normalize_prediction(parsed.get("prediction"), bet_type="total")
+            bt = "total"
 
-            if bt != "total" or (pred not in ("over", "under") and pred != "skip"):
+            if pred not in ("over", "under", "skip"):
                 logger.warning(
                     "[AI分析] GPT 返回无效结果 match=%s | bt=%s pred=%s",
                     match_info.get("id"), parsed.get("bet_type"), parsed.get("prediction"),
@@ -289,7 +288,7 @@ class MatchAnalyzer:
                     "[AI分析] GPT 判定跳过 match=%s | reasoning=%s",
                     match_info.get("id"), (parsed.get("reasoning") or "")[:120],
                 )
-                return {
+                skip_result = {
                     "prediction": "skip",
                     "bet_type": "total",
                     "line": _line_for_pick(market_odds, match_info, "total"),
@@ -299,12 +298,18 @@ class MatchAnalyzer:
                     "value_bets": [],
                     "risk_level": "high",
                     "consensus_reached": False,
-                    "consensus_votes": {},
-                    "consensus_ratio": 0.0,
-                    "ensemble": [{"model": "gpt", "prediction": "skip", "confidence": 0.0}],
                     "models_used": ["gpt"],
                     "models_failed": [],
+                    "neg_cached": True,
                 }
+                # skip 也写负缓存：滚球晚段大量 skip，不缓存则每轮 120s 重复打 LLM
+                try:
+                    await cache.set_json(
+                        cache_key, skip_result, ttl=settings.AI_SKIP_CACHE_TTL
+                    )
+                except Exception:
+                    pass
+                return skip_result
 
             try:
                 conf = float(parsed.get("confidence", settings.LLM_DEFAULT_CONFIDENCE))
@@ -339,21 +344,8 @@ class MatchAnalyzer:
                 "value_bets": (parsed.get("value_bets") or [])[:5],
                 "risk_level": parsed.get("risk_level", "medium"),
                 "consensus_reached": consensus_reached,
-                "consensus_votes": {"total:over": 1 if pred == "over" else 0, "total:under": 1 if pred == "under" else 0},
-                "consensus_ratio": 1.0,
                 "models_used": ["gpt"],
                 "models_failed": [],
-                "ensemble": [
-                    {
-                        "model": "gpt",
-                        "ok": True,
-                        "prediction": pred,
-                        "bet_type": bt,
-                        "confidence": round(conf, 4),
-                        "latency_ms": latency_ms,
-                        "error": None,
-                    }
-                ],
                 "analyzed_at": datetime.now(timezone.utc).isoformat(),
             }
 
@@ -368,20 +360,7 @@ class MatchAnalyzer:
                 historical_data=historical_data,
                 market_odds=market_odds,
             )
-            review = analysis.get("signal_review") if isinstance(analysis.get("signal_review"), dict) else {}
-            triad_ready = bool(review.get("triad_ready"))
-            verdict = str(review.get("verdict") or "").strip().lower()
-            final_conf = _to_float(analysis.get("confidence"), 0.0)
-            # 单模型模式：GPT 返回 over/under 即为最终共识，三重门禁仅作参考标注
-            consensus_reached = pred in ("over", "under")
-            analysis["consensus_reached"] = consensus_reached
-
-            if not consensus_reached:
-                analysis["risk_level"] = "high"
-                analysis["reasoning"] = (
-                    f"[未通过三重门禁 triad={triad_ready} verdict={verdict or 'unknown'} conf={final_conf:.0%}] "
-                    + analysis["reasoning"]
-                )
+            # 单模型模式：GPT 返回 over/under 即为最终共识（consensus_reached 已在上方恒 True）
 
             # 维度分析日志：核心维度逐项 + 盘口解读
             _hd = historical_data if isinstance(historical_data, dict) else {}
@@ -421,7 +400,7 @@ class MatchAnalyzer:
                         await cache.set_json(cache_key, analysis, ttl=settings.LLM_CACHE_TTL)
                     else:
                         analysis["neg_cached"] = True
-                        await cache.set_json(cache_key, analysis, ttl=60)
+                        await cache.set_json(cache_key, analysis, ttl=settings.LLM_NEG_CACHE_TTL)
                 except Exception as e:
                     logger.warning("[AI分析] 缓存写入失败 match=%s: %s", match_info.get("id"), e)
 
@@ -907,15 +886,6 @@ class MatchAnalyzer:
             if anti_chase_signal.get("reason"):
                 conflict_reasons.append(anti_chase_signal["reason"])
 
-        if stat_signals:
-            stat_signal = self._statistical_alignment_signal(stat_signals, selection=selection, bet_type=bet_type, line=line)
-            if stat_signal["supportive"]:
-                fundamental_points += 2
-                support_reasons.append(stat_signal["reason"])
-            elif stat_signal["conflict"]:
-                conflict_points += 2
-                conflict_reasons.append(stat_signal["reason"])
-
         if analysis_signal["supportive"]:
             fundamental_points += int(analysis_signal.get("points") or 0)
             if analysis_signal.get("reason"):
@@ -1169,28 +1139,6 @@ class MatchAnalyzer:
                 reason = "篮球末节通常更适合大分"
         return {"supportive": supportive, "conflict": conflict, "reason": reason}
 
-    @staticmethod
-    def _statistical_alignment_signal(
-        stat_signals: dict[str, Any],
-        *,
-        selection: str,
-        bet_type: str,
-        line: Optional[float],
-    ) -> dict[str, Any]:
-        supportive = False
-        conflict = False
-        reason = ""
-        if bet_type in {"moneyline", "spread"}:
-            xg = stat_signals.get("standings_xg_diff") if isinstance(stat_signals.get("standings_xg_diff"), dict) else {}
-            edge = _to_float(xg.get("edge"), 0.0)
-            if selection == "home" and edge >= 0.35:
-                supportive = True
-                reason = f"xG/积分边际偏向主队 ({edge:.2f})"
-            elif selection == "away" and edge <= -0.35:
-                supportive = True
-                reason = f"xG/积分边际偏向客队 ({edge:.2f})"
-        return {"supportive": supportive, "conflict": conflict, "reason": reason}
-
     def _compact_historical_data(self, data: Optional[dict]) -> Optional[dict]:
         """压缩全量数据：截断 h2h/form 只保留最近 N 场，trend 只保留 text，analysis 截断，prompt 控制 8KB。"""
         if not isinstance(data, dict):
@@ -1206,6 +1154,8 @@ class MatchAnalyzer:
         # h2h: 只保留最近 N 场，保留进球数据
         h2h = result.get("h2h")
         if isinstance(h2h, dict):
+            # summary 摘要由统计信号派生（h2h_baseline），原始块只留 matches 明细
+            h2h.pop("summary", None)
             matches = h2h.get("matches")
             if isinstance(matches, list) and len(matches) > h2h_max:
                 h2h["matches"] = matches[:h2h_max]
@@ -1219,6 +1169,8 @@ class MatchAnalyzer:
         for fk in ("home_form", "away_form"):
             fd = result.get(fk)
             if isinstance(fd, dict):
+                # summary 摘要由统计信号派生（home/away_form_stats），原始块只留明细
+                fd.pop("summary", None)
                 matches = fd.get("matches")
                 if isinstance(matches, list) and len(matches) > form_max:
                     fd["matches"] = matches[:form_max]
@@ -1368,12 +1320,12 @@ class MatchAnalyzer:
             prompt += f"\n## 历史交锋记录\n{json.dumps(h2h_block, ensure_ascii=False, separators=(',', ':'))}\n"
         if home_form:
             prompt += (
-                f"\n## 主队近10场状态（{match_info.get('home_team', '主队')}）\n"
+                f"\n## 主队近况明细（{match_info.get('home_team', '主队')}）\n"
                 f"{json.dumps(home_form, ensure_ascii=False, separators=(',', ':'))}\n"
             )
         if away_form:
             prompt += (
-                f"\n## 客队近10场状态（{match_info.get('away_team', '客队')}）\n"
+                f"\n## 客队近况明细（{match_info.get('away_team', '客队')}）\n"
                 f"{json.dumps(away_form, ensure_ascii=False, separators=(',', ':'))}\n"
             )
         if isinstance(historical_data, dict):
@@ -1434,21 +1386,10 @@ class MatchAnalyzer:
         )
         flat = _flatten_market_odds(market_odds)
         if markets_block and "total" in markets_block:
-            prompt += f"- 当前大小球（含 opening/变盘）: {json.dumps(markets_block['total'], ensure_ascii=False)}\n"
+            # markets_block['total'] 已含 opening 初指与变盘明细，不再重复展开独立摘要
+            prompt += f"- 当前大小球（含 opening/变盘）: {json.dumps(markets_block['total'], ensure_ascii=False, separators=(',', ':'))}\n"
         elif flat:
-            prompt += f"- 当前大小球赔率: {json.dumps(flat, ensure_ascii=False)}\n"
-        line_moves = None
-        if isinstance(market_odds, dict):
-            line_moves = market_odds.get("line_movements")
-        if line_moves:
-            prompt += f"- 盘口变化摘要: {json.dumps(line_moves, ensure_ascii=False)}\n"
-        total_market = markets_block.get("total") if isinstance(markets_block, dict) else {}
-        if isinstance(total_market, dict):
-            opening = total_market.get("opening") if isinstance(total_market.get("opening"), dict) else {}
-            if opening:
-                prompt += (
-                    f"- 初指摘要: line={opening.get('line')} odds={json.dumps(opening.get('odds') or {}, ensure_ascii=False)}\n"
-                )
+            prompt += f"- 当前大小球赔率: {json.dumps(flat, ensure_ascii=False, separators=(',', ':'))}\n"
         # 实时比分分析：计算进球节奏和剩余需求
         score_analysis = ""
         if match_info.get("home_score") is not None and match_info.get("away_score") is not None:

@@ -686,7 +686,7 @@ async def _run_recs_job(
         # 与自动引擎一致：关闭 LLM 时跳过赛前上下文
         skip_ctx = not bool(getattr(job_strat, "use_llm_analysis", True))
 
-        conc = max(2, int(getattr(settings, "ENSEMBLE_CONCURRENCY", 8) or 8))
+        conc = max(2, int(getattr(settings, "AI_ANALYZE_CONCURRENCY", 8) or 8))
         sem = asyncio.Semaphore(conc)
         all_recs: list[dict] = []
         done = 0

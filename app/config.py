@@ -100,13 +100,16 @@ class Settings(BaseSettings):
     GPT_MODEL: str = "gpt-5.6-terra"
 
     # --- AI 分析配置 ---
-    LLM_CLIENT_TIMEOUT_SEC: float = 90.0   # GPT API 调用超时（大 prompt 需要更长时间）
+    GPT_TIMEOUT_SEC: float = 45.0          # 单次 GPT 分析总超时（外层 wait_for）
+    LLM_CLIENT_TIMEOUT_SEC: float = 50.0   # OpenAI 客户端超时（须 ≥ GPT_TIMEOUT_SEC）
     LLM_MAX_TOKENS: int = 2048              # GPT 最大输出 tokens（确保 JSON 不被截断）
     LLM_DEFAULT_CONFIDENCE: float = 0.33    # GPT 未返回置信度时的默认值
     LLM_TEMPERATURE: float = 0.2            # GPT 温度
     LLM_NO_DATA_CONFIDENCE_CAP: float = 0.55  # 无数据时置信度上限
     LLM_UNAVAILABLE_CONF_CAP: float = 0.49   # LLM不可用时置信度上限
     LLM_CACHE_TTL: int = 600               # 10分钟
+    AI_SKIP_CACHE_TTL: int = 180           # GPT 判 skip 的负缓存（略超 120s 轮询间隔，跨轮生效）
+    LLM_NEG_CACHE_TTL: int = 150           # 无共识结果负缓存（略超轮询间隔）
     # Prompt 压缩：截断冗余数据，控制 prompt 在 8KB 以内
     PROMPT_MAX_CHARS: int = 8000           # prompt 最大字符数
     H2H_MAX_MATCHES: int = 3               # 历史交锋最多保留场次
