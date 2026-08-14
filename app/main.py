@@ -95,9 +95,18 @@ async def lifespan(app: FastAPI):
         bal_on = False
         ctx_on = False
         ns_on = False
+        settle_on = False
         while True:
             try:
                 lead = bool(settings.RUN_BACKGROUND_JOBS) and is_background_leader()
+                if lead and not settle_on:
+                    try:
+                        from app.services.bet_settlement import start_settlement_worker
+                        start_settlement_worker()
+                        settle_on = True
+                        logger.info("bet settlement worker started (leader)")
+                    except Exception as e:
+                        logger.warning(f"bet settlement worker 启动失败: {e}")
                 if lead and not live_on:
                     try:
                         from app.services.bookmakers.live_poller import start_live_poller
@@ -158,6 +167,13 @@ async def lifespan(app: FastAPI):
                     except Exception:
                         pass
                     ns_on = False
+                if not lead and settle_on:
+                    try:
+                        from app.services.bet_settlement import stop_settlement_worker
+                        stop_settlement_worker()
+                    except Exception:
+                        pass
+                    settle_on = False
             except Exception:
                 logger.exception("background job supervisor error")
             await asyncio.sleep(5)

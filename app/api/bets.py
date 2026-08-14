@@ -444,7 +444,7 @@ async def place_bet(
             odds=odds_val,
             stake=stake_val,
             potential_payout=potential_payout,
-            actual_payout=potential_payout,
+            actual_payout=Decimal("0"),  # 未结算，由 bet_settlement 按完场比分写回
             line=line_val,
             status=BetStatus.SUCCESS,
             provider=provider_label,

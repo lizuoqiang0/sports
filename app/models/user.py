@@ -276,6 +276,8 @@ class Bet(Base):
     ai_reasoning: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # LLM分析理由
     # 外部真实注单号（OB orderNo 等）
     external_bet_id: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    # 结算时间（NULL=未结算；由 bet_settlement 按完场比分写回）
+    settled_at: Mapped[Optional[datetime]] = mapped_column(DateTimeUTC, nullable=True)
 
     # 时间戳
     created_at: Mapped[datetime] = mapped_column(DateTimeUTC, default=lambda: datetime.now(timezone.utc), index=True)

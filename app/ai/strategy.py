@@ -428,6 +428,80 @@ class StrategyEngine:
             mid, mkt_support, prediction, mkt_strength,
         )
 
+        # ── 闸门2.9：under 余量检查（实盘教训：bet58 下半场48' 1球押 under2.5，终场3球破线）──
+        if prediction == "under" and total_line is not None and played_mins is not None:
+            margin = total_line - current_total
+            if sport_l == "basketball":
+                # 篮球：全场48分钟，按盘口线等比折算剩余期望得分
+                if played_mins >= 20 and played_mins < 48:
+                    expected_remaining = (48.0 - played_mins) / 48.0 * total_line
+                    if margin < expected_remaining * 1.25:
+                        logger.info(
+                            "[闸门2.9/under余量] ❌ 拒绝 match=%s | 篮球%d' 余量%.1f < 剩余期望%.1f×1.25",
+                            mid, played_mins, margin, expected_remaining,
+                        )
+                        return self._reject(
+                            match_info, analysis,
+                            f"篮球under余量不足（{played_mins:.0f}'剩{margin:.1f}分，期望还需{expected_remaining:.1f}分）",
+                        )
+            else:
+                # 足球：全场90分钟，联赛平均约2.75球等比折算剩余期望
+                if played_mins >= 40 and played_mins < 90:
+                    expected_remaining = (90.0 - played_mins) / 90.0 * 2.75
+                    if margin < expected_remaining * 1.3:
+                        logger.info(
+                            "[闸门2.9/under余量] ❌ 拒绝 match=%s | 足球%d' 余量%.2f < 剩余期望%.2f×1.3",
+                            mid, played_mins, margin, expected_remaining,
+                        )
+                        return self._reject(
+                            match_info, analysis,
+                            f"足球under余量不足（{played_mins:.0f}'剩{margin:.2f}球，期望还需{expected_remaining:.2f}球）",
+                        )
+        if prediction == "under":
+            logger.info(
+                "[闸门2.9/under余量] ✅ 通过 match=%s | %s line=%s total=%d mins=%s margin=%s",
+                mid, sport_l, total_line, current_total, played_mins,
+                round(total_line - current_total, 2) if total_line is not None else None,
+            )
+
+        # ── 闸门2.10：近期真实胜率自适应（按已结算输赢动态收紧置信度阈值）──
+        try:
+            from app.services.bet_settlement import recent_betting_stats
+
+            stats = await recent_betting_stats(days=7)
+            settled_n = int(stats.get("settled") or 0)
+            win_rate = stats.get("win_rate")
+            if settled_n >= 5 and isinstance(win_rate, (int, float)):
+                if win_rate < 0.35:
+                    adaptive_bump = 0.10
+                elif win_rate < 0.45:
+                    adaptive_bump = 0.05
+                else:
+                    adaptive_bump = 0.0
+                if adaptive_bump > 0:
+                    bumped = min_conf + adaptive_bump
+                    logger.info(
+                        "[闸门2.10/胜率自适应] match=%s | 近7天%d结算胜率%.1f%%<45%% | min_conf %.2f→%.2f",
+                        mid, settled_n, win_rate * 100, min_conf, bumped,
+                    )
+                    if conf_f < bumped:
+                        return self._reject(
+                            match_info, analysis,
+                            f"近期胜率过低({win_rate * 100:.0f}%)，置信度需≥{bumped:.2f}（当前{conf_f:.2f}）",
+                        )
+                else:
+                    logger.info(
+                        "[闸门2.10/胜率自适应] ✅ 通过 match=%s | 近7天%d结算胜率%.1f%% 正常",
+                        mid, settled_n, win_rate * 100,
+                    )
+            else:
+                logger.info(
+                    "[闸门2.10/胜率自适应] 跳过 match=%s | 样本不足(%s结算)",
+                    mid, settled_n,
+                )
+        except Exception as e:
+            logger.warning("[闸门2.10/胜率自适应] 统计加载失败(跳过): %s", e)
+
         # ── 闸门3：赔率区间检查 ──
         odds_raw_over = odds_data.get("over")
         odds_raw_under = odds_data.get("under")

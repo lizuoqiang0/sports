@@ -184,7 +184,7 @@ async def _materialize_pending_success(
         odds=odds,
         stake=stake,
         potential_payout=potential_payout,
-        actual_payout=potential_payout,
+        actual_payout=Decimal("0"),  # 未结算，由 bet_settlement 按完场比分写回
         line=resolved["line"],
         provider=resolved["provider"],
         status=BetStatus.SUCCESS,
