@@ -373,10 +373,17 @@ class StrategyEngine:
                 mid, conf_f, total_line, current_total, played_mins,
             )
 
-        # ── 闸门2.7：双向风控（参数见模块级 SPORT_RISK）──
+        # ── 闸门2.7：双向风控（置信度门槛动态取用户 AI 配置，盘线地板用 SPORT_RISK）──
         ctx_source = str(analysis.get("context_source") or "none").strip().lower()
         has_fundamentals = ctx_source not in ("", "none")
         RISK = SPORT_RISK.get(sport_l, SPORT_RISK["default"])
+
+        # 置信度门槛：用户 AI 配置的 min_confidence 为主；未配置(<=0)才回落 SPORT_RISK 地板
+        # over 额外保留地板（历史胜率<20%），取两者较大值
+        user_min_conf = min_conf if min_conf > 0 else 0.0
+        over_min_conf = max(user_min_conf, RISK["over_min_conf"]) if user_min_conf > 0 else RISK["over_min_conf"]
+        under_min_conf_fund = user_min_conf if user_min_conf > 0 else RISK["under_min_conf"]
+        under_min_conf_nofund = max(under_min_conf_fund, RISK["under_min_conf_no_fund"])
 
         if prediction == "over":
             if RISK["over_no_fundamentals"] and not has_fundamentals:
@@ -386,16 +393,17 @@ class StrategyEngine:
                 logger.info("[闸门2.7/over风控] ❌ 拒绝 match=%s | %s高线over line=%.2f>=%.2f",
                             mid, sport_l, total_line, RISK["over_max_line"])
                 return self._reject(match_info, analysis, f"{sport_l}高线over（line={total_line:.2f}）历史胜率极低")
-            over_min_conf = max(min_conf, RISK["over_min_conf"])
-            if conf_f < over_min_conf:
-                logger.info("[闸门2.7/over风控] ❌ 拒绝 match=%s | over置信度=%.4f < 要求=%.4f", mid, conf_f, over_min_conf)
-                return self._reject(match_info, analysis, f"over方向需更高置信度（当前{conf_f:.2f}，要求{over_min_conf:.2f}）")
+            over_req = over_min_conf
+            if conf_f < over_req:
+                logger.info("[闸门2.7/over风控] ❌ 拒绝 match=%s | over置信度=%.4f < 要求=%.4f (用户配置=%.2f 地板=%.2f)",
+                            mid, conf_f, over_req, user_min_conf, RISK["over_min_conf"])
+                return self._reject(match_info, analysis, f"over方向需更高置信度（当前{conf_f:.2f}，要求{over_req:.2f}）")
 
         elif prediction == "under":
-            under_min_conf = RISK["under_min_conf"] if has_fundamentals else RISK["under_min_conf_no_fund"]
+            under_min_conf = under_min_conf_fund if has_fundamentals else under_min_conf_nofund
             if conf_f < under_min_conf:
-                logger.info("[闸门2.7/under风控] ❌ 拒绝 match=%s | under置信度=%.4f < 要求=%.4f (fundamentals=%s)",
-                            mid, conf_f, under_min_conf, has_fundamentals)
+                logger.info("[闸门2.7/under风控] ❌ 拒绝 match=%s | under置信度=%.4f < 要求=%.4f (用户配置=%.2f fundamentals=%s)",
+                            mid, conf_f, under_min_conf, user_min_conf, has_fundamentals)
                 return self._reject(match_info, analysis, f"under置信度不足（当前{conf_f:.2f}，要求{under_min_conf:.2f}）")
             if sport_l == "football" and total_line is not None and total_line <= RISK.get("under_min_line", 1.5):
                 logger.info("[闸门2.7/under风控] ❌ 拒绝 match=%s | 足球低线under line=%.2f，1球即破盘", mid, total_line)
