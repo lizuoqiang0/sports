@@ -258,9 +258,7 @@ class StrategyEngine:
         """
         综合评估一场赛事，决定是否投注。
 
-        当前模式仅保留:
-        - AI 分析方向（大小球百分比）
-        - 基础方向检查 + 赔率有效性检查
+        五阶段闸门链（A信号有效性 → B结构性风控 → C市场一致性 → D滚球余量 → E赔率有效性）。
         """
         confidence = analysis.get("confidence", 0)
         prediction = str(analysis.get("prediction", "") or "").lower()
@@ -275,76 +273,34 @@ class StrategyEngine:
         max_odds_cfg = _as_float(self.config.max_odds, 99.0)
         odds_data = match_info.get("odds", {}) or {}
 
-        # ── 入口日志：打印全部配置阈值 + AI 原始分析 ──
-        logger.info(
-            "[闸门入口] match=%s %s %s vs %s | AI方向=%s 置信度=%.4f | "
-            "配置阈值: 最低胜率=%.2f 最低赔率=%.2f 最高赔率=%.2f | "
-            "余额=%.2f 日亏=%.2f 活跃单=%d",
-            mid, sport, ht, at, prediction, conf_f,
-            min_conf, min_odds_cfg, max_odds_cfg,
-            float(user_balance), float(daily_loss), active_bets_count,
-        )
+        # ══════════════════════════════════════════════════════════
+        # 阶段A：信号有效性（AI 输出是否可执行）
+        #   A1 方向合法 + A2 模型共识 + A3 置信度达标（含按方向/基本面分级）
+        # ══════════════════════════════════════════════════════════
 
-        # ── 闸门1：方向检查 ──
+        # ── A1：方向检查 ──
         if prediction not in ("over", "under"):
             logger.info(
-                "[闸门1/方向] ❌ 拒绝 match=%s | AI方向='%s' 不在 [over, under] 内 | "
-                "analysis.prediction='%s' analysis全部=%s",
+                "[A1/方向] ❌ 拒绝 match=%s | AI方向='%s' 不在 [over, under] 内",
                 mid, prediction,
-                analysis.get("prediction", ""), {k: analysis.get(k) for k in ("prediction", "confidence", "odds") if k in analysis},
             )
             return self._reject(match_info, analysis, f"不支持的投注方向: {prediction}")
-        logger.info(
-            "[闸门1/方向] ✅ 通过 match=%s | 方向=%s（大球over/小球under）",
-            mid, prediction,
-        )
 
-        # ── 闸门1.5：硬保护，任何“不可下单”文案或共识失败一律拦截 ──
+        # ── A2：模型共识硬保护 ──
         reasoning = str(analysis.get("reasoning") or "")
         consensus_reached = bool(analysis.get("consensus_reached", False))
         if (not consensus_reached) or ("[不投注]" in reasoning) or ("不可下单" in reasoning):
-            logger.info(
-                "[闸门1.5/硬保护] ❌ 拒绝 match=%s | consensus=%s | reasoning=%s",
-                mid, consensus_reached, reasoning[:220],
-            )
-            why = "模型未通过下单门禁"
-            if "[不投注]" in reasoning:
-                why = "文案已标记为不投注"
-            elif "不可下单" in reasoning:
-                why = "文案已标记为不可下单"
-            elif not consensus_reached:
-                why = "consensus_reached=false"
+            why = ("文案已标记为不投注" if "[不投注]" in reasoning
+                   else "文案已标记为不可下单" if "不可下单" in reasoning
+                   else "consensus_reached=false")
+            logger.info("[A2/共识] ❌ 拒绝 match=%s | consensus=%s | why=%s", mid, consensus_reached, why)
             return self._reject(match_info, analysis, why)
-        logger.info(
-            "[闸门1.5/硬保护] ✅ 通过 match=%s | consensus=%s",
-            mid, consensus_reached,
-        )
 
-        # ── 闸门2：置信度检查（参考，实际由闸门2.7按方向分别判断）──
-        if conf_f < min_conf:
-            logger.info(
-                "[闸门2/置信度] 参考 match=%s | 实际=%.4f 低于通用阈值=%.4f | 将由闸门2.7按方向判断",
-                mid, conf_f, min_conf,
-            )
-        else:
-            logger.info(
-                "[闸门2/置信度] ✅ 通过 match=%s | 实际=%.4f ≥ 阈值=%.4f",
-                mid, conf_f, min_conf,
-            )
-
-        # ── 闸门2.5：初指 + 实时盘口 + 基本面 三重门禁 ──
-        signal_review = analysis.get("signal_review") if isinstance(analysis.get("signal_review"), dict) else {}
-        triad_ready = bool(signal_review.get("triad_ready"))
-        verdict = str(signal_review.get("verdict") or "").strip().lower()
-        edge_score = _as_float(signal_review.get("edge_score"), 0.0)
-        # 单模型模式：三重门禁仅作参考标注，不阻断 GPT 的 over/under 判断
-        logger.info(
-            "[闸门2.5/三重门禁] 参考（不阻断） match=%s | triad_ready=%s verdict=%s edge=%.2f",
-            mid, triad_ready, verdict, edge_score,
-        )
-
-        # ── 闸门2.6：足球大球保守保护（近期实盘大球回撤高，先收紧） ──
+        # ── A3：置信度（用户AI配置主导 + over地板 + 无基本面加严 + 胜率自适应）──
         sport_l = str(sport or "").lower().strip()
+        RISK = SPORT_RISK.get(sport_l, SPORT_RISK["default"])
+        ctx_source = str(analysis.get("context_source") or "none").strip().lower()
+        has_fundamentals = ctx_source not in ("", "none")
         total_line = _as_float(
             analysis.get("line", match_info.get("total_line", match_info.get("line"))),
             None,
@@ -352,10 +308,6 @@ class StrategyEngine:
         home_score = _as_int(match_info.get("home_score"), 0)
         away_score = _as_int(match_info.get("away_score"), 0)
         current_total = home_score + away_score
-        conflict_points = _as_int(signal_review.get("conflict_points"), 0)
-        market_points = _as_int(signal_review.get("market_points"), 0)
-        fundamental_points = _as_int(signal_review.get("fundamental_points"), 0)
-        # 单模型模式：足球大球保护降级为参考日志，不阻断 GPT 判断
         played_mins = None
         try:
             from app.services.bookmakers.match_live import parse_match_clock_minutes
@@ -367,56 +319,92 @@ class StrategyEngine:
         except Exception:
             played_mins = None
 
-        if sport_l == "football" and prediction == "over":
-            logger.info(
-                "[闸门2.6/足球大球保护] 参考（不阻断） match=%s | conf=%.4f line=%s total=%d mins=%s",
-                mid, conf_f, total_line, current_total, played_mins,
-            )
-
-        # ── 闸门2.7：双向风控（置信度门槛动态取用户 AI 配置，盘线地板用 SPORT_RISK）──
-        ctx_source = str(analysis.get("context_source") or "none").strip().lower()
-        has_fundamentals = ctx_source not in ("", "none")
-        RISK = SPORT_RISK.get(sport_l, SPORT_RISK["default"])
-
-        # 置信度门槛：用户 AI 配置的 min_confidence 为主；未配置(<=0)才回落 SPORT_RISK 地板
-        # over 额外保留地板（历史胜率<20%），取两者较大值
+        # 有效置信度门槛 = 用户配置（>0时） → 无基本面时取两者较大 → over再叠地板 → 胜率自适应再加成
         user_min_conf = min_conf if min_conf > 0 else 0.0
-        over_min_conf = max(user_min_conf, RISK["over_min_conf"]) if user_min_conf > 0 else RISK["over_min_conf"]
-        under_min_conf_fund = user_min_conf if user_min_conf > 0 else RISK["under_min_conf"]
-        under_min_conf_nofund = max(under_min_conf_fund, RISK["under_min_conf_no_fund"])
+        if user_min_conf > 0:
+            base_req = user_min_conf
+        else:
+            base_req = RISK["under_min_conf"]  # 未配置时的兜底地板
+        if not has_fundamentals:
+            base_req = max(base_req, RISK["under_min_conf_no_fund"])
+        if prediction == "over":
+            base_req = max(base_req, RISK["over_min_conf"])
+
+        adaptive_bump = 0.0
+        try:
+            from app.services.bet_settlement import recent_betting_stats
+
+            stats = await recent_betting_stats(days=7)
+            settled_n = int(stats.get("settled") or 0)
+            win_rate = stats.get("win_rate")
+            if settled_n >= 5 and isinstance(win_rate, (int, float)):
+                if win_rate < 0.35:
+                    adaptive_bump = 0.10
+                elif win_rate < 0.45:
+                    adaptive_bump = 0.05
+            if adaptive_bump:
+                logger.info(
+                    "[A3/置信度] 胜率自适应 match=%s | 近7天%d结算胜率%.1f%%<45%% | 门槛+%.2f",
+                    mid, settled_n, win_rate * 100, adaptive_bump,
+                )
+            else:
+                logger.info(
+                    "[A3/置信度] 胜率自适应跳过 match=%s | 样本%d结算/胜率正常",
+                    mid, settled_n,
+                )
+        except Exception as e:
+            logger.warning("[A3/胜率自适应] 统计加载失败(跳过): %s", e)
+
+        required_conf = base_req + adaptive_bump
+        if conf_f < required_conf:
+            logger.info(
+                "[A3/置信度] ❌ 拒绝 match=%s | conf=%.4f < 要求=%.4f (用户配置=%.2f fundamentals=%s over地板=%s 自适应+%.2f)",
+                mid, conf_f, required_conf, user_min_conf, has_fundamentals,
+                RISK["over_min_conf"] if prediction == "over" else "-", adaptive_bump,
+            )
+            return self._reject(
+                match_info, analysis,
+                f"{prediction}置信度不足（当前{conf_f:.2f}，要求{required_conf:.2f}）",
+            )
+        logger.info(
+            "[A3/置信度] ✅ 通过 match=%s | conf=%.2f ≥ 要求=%.2f | 方向=%s fundamentals=%s",
+            mid, conf_f, required_conf, prediction, has_fundamentals,
+        )
+
+        # ══════════════════════════════════════════════════════════
+        # 阶段B：结构性风控（盘口线本身的下注价值）
+        #   B1 over 双重前置（无基本面禁/高线禁） + under 盘线区间
+        # ══════════════════════════════════════════════════════════
 
         if prediction == "over":
             if RISK["over_no_fundamentals"] and not has_fundamentals:
-                logger.info("[闸门2.7/over风控] ❌ 拒绝 match=%s | 无基本面数据，over方向禁止", mid)
+                logger.info("[B1/over风控] ❌ 拒绝 match=%s | 无基本面数据，over方向禁止", mid)
                 return self._reject(match_info, analysis, "无基本面数据支撑，over方向禁止下单")
             if total_line is not None and total_line >= RISK["over_max_line"]:
-                logger.info("[闸门2.7/over风控] ❌ 拒绝 match=%s | %s高线over line=%.2f>=%.2f",
-                            mid, sport_l, total_line, RISK["over_max_line"])
+                logger.info(
+                    "[B1/over风控] ❌ 拒绝 match=%s | %s高线over line=%.2f>=%.2f",
+                    mid, sport_l, total_line, RISK["over_max_line"],
+                )
                 return self._reject(match_info, analysis, f"{sport_l}高线over（line={total_line:.2f}）历史胜率极低")
-            over_req = over_min_conf
-            if conf_f < over_req:
-                logger.info("[闸门2.7/over风控] ❌ 拒绝 match=%s | over置信度=%.4f < 要求=%.4f (用户配置=%.2f 地板=%.2f)",
-                            mid, conf_f, over_req, user_min_conf, RISK["over_min_conf"])
-                return self._reject(match_info, analysis, f"over方向需更高置信度（当前{conf_f:.2f}，要求{over_req:.2f}）")
-
-        elif prediction == "under":
-            under_min_conf = under_min_conf_fund if has_fundamentals else under_min_conf_nofund
-            if conf_f < under_min_conf:
-                logger.info("[闸门2.7/under风控] ❌ 拒绝 match=%s | under置信度=%.4f < 要求=%.4f (用户配置=%.2f fundamentals=%s)",
-                            mid, conf_f, under_min_conf, user_min_conf, has_fundamentals)
-                return self._reject(match_info, analysis, f"under置信度不足（当前{conf_f:.2f}，要求{under_min_conf:.2f}）")
+        else:  # under
             if sport_l == "football" and total_line is not None and total_line <= RISK.get("under_min_line", 1.5):
-                logger.info("[闸门2.7/under风控] ❌ 拒绝 match=%s | 足球低线under line=%.2f，1球即破盘", mid, total_line)
+                logger.info("[B1/under风控] ❌ 拒绝 match=%s | 足球低线under line=%.2f，1球即破盘", mid, total_line)
                 return self._reject(match_info, analysis, f"足球低线under（line={total_line:.2f}）1球即破盘，风险过高")
             if sport_l == "basketball" and total_line is not None and RISK.get("under_max_line") and total_line >= RISK["under_max_line"]:
-                logger.info("[闸门2.7/under风控] ❌ 拒绝 match=%s | 篮球高线under line=%.1f>=%.1f，变数大", mid, total_line, RISK["under_max_line"])
+                logger.info(
+                    "[B1/under风控] ❌ 拒绝 match=%s | 篮球高线under line=%.1f>=%.1f，变数大",
+                    mid, total_line, RISK["under_max_line"],
+                )
                 return self._reject(match_info, analysis, f"篮球高线under（line={total_line:.1f}）加时/罚球变数大")
 
-        # ── 闸门2.8：盘口变化方向过滤 ──
+        # ══════════════════════════════════════════════════════════
+        # 阶段C：市场一致性（盘口变化方向）
+        #   C1 市场降/升盘方向与预测相反 → 拒绝
+        # ══════════════════════════════════════════════════════════
+
         line_moves_raw = match_info.get("line_movements") or match_info.get("line_movement") or {}
         total_move = None
         if isinstance(line_moves_raw, dict):
-            # line_movements 是 dict（key=bet_type）
             total_move = line_moves_raw.get("total") or line_moves_raw
         elif isinstance(line_moves_raw, list) and line_moves_raw:
             total_move = line_moves_raw[-1] if isinstance(line_moves_raw[-1], dict) else {}
@@ -438,18 +426,21 @@ class StrategyEngine:
                     pass
 
         if mkt_support != "neutral" and mkt_support != prediction:
-            # 市场方向与 GPT 预测相反
             logger.info(
-                "[闸门2.8/盘口方向] ❌ 拒绝 match=%s | 市场支持%s 但GPT预测%s | line_delta=%s strength=%s",
-                mid, mkt_support, prediction, total_move.get("line_delta") if isinstance(total_move, dict) else "?", mkt_strength,
+                "[C1/盘口方向] ❌ 拒绝 match=%s | 市场支持%s 但AI预测%s | strength=%s",
+                mid, mkt_support, prediction, mkt_strength,
             )
             return self._reject(match_info, analysis, f"盘口变化方向({mkt_support})与预测({prediction})相反")
         logger.info(
-            "[闸门2.8/盘口方向] ✅ 通过 match=%s | 市场支持=%s 预测=%s strength=%s",
+            "[C1/盘口方向] ✅ 通过 match=%s | 市场支持=%s 预测=%s strength=%s",
             mid, mkt_support, prediction, mkt_strength,
         )
 
-        # ── 闸门2.9：under 余量检查（参数见 SPORT_RISK；实盘教训：bet58 下48' 1球押 under2.5，终场3球破线）──
+        # ══════════════════════════════════════════════════════════
+        # 阶段D：滚球余量（仅 under，中后段余量不足以覆盖剩余期望 → 拒绝）
+        #   实盘教训：bet58 下48' 1球押 under2.5，终场3球破线
+        # ══════════════════════════════════════════════════════════
+
         if prediction == "under" and total_line is not None and played_mins is not None:
             margin = total_line - current_total
             m_cfg = RISK
@@ -458,7 +449,7 @@ class StrategyEngine:
                 expected_remaining = (m_cfg["margin_full_mins"] - played_mins) / m_cfg["margin_full_mins"] * base
                 if margin < expected_remaining * m_cfg["margin_factor"]:
                     logger.info(
-                        "[闸门2.9/under余量] ❌ 拒绝 match=%s | %s %.0f' 余量%.2f < 剩余期望%.2f×%.2f",
+                        "[D1/under余量] ❌ 拒绝 match=%s | %s %.0f' 余量%.2f < 剩余期望%.2f×%.2f",
                         mid, sport_l, played_mins, margin, expected_remaining, m_cfg["margin_factor"],
                     )
                     return self._reject(
@@ -467,50 +458,14 @@ class StrategyEngine:
                     )
         if prediction == "under":
             logger.info(
-                "[闸门2.9/under余量] ✅ 通过 match=%s | %s line=%s total=%d mins=%s margin=%s",
+                "[D1/under余量] ✅ 通过 match=%s | %s line=%s total=%d mins=%s margin=%s",
                 mid, sport_l, total_line, current_total, played_mins,
                 round(total_line - current_total, 2) if total_line is not None else None,
             )
 
-        # ── 闸门2.10：近期真实胜率自适应（按已结算输赢动态收紧置信度阈值）──
-        try:
-            from app.services.bet_settlement import recent_betting_stats
-
-            stats = await recent_betting_stats(days=7)
-            settled_n = int(stats.get("settled") or 0)
-            win_rate = stats.get("win_rate")
-            if settled_n >= 5 and isinstance(win_rate, (int, float)):
-                if win_rate < 0.35:
-                    adaptive_bump = 0.10
-                elif win_rate < 0.45:
-                    adaptive_bump = 0.05
-                else:
-                    adaptive_bump = 0.0
-                if adaptive_bump > 0:
-                    bumped = min_conf + adaptive_bump
-                    logger.info(
-                        "[闸门2.10/胜率自适应] match=%s | 近7天%d结算胜率%.1f%%<45%% | min_conf %.2f→%.2f",
-                        mid, settled_n, win_rate * 100, min_conf, bumped,
-                    )
-                    if conf_f < bumped:
-                        return self._reject(
-                            match_info, analysis,
-                            f"近期胜率过低({win_rate * 100:.0f}%)，置信度需≥{bumped:.2f}（当前{conf_f:.2f}）",
-                        )
-                else:
-                    logger.info(
-                        "[闸门2.10/胜率自适应] ✅ 通过 match=%s | 近7天%d结算胜率%.1f%% 正常",
-                        mid, settled_n, win_rate * 100,
-                    )
-            else:
-                logger.info(
-                    "[闸门2.10/胜率自适应] 跳过 match=%s | 样本不足(%s结算)",
-                    mid, settled_n,
-                )
-        except Exception as e:
-            logger.warning("[闸门2.10/胜率自适应] 统计加载失败(跳过): %s", e)
-
-        # ── 闸门3：赔率区间检查 ──
+        # ══════════════════════════════════════════════════════════
+        # 阶段E：赔率有效性（区间检查 + 来源回显）
+        # ══════════════════════════════════════════════════════════
         odds_raw_over = odds_data.get("over")
         odds_raw_under = odds_data.get("under")
         odds_from_analysis = analysis.get("odds")
@@ -520,7 +475,7 @@ class StrategyEngine:
             odds = 0.0
         odds_source = "odds_data" if odds_data.get(prediction) else ("analysis" if odds_from_analysis else "无来源")
         logger.info(
-            "[闸门3/赔率] match=%s | 取值=%.4f 来源=%s | "
+            "[E1/赔率] match=%s | 取值=%.4f 来源=%s | "
             "odds_data={over:%s, under:%s} analysis.odds=%s | "
             "区间[%.2f, %.2f]",
             mid, odds, odds_source,
@@ -529,24 +484,24 @@ class StrategyEngine:
         )
         if odds <= 1.0:
             logger.info(
-                "[闸门3/赔率] ❌ 拒绝 match=%s | 赔率=%.4f 无效(≤1.0) | 来源=%s | odds_data=%s analysis.odds=%s",
+                "[E1/赔率] ❌ 拒绝 match=%s | 赔率=%.4f 无效(≤1.0) | 来源=%s | odds_data=%s analysis.odds=%s",
                 mid, odds, odds_source, odds_data, odds_from_analysis,
             )
             return self._reject(match_info, analysis, f"赔率无效: {odds}")
         if odds < min_odds_cfg:
             logger.info(
-                "[闸门3/赔率] ❌ 拒绝 match=%s | 赔率=%.4f < 最低=%.2f | 差距=%.4f | 来源=%s",
+                "[E1/赔率] ❌ 拒绝 match=%s | 赔率=%.4f < 最低=%.2f | 差距=%.4f | 来源=%s",
                 mid, odds, min_odds_cfg, min_odds_cfg - odds, odds_source,
             )
             return self._reject(match_info, analysis, f"赔率 {odds} 低于最低 {min_odds_cfg}")
         if odds > max_odds_cfg:
             logger.info(
-                "[闸门3/赔率] ❌ 拒绝 match=%s | 赔率=%.4f > 最高=%.2f | 超出=%.4f | 来源=%s",
+                "[E1/赔率] ❌ 拒绝 match=%s | 赔率=%.4f > 最高=%.2f | 超出=%.4f | 来源=%s",
                 mid, odds, max_odds_cfg, odds - max_odds_cfg, odds_source,
             )
             return self._reject(match_info, analysis, f"赔率 {odds} 高于最高 {max_odds_cfg}")
         logger.info(
-            "[闸门3/赔率] ✅ 通过 match=%s | 赔率=%.4f 在区间[%.2f, %.2f]内 | 来源=%s",
+            "[E1/赔率] ✅ 通过 match=%s | 赔率=%.4f 在区间[%.2f, %.2f]内 | 来源=%s",
             mid, odds, min_odds_cfg, max_odds_cfg, odds_source,
         )
 
