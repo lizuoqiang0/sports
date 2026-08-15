@@ -1608,9 +1608,6 @@ class MatchAnalyzer:
             "value_bets": [],
             "risk_level": "high",
             "consensus_reached": False,
-            "consensus_votes": {},
-            "consensus_ratio": 0.0,
-            "ensemble": [],
             "models_used": [],
             "models_failed": [],
         }

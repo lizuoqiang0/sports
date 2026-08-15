@@ -1387,11 +1387,6 @@ async def analyze_and_recommend(
             "fixture_key": fk,
             "extra_data": dict(match.extra_data or {}) if isinstance(match.extra_data, dict) else {},
         }
-        match_info["preferred_bet_type"] = "total"
-        try:
-            ed = match_info["extra_data"]
-        except Exception:
-            pass
         # 足球：胜负/让球/大小；篮球：大小
         from app.ai.market_recommend import load_all_market_odds_pack
 
@@ -1564,23 +1559,19 @@ async def analyze_and_recommend(
             ctx_bits.append(f"交锋/近10场/积分:暂无数据(源:{src})")
         ctx_note = "[" + " | ".join(ctx_bits) + "] "
 
-        failed = analysis.get("models_failed") or []
-        fail_note = ""
-        if failed:
-            fail_note = f"[失败模型: {', '.join(str(x) for x in failed[:6])}] "
         err = str(analysis.get("error") or "")
         quota_hit = any(
-            x in (err + fail_note + str(analysis.get("reasoning") or "")).lower()
-            for x in ("401008", "quota", "额度", "402", "rate limit", "429", "exhausted")
+            x in (err + str(analysis.get("reasoning") or "")).lower()
+            for x in ("quota", "额度", "rate limit", "429", "exhausted")
         )
 
         if llm_down:
             # 真正无可用模型 / 超时：可展示盘口启发式，但禁止放行共识门禁
             why = "LLM 暂不可用"
-            if "timeout" in err.lower() or err == "ensemble_timeout":
+            if "timeout" in err.lower():
                 why = "LLM 分析超时"
             elif quota_hit:
-                why = "部分模型额度耗尽/未开通后付费"
+                why = "模型额度耗尽/未开通后付费"
             analysis = {
                 **analysis,
                 "confidence": min(float(conf0 or 0), 0.49),
@@ -1588,7 +1579,6 @@ async def analyze_and_recommend(
                 "should_bet": False,
                 "reasoning": (
                     f"[盘口启发式·不可下单] {why}，共识未通过，仅供参考。 "
-                    + fail_note
                     + ctx_note
                     + str(analysis.get("reasoning") or "")
                 )[:500],
@@ -1600,7 +1590,6 @@ async def analyze_and_recommend(
                 "should_bet": False,
                 "reasoning": (
                     "[共识不足·不可下单] 模型未达共识门槛，禁止放行。 "
-                    + fail_note
                     + ctx_note
                     + str(analysis.get("reasoning") or "")
                 )[:500],
@@ -1616,16 +1605,8 @@ async def analyze_and_recommend(
     async with AsyncSessionLocal() as db:
         conf_use = float(analysis.get("confidence") or conf0 or 0)
         conf_use = max(0.0, min(0.99, conf_use))
-        pref_bt = "total"
-        if pref_bt not in ("total", "moneyline", "spread"):
-            pref_bt = "total"
         pred = str(analysis.get("prediction") or "").lower().strip()
-        allowed_sels = {
-            "total": {"over", "under"},
-            "moneyline": {"home", "away", "draw"},
-            "spread": {"home", "away"},
-        }
-        if pred not in allowed_sels.get(pref_bt, ()):
+        if pred not in ("over", "under"):
             pred = ""
 
         markets = await build_match_market_recommendations(
@@ -1638,17 +1619,16 @@ async def analyze_and_recommend(
             providers_filter=providers_filter,
             min_odds=1.01,
             max_odds=None,
-            preferred_bet_type=pref_bt,
+            preferred_bet_type="total",
         )
         primary_market = next(
-            (m for m in markets if str(m.get("bet_type") or "") == pref_bt),
+            (m for m in markets if str(m.get("bet_type") or "") == "total"),
             None,
         )
         primary = dict((primary_market or {}).get("single") or {})
         bet_type = str(
             (primary_market or {}).get("bet_type")
             or primary.get("bet_type")
-            or pref_bt
             or "total"
         ).lower()
 

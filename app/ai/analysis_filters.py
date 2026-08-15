@@ -138,6 +138,12 @@ def skip_reason_for_match(
     if is_china_match(str(league), str(home), str(away), str(sport)):
         return "china_match"
 
+    # 联赛黑名单前置过滤（青少年/女子赛事）：扫描层直接跳过，省一次 LLM 调用
+    from app.ai.strategy import league_is_blacklisted
+
+    if league_is_blacklisted(str(league)):
+        return "league_blacklisted"
+
     sport_l = str(sport or "").lower()
     check = total_odds_meet_min if require_total_only or sport_l == "basketball" else any_market_odds_meet_min
     if odds_map is not None and not check(odds_map, floor=min_odds, ceiling=max_odds):

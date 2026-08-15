@@ -91,12 +91,6 @@ def filter_recs_by_bet_mode(
         teams = f"{str(rec.get('home_team') or '').lower()} {str(rec.get('away_team') or '').lower()}"
         if excluded and any(x in teams for x in excluded):
             continue
-        sig = ((rec.get("recommendation") or {}).get("signal_scores") or {})
-        if isinstance(sig, dict):
-            if bool(sig.get("severe_conflict")):
-                continue
-            if str(sig.get("verdict") or "").strip().lower() == "reject":
-                continue
         out.append(rec)
 
     def _sort_key(rec: dict):

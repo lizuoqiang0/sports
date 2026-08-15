@@ -65,8 +65,23 @@ SPORT_RISK: dict[str, dict] = {
         "margin_factor": 1.3,
     },
 }
-# 兜底：未知运动按足球参数处理
-SPORT_RISK["default"] = SPORT_RISK["football"]
+# 兜底：未知运动按足球参数处理（注意：深拷贝避免 default 与 football 同对象互改）
+SPORT_RISK["default"] = {k: dict(v) if isinstance(v, dict) else v for k, v in SPORT_RISK["football"].items()}
+
+# 联赛黑名单关键词（实盘教训：青少年/女子联赛进球极不稳定，2026-08-14 该类5注仅1胜）
+# 同时用于：B2 下单闸门（strategy.evaluate_bet）+ 扫描层前置过滤（analysis_filters.skip_reason_for_match）
+LEAGUE_BLACKLIST_KEYWORDS: tuple[str, ...] = (
+    "u19", "u21", "u18", "u20", "u17", "u16",
+    "青年", "青少年", "后备队", "女子", "(女)", "women", "女篮",
+)
+
+
+def league_is_blacklisted(league: str) -> bool:
+    """联赛名是否命中黑名单（青少年/女子等进球不稳定赛事）。"""
+    if not league:
+        return False
+    league_l = str(league).lower()
+    return any(kw in league_l for kw in LEAGUE_BLACKLIST_KEYWORDS)
 
 
 def effective_strategy_from_ai_config(ai_config) -> StrategyConfig:
@@ -397,22 +412,17 @@ class StrategyEngine:
                 )
                 return self._reject(match_info, analysis, f"篮球高线under（line={total_line:.1f}）加时/罚球变数大")
 
-        # ── B2：联赛质量闸门（实盘教训：青少年/女子联赛进球极不稳定，2026-08-14 该类5注仅1胜）──
+        # ── B2：联赛质量闸门（关键词见模块级 LEAGUE_BLACKLIST_KEYWORDS，扫描层已前置过滤，此处兜底）──
         league = str(match_info.get("league") or analysis.get("league") or "")
-        if league:
-            league_l = league.lower()
-            if any(
-                kw in league_l
-                for kw in ("u19", "u21", "u18", "u20", "u17", "u16", "青年", "青少年", "后备队", "女子", "(女)", "women", "女篮")
-            ):
-                logger.info(
-                    "[B2/联赛质量] ❌ 拒绝 match=%s | 青少年/女子联赛进球不稳定 league=%s",
-                    mid, league,
-                )
-                return self._reject(
-                    match_info, analysis,
-                    f"联赛类型风控（{league}：青少年/女子赛事进球波动大）",
-                )
+        if league_is_blacklisted(league):
+            logger.info(
+                "[B2/联赛质量] ❌ 拒绝 match=%s | 青少年/女子联赛进球不稳定 league=%s",
+                mid, league,
+            )
+            return self._reject(
+                match_info, analysis,
+                f"联赛类型风控（{league}：青少年/女子赛事进球波动大）",
+            )
 
         # ── B3：高赔率 under 风险（under 正常水位≤1.95，≥2.0 说明市场强烈看大）──
         try:
