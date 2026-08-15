@@ -518,11 +518,20 @@ async def login(req: LoginRequest):
         )
         if isinstance(result, dict):
             result["lane"] = lane.key
-        # 登录完成立即挂钩抓包（平博）：不等 45s keep-alive，会话一就绪就监听
+        # 登录完成：平博先拉回滚球盘（否则停在个人中心），再挂抓包钩子
         if site_code == "pinnacle" and isinstance(result, dict) and result.get("ok"):
             try:
                 sess = site_sessions.find(base_url=req.base_url, site_code="pinnacle")
                 if sess and sess.page and not sess.page.is_closed():
+                    try:
+                        from app.services.bookmakers.plugins.pinnacle.venue import (
+                            recover_pinnacle_live_list,
+                        )
+
+                        await recover_pinnacle_live_list(sess.page)
+                        logger.info("pinnacle login post-recover to live url=%s", (sess.page.url or "")[:120])
+                    except Exception as e:
+                        logger.warning("pinnacle login recover failed: %s", e)
                     _hook_pinnacle_bet_capture(sess.page)
                     logger.info("pinnacle bet-capture hooked at login (pid=%s)", id(sess.page))
             except Exception:
