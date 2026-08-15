@@ -315,6 +315,36 @@ async def place_site_bet(
                     )
                 except Exception:
                     full_t = ""
+                # 维护横幅 = 过期 DOM 遮罩（站点实际未维护）：goto 直达滚球 URL
+                # 强制全新 SPA 加载即清除，普通 reload 会再次停在遮罩上
+                if ("正在维护" in (full_t or "")) or ("维护中" in (full_t or "")):
+                    try:
+                        from urllib.parse import urlparse
+
+                        from app.services.bookmakers.plugins.pinnacle.venue import (
+                            pinnacle_live_sport_urls,
+                        )
+
+                        raw_u = page.url or ""
+                        pu = urlparse(raw_u if "://" in raw_u else f"https://{raw_u}")
+                        origin = f"{pu.scheme}://{pu.netloc}" if pu.netloc else ""
+                        for dest in pinnacle_live_sport_urls(origin=origin)[:2]:
+                            try:
+                                await page.goto(dest, wait_until="domcontentloaded", timeout=45000)
+                                await page.wait_for_timeout(2500)
+                                break
+                            except Exception:
+                                continue
+                        full_t = await page.evaluate(
+                            "() => ((document.body && document.body.innerText) || '')"
+                        )
+                        logger.warning(
+                            "pinnacle place: maintenance banner cleared via goto url=%s still_banner=%s",
+                            (page.url or "")[:120],
+                            ("维护" in (full_t or "")),
+                        )
+                    except Exception as e:
+                        logger.warning("pinnacle banner goto failed: %s", e)
                 team_visible = bool(
                     (home and home[:4] and home[:4] in (full_t or ""))
                     or (away and away[:4] and away[:4] in (full_t or ""))
@@ -352,8 +382,23 @@ async def place_site_bet(
                         try:
                             cur = page.url or ""
                             logger.warning("pinnacle place: soft reload url=%s", cur[:140])
-                            await page.reload(wait_until="domcontentloaded", timeout=45000)
-                            await page.wait_for_timeout(3500)
+                            # goto 直达滚球 URL（普通 reload 易再停在维护遮罩上）
+                            from urllib.parse import urlparse as _pu
+
+                            from app.services.bookmakers.plugins.pinnacle.venue import (
+                                pinnacle_live_sport_urls as _plsu,
+                            )
+
+                            _r = _pu(cur if "://" in cur else f"https://{cur}")
+                            _org = f"{_r.scheme}://{_r.netloc}" if _r.netloc else ""
+                            _dests = _plsu(origin=_org)[:2] or ([cur] if cur else [])
+                            for dest in _dests:
+                                try:
+                                    await page.goto(dest, wait_until="domcontentloaded", timeout=45000)
+                                    await page.wait_for_timeout(3000)
+                                    break
+                                except Exception:
+                                    continue
                             for text in ("滚球盘", "滚球", "In-Play", "足球"):
                                 try:
                                     loc = page.get_by_text(text, exact=False).first
