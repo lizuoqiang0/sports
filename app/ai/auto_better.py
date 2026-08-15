@@ -1118,10 +1118,27 @@ class AIBettingEngine:
         provider_name_prefer: str = "平博",
         bet_type: BetType = BetType.TOTAL,
     ) -> Optional[Odds]:
-        """优先取指定站盘口行（默认全场大小球）。"""
+        """优先取指定站盘口行（默认全场大小球）。
+
+        canonical=OB 时平博赔率存在兄弟 match_id 名下（跨站同场未合并），
+        扩展查询兄弟场后再按 provider 优先挑选。
+        """
+        match_ids = [int(match_id)]
+        try:
+            from app.models.user import Match
+            from app.services.fixture_key import sibling_match_ids
+
+            m = await db.get(Match, int(match_id))
+            if m is not None:
+                for sid in await sibling_match_ids(db, m):
+                    if sid and int(sid) not in match_ids:
+                        match_ids.append(int(sid))
+        except Exception:
+            pass
+
         result = await db.execute(
             select(Odds).where(
-                Odds.match_id == match_id,
+                Odds.match_id.in_(match_ids),
                 Odds.bet_type == bet_type,
                 Odds.provider == provider_name_prefer,
                 Odds.valid_to.is_(None),
@@ -1132,18 +1149,22 @@ class AIBettingEngine:
             return row
         result = await db.execute(
             select(Odds).where(
-                Odds.match_id == match_id,
+                Odds.match_id.in_(match_ids),
                 Odds.bet_type == bet_type,
                 Odds.valid_to.is_(None),
             )
         )
         odds_list = result.scalars().all()
         if odds_list:
+            # 平博行优先（其 _site 带 API 下单所需 sel_id）
+            for o in odds_list:
+                if str(o.provider or "") == "平博":
+                    return o
             return odds_list[0]
         # 兜底：任意有效行
         result = await db.execute(
             select(Odds).where(
-                Odds.match_id == match_id,
+                Odds.match_id.in_(match_ids),
                 Odds.valid_to.is_(None),
             )
         )
