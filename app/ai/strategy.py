@@ -343,7 +343,10 @@ class StrategyEngine:
         if not has_fundamentals:
             base_req = max(base_req, RISK["under_min_conf_no_fund"])
         if prediction == "over":
-            base_req = max(base_req, RISK["over_min_conf"])
+            # over 非对称折扣：GPT 对 over 的置信度天然低 0.05-0.1（预测未来进球
+            # 不确定性高），同一根 0.60 线会拦光 over（实测 28 under : 0 over）。
+            # 用户线打折 0.05，B1 结构闸门（无基本面禁/高线禁）仍兜底。
+            base_req = max(base_req - 0.05, RISK["over_min_conf"])
 
         adaptive_bump = 0.0
         try:

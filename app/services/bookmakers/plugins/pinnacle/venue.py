@@ -42,16 +42,21 @@ async def recover_pinnacle_live_list(page) -> bool:
     except Exception:
         cur = ""
     # 已在滚球：视为成功，留给调用方就地刮盘（比分由站点自己推送更新）
+    # 就地原则：compact/sports/ 下任意页（soccer/basketball/live）都不再导航——
+    # 采盘走 sports-service API（fetch compact/events），不依赖页面在 /live；
+    # 频繁 goto 会打断用户手动浏览并易致 SPA 白屏
+    cur_l = (cur or "").lower()
+    if "/live" in cur_l or "/compact/sports/" in cur_l:
+        logger.info("pinnacle recover skip (on sports pages) url=%s", cur)
+        return True
     try:
         from app.services.bookmakers.venue_entry import page_already_on_live_board
 
-        if await page_already_on_live_board(page) or "/live" in (cur or "").lower():
+        if await page_already_on_live_board(page):
             logger.info("pinnacle recover skip (already on live) url=%s", cur)
             return True
     except Exception:
-        if "/live" in (cur or "").lower():
-            logger.info("pinnacle recover skip (url /live) url=%s", cur)
-            return True
+        pass
     logger.info("pinnacle recover live list from url=%s", cur)
 
     # 1) 直达滚球 URL（早盘 /sports/soccer 点「滚球」常无效）
