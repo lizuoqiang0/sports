@@ -1,14 +1,10 @@
-"""平博插件实现：滚球 URL / 正文刮取 / 空盘恢复；下单 API 优先（buyV4），回退通用 site_bet。"""
+"""平博插件实现：滚球 URL / 正文刮取 / 空盘恢复；下单走通用 site_bet（UI）。"""
 from __future__ import annotations
 
-import logging
-from decimal import Decimal
 from typing import Any, Optional
 
 from app.services.bookmakers.plugin import BasePlugin
 from app.services.bookmakers.plugins.pinnacle.profile import PROFILE
-
-logger = logging.getLogger(__name__)
 
 
 class PinnaclePlugin(BasePlugin):
@@ -147,38 +143,6 @@ class PinnaclePlugin(BasePlugin):
         from app.services.bookmakers.plugins.pinnacle.venue import pinnacle_live_sport_urls
 
         return pinnacle_live_sport_urls(page_url, origin=origin)
-
-    async def place_bet(
-        self,
-        page: Any,
-        *,
-        base_url: str,
-        session_token: str,
-        match_external_id: str,
-        selection: str,
-        odds: float,
-        stake: Decimal,
-        bet_type: str,
-        odds_data: dict,
-    ) -> Any:
-        """API 优先（buyV4 页面上下文 fetch）；无法构造时回退通用 UI（None）。"""
-        from app.services.bookmakers.plugins.pinnacle.bet_api import api_place_pinnacle
-
-        try:
-            return await api_place_pinnacle(
-                page,
-                base_url=base_url,
-                session_token=session_token,
-                match_external_id=match_external_id,
-                selection=selection,
-                odds=odds,
-                stake=stake,
-                bet_type=bet_type,
-                odds_data=odds_data or {},
-            )
-        except Exception as e:
-            logger.warning("pinnacle api place error, fallback ui: %s", e)
-            return None
 
 
 PLUGIN = PinnaclePlugin()

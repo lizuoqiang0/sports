@@ -820,12 +820,6 @@ class AIBettingEngine:
                 odds_payload = {**odds_payload, "line": line_val, "total": line_val}
             elif bet_type == "spread":
                 odds_payload = {**odds_payload, "line": line_val, "spread": line_val}
-        # 平博 API 下单捕获点击定位用（含队名 token）
-        odds_payload = {
-            **odds_payload,
-            "_home": str(match.home_team or "")[:24],
-            "_away": str(match.away_team or "")[:24],
-        }
 
         try:
             # 优先用数据库最新赔率，其次用决策赔率

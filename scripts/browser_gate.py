@@ -97,10 +97,24 @@ def _hook_pinnacle_bet_capture(page) -> None:
             if any(x in low for x in (".js", ".css", ".png", ".jpg", ".woff", "analytics", "beacon", "log")):
                 return
             body = req.post_data or ""
+            # 会员/下单类接口：连请求头一起记录（逆向鉴权头必需）
+            hdrs = ""
+            if any(x in low for x in ("member-betslip", "bet-placement", "member-service")):
+                try:
+                    h = req.headers
+                    keep = {k: v for k, v in (h or {}).items()
+                            if k.lower() not in ("cookie", "user-agent", "sec-ch-ua", "sec-fetch-site",
+                                                  "sec-fetch-mode", "sec-fetch-dest", "accept-encoding",
+                                                  "accept-language", "connection", "host", "content-length")}
+                    hdrs = "  req_headers=" + str(keep)[:800] + "\n"
+                except Exception:
+                    pass
             with open(_BET_CAPTURE_LOG, "a", encoding="utf-8") as f:
                 ts = __import__("time").strftime("%F %T")
                 f.write(f"\n[{ts}] POST {url}\n")
                 f.write(f"  status={resp.status}\n")
+                if hdrs:
+                    f.write(hdrs)
                 if body:
                     f.write(f"  req_body={body[:2000]}\n")
                 try:
