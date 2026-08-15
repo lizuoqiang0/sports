@@ -178,7 +178,18 @@ async def ui_place_pinnacle_total(
               // 完全无关行的赔率——实测目标格沃古夫点到巴列卡诺）。fail 让上层
               // 重试搜索/其他 frame。
               if (!row) {
-                return { ok: false, why: 'row_not_found', sample: norm((document.body && document.body.innerText) || '').slice(0, 180), how };
+                const bt = norm((document.body && document.body.innerText) || '');
+                // 调试：队名 token 命中情况 + 页面样本
+                const tokHit = (tokens || []).filter((tk) => {
+                  const t2 = norm(tk);
+                  return t2 && t2.length >= 2 && bt.includes(t2);
+                });
+                return {
+                  ok: false, why: 'row_not_found',
+                  tokHit: tokHit.slice(0, 6),
+                  pageTeams: bt.replace(/\s+/g, ' ').slice(200, 700),
+                  how,
+                };
               }
               const scope = row;
               if (row) {
@@ -240,6 +251,49 @@ async def ui_place_pinnacle_total(
         "sideWords": side_words,
         "line": float(line) if line is not None else None,
     }
+
+    # SPA 惰性激活：compact/sports 页可能只渲染头部导航（大厅壳），赛事区需
+    # 用户交互才加载。点击前若主 frame 无赔率数字特征，点「体育」标签激活再等列表。
+    try:
+        async def _body_has_odds() -> bool:
+            try:
+                t = await page.evaluate(
+                    "() => ((document.body && document.body.innerText) || '')"
+                )
+            except Exception:
+                return True
+            import re as _re
+
+            return bool(_re.search(r"(?<![0-9])1\.\d{2,3}(?![0-9])", t or ""))
+
+        if not await _body_has_odds():
+            logger.info("pinnacle ui: body no odds, activate sportsbook tab")
+            for txt in ("体育", "滚球盘", "滚球", "In-Play"):
+                try:
+                    loc = page.get_by_text(txt, exact=False).first
+                    if await loc.count() > 0 and await loc.is_visible():
+                        await loc.click(timeout=2500)
+                        await page.wait_for_timeout(2000)
+                        break
+                except Exception:
+                    continue
+            # 轮询等待 SPA 列表渲染（最多 15s，滚球列表加载有时较慢）
+            for _ in range(10):
+                if await _body_has_odds():
+                    break
+                await page.wait_for_timeout(1500)
+            # 激活后仍无赔率：滚一下触发懒加载再等 5s
+            if not await _body_has_odds():
+                try:
+                    await page.evaluate(
+                        "() => window.scrollTo(0, document.body.scrollHeight / 2)"
+                    )
+                    await page.wait_for_timeout(2500)
+                except Exception:
+                    pass
+    except Exception as e:
+        logger.warning("pinnacle ui: sportsbook activate failed: %s", e)
+
     async def _try_click_all_frames() -> tuple[dict | None, str]:
         try:
             await page.wait_for_timeout(800)
