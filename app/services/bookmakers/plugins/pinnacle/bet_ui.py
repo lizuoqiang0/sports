@@ -232,6 +232,28 @@ async def ui_place_pinnacle_total(
         miss = "ui_miss"
         if not ordered:
             return None, "no_frames"
+
+        # 滚球列表渲染等待：主 frame 文本过短（<1500字）说明 SPA 列表未出
+        # （goto/refresh 后常见），等最多 12s 让列表渲染，避免立即 odds_not_found
+        async def _wait_board_ready() -> None:
+            try:
+                for _ in range(12):
+                    try:
+                        blen = int(
+                            await page.evaluate(
+                                "() => ((document.body && document.body.innerText) || '').length"
+                            )
+                        )
+                    except Exception:
+                        blen = 0
+                    if blen >= 1500:
+                        return
+                    await page.wait_for_timeout(1000)
+            except Exception:
+                pass
+
+        await _wait_board_ready()
+
         for score, fr in ordered:
             if score < -10:
                 continue
