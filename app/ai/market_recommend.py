@@ -202,13 +202,33 @@ async def load_market_matrix(
     if providers_filter:
         allowed = {p for p in allowed if p in providers_filter}
 
+    # 跨站比价：平博赔率存在同场兄弟 match_id 名下（ob/pinnacle 各一条 Match 记录），
+    # 只查 canonical 自己的行会导致矩阵里永远只有 canonical 站 → 比价失效
+    match_ids = [int(match_id)]
+    try:
+        from app.models.user import Match
+        from app.services.fixture_key import sibling_match_ids
+
+        m = await db.get(Match, int(match_id))
+        if m is not None:
+            sib = await sibling_match_ids(db, m)
+            for sid in sib:
+                if sid and int(sid) not in match_ids:
+                    match_ids.append(int(sid))
+    except Exception:
+        match_ids = [int(match_id)]
+
     result = await db.execute(
         select(Odds).where(
             and_(
-                Odds.match_id == match_id,
+                Odds.match_id.in_(match_ids),
                 Odds.bet_type == enum,
                 Odds.valid_to.is_(None),
             )
+        ).order_by(
+            # canonical 站的行优先（盘口线以其为准），同站内最新行优先
+            (Odds.match_id != int(match_id)),
+            Odds.id.desc(),
         )
     )
     matrix: dict[str, dict[str, float]] = {}
