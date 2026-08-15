@@ -1652,7 +1652,7 @@ async def analyze_and_recommend(
             if cell.get("available") and cell.get("odds") and cell.get("selection"):
                 market_odds_flat.setdefault(str(cell["selection"]), float(cell["odds"]))
 
-        analysis_pick_allowed = bool(use_llm) and pred in allowed_sels.get(bet_type, ())
+        analysis_pick_allowed = bool(use_llm) and pred in ("over", "under")
         consensus_ok = True if not use_llm else bool(analysis.get("consensus_reached", True))
         if analysis_pick_allowed:
             sel = str(primary.get("selection") or pred or "").lower()
@@ -1671,7 +1671,7 @@ async def analyze_and_recommend(
                 conf_use = max(0.01, min(0.99, wr))
         except (TypeError, ValueError):
             pass
-        if analysis_pick_allowed and sel in allowed_sels.get(bet_type, ()):
+        if analysis_pick_allowed and sel in ("over", "under"):
             analysis = {
                 **analysis,
                 "prediction": sel,
@@ -1710,7 +1710,7 @@ async def analyze_and_recommend(
         if (
             not analysis_pick_allowed
             or not primary
-            or sel not in allowed_sels.get(bet_type, ())
+            or sel not in ("over", "under")
             or sel_odds <= 1
         ):
             decision = BetDecision(
