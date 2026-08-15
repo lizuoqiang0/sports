@@ -811,6 +811,30 @@ async def ui_place_pinnacle_total(
             if not isinstance(v, dict):
                 continue
             got = v.get("got")
+            # 最低投注额处理：stake 低于站点最低额会被拒单
+            # （实测弹「您的投注不能低于最低投注金额」），自动上调到最低额
+            min_stake_site = v.get("minStake")
+            if (
+                min_stake_site
+                and min_stake_site == min_stake_site
+                and float(min_stake_site) > float(stake)
+                and float(min_stake_site) <= 30.0  # 上调上限，防误读大数
+            ):
+                new_stake = float(min_stake_site)
+                logger.info(
+                    "pinnacle stake below site minimum (%s < %s), raising to minimum",
+                    stake, new_stake,
+                )
+                try:
+                    data = await asyncio.wait_for(fr.evaluate(fill_js, new_stake), timeout=5.0)
+                    if isinstance(data, dict) and data.get("ok"):
+                        await page.keyboard.press("Meta+a")
+                        await page.keyboard.press("Control+a")
+                        await page.keyboard.type(str(new_stake), delay=50)
+                        stake = new_stake
+                        fill_detail = f"filled:{new_stake}:raised_from_min"
+                except Exception:
+                    pass
             if got == got and abs(float(got) - float(stake)) > max(0.2, float(stake) * 0.3):
                 logger.warning("pinnacle stake mismatch want=%s got=%s, refill", stake, got)
                 try:
