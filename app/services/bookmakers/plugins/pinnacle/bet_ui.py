@@ -113,6 +113,8 @@ async def ui_place_pinnacle_total(
               let target = null;
               let rowFallback = null;
               let pureOdds = null;
+              // 滚球赔率漂移兜底：快照 odds ±0.06 找不到时，行内按 side+line 的任意赔率节点
+              let sideLoose = null;
               const scope = row || document.body;
               if (row) {
                 try { row.scrollIntoView({ block: 'center' }); } catch (e) {}
@@ -120,15 +122,20 @@ async def ui_place_pinnacle_total(
               const clickables = Array.from((scope || document).querySelectorAll('button, a, span, div, td, label'));
               for (const el of clickables) {
                 const txt = String(el.innerText || el.textContent || '').trim();
-                if (!oddsTextOk(txt)) continue;
+                // 宽松赔率判定：1.01-50 的纯数字节点（不校验 ±0.06，用于漂移兜底）
+                const looseOddsOk = /^\\d{1,2}\\.\\d{2,3}$/.test(txt.replace(/\\s/g, ''));
+                if (!oddsTextOk(txt) && !looseOddsOk) continue;
                 // 纯赔率数字节点优先（避免点到「小\\n2.21」整块导致投注单不开）
-                if (/^\\d\\.\\d{2,3}$/.test(txt.replace(/\\s/g, ''))) {
+                if (/^\\d{1,2}\\.\\d{2,3}$/.test(txt.replace(/\\s/g, ''))) {
                   const p = el.closest('div, tr, li, section') || el.parentElement;
                   const ctx = String((p && p.innerText) || txt);
                   const hitSide = sideWords.some((w) => ctx.toLowerCase().includes(String(w).toLowerCase()));
                   const hitLine = lineTxt ? ctx.includes(lineTxt) : true;
                   if (hitSide && hitLine) { pureOdds = el; }
+                  // 漂移兜底：side 匹配即可（大小球行内该 side 只有一个赔率）
+                  if (hitSide && !sideLoose) { sideLoose = el; }
                 }
+                if (!oddsTextOk(txt)) continue;
                 let ctx = '';
                 try {
                   const p = el.closest('div, tr, li, section') || el.parentElement;
@@ -149,6 +156,7 @@ async def ui_place_pinnacle_total(
                 if (!target) { target = el; how = (how || 'odds') + '+loose'; }
               }
               if (pureOdds) { target = pureOdds; how = (how || 'odds') + '+pure'; }
+              if (!target && sideLoose) { target = sideLoose; how = (how || 'odds') + '+sideloose'; }
               if (!target && rowFallback) { target = rowFallback; how = (how || 'odds') + '+row'; }
               if (!target) {
                 const body = norm(document.body && document.body.innerText || '');
