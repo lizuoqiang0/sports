@@ -349,6 +349,58 @@ async def place_site_bet(
                     (home and home[:4] and home[:4] in (full_t or ""))
                     or (away and away[:4] and away[:4] in (full_t or ""))
                 )
+                # 球种定向：篮球赛必须到 basketball 滚球页（soccer 页看不到行 → row_not_found）
+                # _site.sport 常缺失，用 sport_id 判定（compact: 29=足球 4=篮球）
+                _site_meta = (odds_data or {}).get("_site") or {}
+                _sport_early = str(_site_meta.get("sport") or "")
+                if not _sport_early:
+                    try:
+                        _sid = int(str(_site_meta.get("sport_id") or 0))
+                        if _sid == 4:
+                            _sport_early = "basketball"
+                        elif _sid == 29:
+                            _sport_early = "football"
+                    except (TypeError, ValueError):
+                        pass
+                if not _sport_early:
+                    _parts = (match_external_id or "").split(":", 1)[-1].split("|")
+                    if len(_parts) >= 2:
+                        _sport_early = _parts[1]
+                if not team_visible and _sport_early == "basketball":
+                    try:
+                        from urllib.parse import urlparse as _pu2
+
+                        _raw = page.url or ""
+                        _p2 = _pu2(_raw if "://" in _raw else f"https://{_raw}")
+                        _org = f"{_p2.scheme}://{_p2.netloc}" if _p2.netloc else ""
+                        _bk = f"{_org}/zh-cn/compact/sports/basketball/live"
+                        if _org and "/basketball" not in (_raw or "").lower():
+                            await page.goto(_bk, wait_until="domcontentloaded", timeout=45000)
+                            await page.wait_for_timeout(5000)
+                            # 触发懒加载：滚到底再回顶
+                            try:
+                                await page.evaluate(
+                                    "() => { window.scrollTo(0, document.body.scrollHeight / 2); }"
+                                )
+                                await page.wait_for_timeout(1500)
+                                await page.evaluate("() => window.scrollTo(0, 0)")
+                                await page.wait_for_timeout(1500)
+                            except Exception:
+                                pass
+                            full_t = await page.evaluate(
+                                "() => ((document.body && document.body.innerText) || '')"
+                            )
+                            team_visible = bool(
+                                (home and home[:4] and home[:4] in (full_t or ""))
+                                or (away and away[:4] and away[:4] in (full_t or ""))
+                            )
+                            logger.warning(
+                                "pinnacle place: goto basketball live team_visible=%s url=%s",
+                                team_visible,
+                                (page.url or "")[:120],
+                            )
+                    except Exception as e:
+                        logger.warning("pinnacle basketball goto failed: %s", e)
                 # 仅有导航壳/无目标队名时，强制软刷新拉起盘口列表
                 shell_only = (
                     ("电子竞技" in (full_t or "") or "真人娱乐场" in (full_t or ""))
@@ -434,6 +486,16 @@ async def place_site_bet(
             parts = (match_external_id or "").split(":", 1)[-1].split("|")
             if len(parts) >= 2:
                 sport = parts[1]
+        if not sport:
+            # _site.sport 常缺失：compact sport_id 映射（29=足球 4=篮球）
+            try:
+                _sid2 = int(str(((odds_data or {}).get("_site") or {}).get("sport_id") or 0))
+                if _sid2 == 4:
+                    sport = "basketball"
+                elif _sid2 == 29:
+                    sport = "football"
+            except (TypeError, ValueError):
+                pass
 
         ui_ok = False
         ui_detail = ""

@@ -63,6 +63,46 @@ async def ui_place_pinnacle_total(
     seen: set[str] = set()
     tokens = [x for x in tokens if not (x in seen or seen.add(x))]
 
+    # 球种定向：篮球赛需要篮球滚球列表（soccer 页无该行 → row_not_found）。
+    # basketball/live 直达 URL 常渲染空（SPA 惰性），优先 URL 直达+侧栏点击双保险。
+    try:
+        cur_url = (page.url or "").lower()
+        if sport_l == "basketball" and "/basketball" not in cur_url:
+            from urllib.parse import urlparse
+
+            pu = urlparse(page.url or "")
+            org = f"{pu.scheme}://{pu.netloc}" if pu.netloc else ""
+            if org:
+                try:
+                    await page.goto(
+                        f"{org}/zh-cn/compact/sports/basketball/live",
+                        wait_until="domcontentloaded",
+                        timeout=45000,
+                    )
+                    await page.wait_for_timeout(4000)
+                except Exception as e:
+                    logger.warning("pinnacle ui: basketball goto err: %s", e)
+                # 页面空则点侧栏「篮球」标签激活 SPA
+                try:
+                    body_len = await page.evaluate(
+                        "() => ((document.body && document.body.innerText) || '').length"
+                    )
+                    if int(body_len or 0) < 3000:
+                        for txt in ("篮球", "Basketball"):
+                            try:
+                                loc = page.get_by_text(txt, exact=False).first
+                                if await loc.count() > 0 and await loc.is_visible():
+                                    await loc.click(timeout=2000)
+                                    await page.wait_for_timeout(3500)
+                                    break
+                            except Exception:
+                                continue
+                except Exception:
+                    pass
+                logger.info("pinnacle ui: goto basketball done url=%s", (page.url or "")[:100])
+    except Exception as e:
+        logger.warning("pinnacle ui: basketball nav failed: %s", e)
+
     click_js = """(args) => {
               const { tokens, odds, sideWords, line } = args;
               const norm = (s) => String(s || '').replace(/\\s+/g, '').toLowerCase();
