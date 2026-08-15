@@ -138,34 +138,23 @@ async (args) => {
             const periods = (ev[8] && typeof ev[8] === 'object') ? ev[8] : {};
             const p0 = periods['0'] || periods[0];
             if (!Array.isArray(p0)) continue;
-            // p0[1] 大小线列表: [line, ?, over, under, selId, ?, ?, ..., alt?]
+            // p0[1] 大小线列表: [线, 线, over, under, selId, 主盘标志, ?, ?]
+            // row[5]=='1' 是主盘（实时线）；'0' 是历史/次线。选错会 INVALID_REQUEST_DATA
             const rows = Array.isArray(p0[1]) ? p0[1] : [];
             let mainRow = null;
             for (const row of rows) {
               if (!Array.isArray(row) || row.length < 5) continue;
-              const alt = row[5] !== undefined ? row[5] : 0;
-              if (alt === 0) { mainRow = row; break; }
+              if (String(row[5]) === '1') { mainRow = row; break; }
               if (!mainRow) mainRow = row;
             }
             if (!mainRow) continue;
-            let line = mainRow[0];
-            // 复合线（如 "1.5-2"）：oddsId 尾段可能不认，优先改取该行主段
-            let lineIsCompound = false;
-            if (typeof line === 'string' && line.includes('-')) {
-              lineIsCompound = true;
-              const head = line.split('-')[0];
-              // 找同列表里是否有以 head 开头的单线行
-              for (const row of rows) {
-                if (!Array.isArray(row) || row.length < 5) continue;
-                if (String(row[0]) === String(head)) { mainRow = row; line = row[0]; lineIsCompound = false; break; }
-              }
-              if (lineIsCompound) line = head;  // 兜底：直接用主段
-            }
-            const over = mainRow[2];
-            const under = mainRow[3];
+            // compact 返回的线/赔率可能是字符串，统一转数字
+            const line = Number(mainRow[0]);
+            const over = Number(mainRow[2]);
+            const under = Number(mainRow[3]);
             const selId = String(mainRow[4] || '');
             const isLive = !!(ev[5] || ev[6] || ev[15] || ev[16]);
-            target = { line, over, under, selId, isLive, lineIsCompound };
+            target = { line, over, under, selId, isLive };
           }
         }
       }
@@ -186,135 +175,72 @@ async (args) => {
     return { stage: 'odds', error: 'price_invalid', target, oddsId };
   }
 
-  // 3) 干跑 all-odds-selections：验证 oddsId + 回读规范 selectionId
-  // selectionId 样本: {裸id}|{mid}|0|3|{period}|1|{线}|{flag} = 裸id + oddsId 全段 + flag（8段）
-  const probeSel = `${target.selId || 0}|${oddsId}|${target.isLive ? 0 : 1}`;
-  const pr = await post(
-    `/member-betslip/v2/all-odds-selections?locale=zh_CN&_=${ts()}&withCredentials=true`,
-    { oddsSelections: [{ oddsFormat: 1, oddsId, oddsSelectionsType: 'NORMAL', selectionId: probeSel }] },
-  );
-  if (pr.status !== 200) {
-    // 干跑被拒：降级为「站点选中捕获」——点击赔率节点让站点自己发
-    // all-odds-selections，hook 捕获真实 payload（服务器认可的 oddsId/selectionId）
-    let captured = null;
-    const origFetch = window.fetch;
-    const origXO = XMLHttpRequest.prototype.open;
-    const onBody = (url, bodyStr) => {
-      try {
-        if (String(url).indexOf('all-odds-selections') >= 0 && bodyStr) {
-          const b = JSON.parse(bodyStr);
-          if (b && Array.isArray(b.oddsSelections) && b.oddsSelections.length) {
-            captured = b.oddsSelections[0];
-          }
-        }
-      } catch (e) {}
-    };
-    window.fetch = async function(u, opts) {
-      try {
-        if (opts && opts.body && String(u).indexOf('all-odds-selections') >= 0) {
-          onBody(String(u), typeof opts.body === 'string' ? opts.body : String(opts.body));
-        }
-      } catch (e) {}
-      return origFetch.apply(this, arguments);
-    };
-    XMLHttpRequest.prototype.open = function(m, u) {
-      this.addEventListener('loadstart', () => {});
-      const self = this;
-      const origSend = this.send;
-      this.send = function(b) {
-        try { if (String(u).indexOf('all-odds-selections') >= 0 && b) onBody(String(u), String(b)); } catch (e) {}
-        return origSend.apply(this, arguments);
-      };
-      return origXO.apply(this, arguments);
-    };
-    try {
-      // 点击目标 side 的赔率节点（限定在含目标队名的行内）
-      const norm = (s) => String(s || '').replace(/\s+/g, '');
-      const sideZh = side === 'over' ? '大' : '小';
-      const rows = Array.from(document.querySelectorAll('div,tr,li'));
-      let host = null;
-      for (const r of rows) {
-        const t = norm(r.innerText || '');
-        if (t.length < 5 || t.length > 500) continue;
-        const teamsOk = (args.homeTok && t.indexOf(norm(args.homeTok)) >= 0) || (args.awayTok && t.indexOf(norm(args.awayTok)) >= 0);
-        if (teamsOk) { host = r; break; }
+  // 3) 直接 buyV4 提交（构造 selectionId；服务器格式错会 400 明确拒绝，不会误下单）
+  //    selectionId 精确结构（成功样本逆向）：
+  //      9段 = 裸id | mid | s2 | 3 | period | 1 | line2位 | flag
+  //      其中 (mid, s2, 3, period, 1, line) 就是 oddsId 的 6 段原样，
+  //      flag = s2（女王公园滚球样本 s2=0 flag=0；17:14 样本 s2=1 flag=1）
+  //    period 推断：滚球=3，非滚球=4（样本归纳，多候选重试兜底）
+  const cands = [];
+  const line2 = Number(target.line).toFixed(2);
+  // selectionId 段5 = 方向位（成功样本逆向：女王公园under样本=0，17:14 over样本=1）
+  const dirSeg = side === 'over' ? '1' : '0';
+  const mkSel = (s2v, per) => `${target.selId || 0}|${mid}|${s2v}|3|${per}|${dirSeg}|${line2}|${s2v}`;
+  const selMain = String(target.selId || '');
+  if (selMain) {
+    for (const s2v of ['0', '1']) {
+      for (const per of ['0', '3', '4']) {
+        cands.push(mkSel(s2v, per));
       }
-      if (host) {
-        const cells = Array.from(host.querySelectorAll('button,a,span,div,td,label'));
-        let pick = null;
-        for (const c of cells) {
-          const t = String(c.innerText || '').trim();
-          if (!/^\d{1,2}\.\d{2,3}$/.test(t.replace(/\s/g, ''))) continue;
-          const p = c.closest('div,tr,li') || c.parentElement;
-          const ctx = String((p && p.innerText) || t);
-          if (ctx.indexOf(sideZh) >= 0 || ctx.toLowerCase().indexOf(side) >= 0) { pick = c; break; }
-        }
-        if (pick) {
-          pick.click();
-          for (let i = 0; i < 20 && !captured; i++) {
-            await new Promise((res) => setTimeout(res, 200));
-          }
-        }
-      }
-    } finally {
-      window.fetch = origFetch;
-      XMLHttpRequest.prototype.open = origXO;
     }
-    if (!captured) {
-      return { stage: 'probe', status: pr.status, body: pr.body.slice(0, 300), oddsId, rejected: true, target, captureFailed: true };
-    }
-    // 用站点自己的 payload 提交
-    const realOddsId = String(captured.oddsId || oddsId);
-    const realSelId = String(captured.selectionId || probeSel);
-    const selPayload2 = {
+  }
+  const triedFormats = [];
+  let lastPlace = null;
+  for (const cand of cands) {
+    // oddsId/selectionId 同构：s2、period、线段完全一致；线段统一 2 位小数
+    // （compact 大线值可能是 "104" 整数形式，真实线 104.5——必须规范化）
+    const seg = cand.split('|');
+    const oid = `${mid}|${seg[2]}|3|${seg[4]}|1|${line2}`;
+    const selPayload = {
       odds: price.toFixed(3),
-      oddsId: realOddsId,
-      selectionId: realSelId,
+      oddsId: oid,
+      selectionId: cand,
       stake,
       uniqueRequestId: uuid(),
       wagerType: 'NORMAL',
       betLocationTracking: args.tracking || {},
       winRiskStake: 'RISK',
     };
-    const place2 = await post(
+    const place = await post(
       `/bet-placement/buyV4?uniqueRequestId=${uuid()}&locale=zh_CN&_=${ts()}&withCredentials=true`,
-      { acceptBetterOdds: true, oddsFormat: 1, selections: [selPayload2] },
+      { acceptBetterOdds: true, oddsFormat: 1, selections: [selPayload] },
     );
-    return {
-      stage: 'place', status: place2.status, body: place2.body.slice(0, 1500),
-      json: place2.json, oddsId: realOddsId, price, line: target.line,
-      selId: target.selId, canonicalSel: realSelId, via: 'capture',
-      liveOdds: { over: target.over, under: target.under }, wantOdds,
-    };
+    triedFormats.push({ selId: cand.slice(0, 70), oddsId: oid, status: place.status, body: place.body.slice(0, 100) });
+    lastPlace = { ...place, _oid: oid };
+    // 200 且业务成功（无 errorCode）= 成交
+    const bizOk = place.status === 200 && place.body.indexOf('errorCode') < 0;
+    if (bizOk) {
+      return {
+        stage: 'place', status: place.status, body: place.body.slice(0, 1500),
+        json: place.json, oddsId: oid, price, line: target.line,
+        selId: target.selId, canonicalSel: cand, via: 'direct',
+        liveOdds: { over: target.over, under: target.under }, wantOdds,
+        triedFormats,
+      };
+    }
+    // 业务拒绝（200+errorCode）→ 继续尝试下一候选格式
+    if (place.status === 200) continue;
+    // 非 400 的失败（403/5xx）不必再试其他格式
+    if (place.status !== 400) break;
   }
-  // 回读规范 selectionId
-  let canonicalSel = null;
-  try {
-    const d = pr.json && (pr.json.data !== undefined ? pr.json.data : pr.json);
-    const arr = Array.isArray(d) ? d : (d && Array.isArray(d.oddsSelections) ? d.oddsSelections : null);
-    if (arr && arr.length) canonicalSel = String(arr[0].selectionId || '') || null;
-  } catch (e) {}
-
-  // 4) buyV4 提交
-  const selPayload = {
-    odds: price.toFixed(3),
-    oddsId,
-    selectionId: canonicalSel || probeSel,
-    stake,
-    uniqueRequestId: uuid(),
-    wagerType: 'NORMAL',
-    betLocationTracking: args.tracking || {},
-    winRiskStake: 'RISK',
-  };
-  const place = await post(
-    `/bet-placement/buyV4?uniqueRequestId=${uuid()}&locale=zh_CN&_=${ts()}&withCredentials=true`,
-    { acceptBetterOdds: true, oddsFormat: 1, selections: [selPayload] },
-  );
   return {
-    stage: 'place', status: place.status, body: place.body.slice(0, 1500),
-    json: place.json, oddsId, price, line: target.line, selId: target.selId,
-    canonicalSel, liveOdds: { over: target.over, under: target.under },
-    wantOdds,
+    stage: 'place', status: lastPlace ? lastPlace.status : 0,
+    body: (lastPlace && lastPlace.body || '').slice(0, 1500),
+    json: lastPlace ? lastPlace.json : null,
+    oddsId: lastPlace ? lastPlace._oid : '', price, line: target.line,
+    selId: target.selId, canonicalSel: null, via: 'direct',
+    liveOdds: { over: target.over, under: target.under }, wantOdds,
+    triedFormats,
   };
 }
 """
@@ -373,13 +299,11 @@ async def api_place_pinnacle(
         return None
     stage = str(res.get("stage") or "")
 
-    if stage in ("odds", "probe"):
-        # 未下单：实时盘没找到 / 干跑被拒 → 安全回退 UI
+    if stage == "odds":
+        # 未下单：实时盘没找到 → 安全回退 UI
         logger.info(
-            "pinnacle api place %s: %s | oddsId=%s detail=%s | events=%s mids=%s",
-            stage, res.get("error") or res.get("status"), res.get("oddsId"),
-            str(res.get("body") or "")[:150],
-            res.get("totalEvents"), res.get("liveMids"),
+            "pinnacle api place odds: %s | mid=%s events=%s mids=%s",
+            res.get("error"), mid, res.get("totalEvents"), res.get("liveMids"),
         )
         return None
 
@@ -389,6 +313,7 @@ async def api_place_pinnacle(
     live_price = float(res.get("price") or 0)
     want = float(res.get("wantOdds") or 0)
 
+    # 200 = 已提交：语义上 success 或含 bettingItems 才算成交
     ok = False
     ext_bet = ""
     if status == 200 and isinstance(j, dict):
@@ -401,6 +326,9 @@ async def api_place_pinnacle(
                 ok = True
             elif data.get("success") is True:
                 ok = True
+            else:
+                # 200 但无成功标志：可能全部格式被业务层拒绝（如下线/停盘）
+                ok = False
 
     if ok:
         logger.info(
@@ -413,10 +341,13 @@ async def api_place_pinnacle(
             external_bet_id=ext_bet or None,
         )
 
-    # 已提交但失败（可能含风控拒单）：不回退 UI（防重复下单），返回原文
+    # 全部格式失败：业务拒绝(200+errorCode)或非400 → 已尽力，返回明确失败
+    # （多个候选都试过后仍拒绝，多为盘口关闭/限额/风控，UI 兜底大概率同样被拒，
+    #   但 UI 有机会走人工确认流程，交给上层重试策略）
+    tried = res.get("triedFormats") or []
     logger.warning(
-        "pinnacle api place failed: status=%s body=%s oddsId=%s",
-        status, body, res.get("oddsId"),
+        "pinnacle api place failed: status=%s body=%s oddsId=%s tried=%s",
+        status, body[:200], res.get("oddsId"), tried,
     )
     return PlaceBetResult(
         ok=False,
