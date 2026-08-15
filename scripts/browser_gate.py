@@ -434,6 +434,13 @@ async def login(req: LoginRequest):
                     fast=True,
                 )
                 if probe.get("ok"):
+                    # 复用成功立即挂钩抓包（平博）
+                    if site_code == "pinnacle":
+                        try:
+                            _hook_pinnacle_bet_capture(existing.page)
+                            logger.info("pinnacle bet-capture hooked at login-reuse (pid=%s)", id(existing.page))
+                        except Exception:
+                            pass
                     try:
                         vu = existing.venue_url or (existing.page.url or "")
                     except Exception:
@@ -511,6 +518,15 @@ async def login(req: LoginRequest):
         )
         if isinstance(result, dict):
             result["lane"] = lane.key
+        # 登录完成立即挂钩抓包（平博）：不等 45s keep-alive，会话一就绪就监听
+        if site_code == "pinnacle" and isinstance(result, dict) and result.get("ok"):
+            try:
+                sess = site_sessions.find(base_url=req.base_url, site_code="pinnacle")
+                if sess and sess.page and not sess.page.is_closed():
+                    _hook_pinnacle_bet_capture(sess.page)
+                    logger.info("pinnacle bet-capture hooked at login (pid=%s)", id(sess.page))
+            except Exception:
+                pass
         return result
     except Exception as e:
         return {
