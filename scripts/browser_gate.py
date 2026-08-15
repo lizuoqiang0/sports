@@ -68,6 +68,56 @@ from app.services.bookmakers.site_session import site_sessions
 _KEEP_REFRESH_SEC = 45  # 拉长保活间隔，少与盘口同步抢车道
 _refresh_task: asyncio.Task | None = None
 
+# ── 平博下单接口抓包（一次性任务：挂监听后由用户手动完成一次真实下单）──
+_BET_CAPTURE_LOG = "/tmp/pinnacle_bet_capture.log"
+_bet_capture_hooked: set[int] = set()  # 已挂钩的 page hash，防重复
+
+
+def _hook_pinnacle_bet_capture(page) -> None:
+    """给平博长连接页挂全量 XHR 监听，捕获下单接口端点/payload/回执。
+
+    只记 POST（下单必然 POST），过滤静态资源；写 /tmp/pinnacle_bet_capture.log。
+    成功捕获 bet 相关端点后可移除此钩子。
+    """
+    if page is None or page.is_closed():
+        return
+    key = id(page)
+    if key in _bet_capture_hooked:
+        return
+    _bet_capture_hooked.add(key)
+
+    def _on_response(resp):
+        try:
+            req = resp.request
+            if req.method.upper() != "POST":
+                return
+            url = req.url or ""
+            # 过滤明显非业务请求
+            low = url.lower()
+            if any(x in low for x in (".js", ".css", ".png", ".jpg", ".woff", "analytics", "beacon", "log")):
+                return
+            body = req.post_data or ""
+            with open(_BET_CAPTURE_LOG, "a", encoding="utf-8") as f:
+                ts = __import__("time").strftime("%F %T")
+                f.write(f"\n[{ts}] POST {url}\n")
+                f.write(f"  status={resp.status}\n")
+                if body:
+                    f.write(f"  req_body={body[:2000]}\n")
+                try:
+                    # 同步读取响应体（小响应可接受）
+                    rb = resp.text()[:2000] if resp.status < 400 else ""
+                    if rb:
+                        f.write(f"  resp_body={rb}\n")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    try:
+        page.on("response", _on_response)
+    except Exception:
+        pass
+
 
 async def _keep_sessions_refresh_loop() -> None:
     """
@@ -108,6 +158,9 @@ async def _keep_sessions_refresh_loop() -> None:
                         pass
                 base = sess.base_url or ""
                 try:
+                    # 平博页挂下单接口抓包（一次性任务，见 _hook_pinnacle_bet_capture）
+                    if code == "pinnacle" and sess.page and not sess.page.is_closed():
+                        _hook_pinnacle_bet_capture(sess.page)
                     # 绝对禁止 goto/reload：只探测存活 + 刮余额 + 动态记下当前 URL
                     ok = await site_sessions.refresh(base, force=False, site_code=code)
                     if not ok:
