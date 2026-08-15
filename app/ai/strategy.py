@@ -478,6 +478,24 @@ class StrategyEngine:
             mid, mkt_support, prediction, mkt_strength,
         )
 
+        # C2 高置信度加验：GPT 过度自信失准防护
+        # 实盘统计（3天26单）：conf>=0.65 胜率仅 25%（1/4），中置信 0.55-0.65 反而 68%。
+        # 高置信单要求盘口方向必须同向（neutral 视为无验证），否则降级到 0.55 档：
+        # - 仓位随降级 conf 缩小（不满仓）
+        # - 不直接拒绝，保留信号机会
+        conf_hi_threshold = 0.65
+        if conf_f >= conf_hi_threshold and mkt_support != prediction:
+            logger.info(
+                "[C2/高置信加验] ⚠️ 降级 match=%s | conf=%.2f>=%.2f 但盘口%s≠预测%s | conf→0.55",
+                mid, conf_f, conf_hi_threshold, mkt_support, prediction,
+            )
+            analysis = {**analysis, "confidence": 0.55}
+            confidence = 0.55
+            conf_f = 0.55
+            self._c2_downgraded = True  # 供日志/通知标记
+        else:
+            self._c2_downgraded = False
+
         # ══════════════════════════════════════════════════════════
         # 阶段D：滚球余量（仅 under，中后段余量不足以覆盖剩余期望 → 拒绝）
         #   实盘教训：bet58 下48' 1球押 under2.5，终场3球破线
