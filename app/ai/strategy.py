@@ -397,6 +397,38 @@ class StrategyEngine:
                 )
                 return self._reject(match_info, analysis, f"篮球高线under（line={total_line:.1f}）加时/罚球变数大")
 
+        # ── B2：联赛质量闸门（实盘教训：青少年/女子联赛进球极不稳定，2026-08-14 该类5注仅1胜）──
+        league = str(match_info.get("league") or analysis.get("league") or "")
+        if league:
+            league_l = league.lower()
+            if any(
+                kw in league_l
+                for kw in ("u19", "u21", "u18", "u20", "u17", "u16", "青年", "青少年", "后备队", "女子", "(女)", "women", "女篮")
+            ):
+                logger.info(
+                    "[B2/联赛质量] ❌ 拒绝 match=%s | 青少年/女子联赛进球不稳定 league=%s",
+                    mid, league,
+                )
+                return self._reject(
+                    match_info, analysis,
+                    f"联赛类型风控（{league}：青少年/女子赛事进球波动大）",
+                )
+
+        # ── B3：高赔率 under 风险（under 正常水位≤1.95，≥2.0 说明市场强烈看大）──
+        try:
+            sel_odds_f = float(odds_data.get(prediction) or analysis.get("odds") or 0)
+        except (TypeError, ValueError):
+            sel_odds_f = 0.0
+        if prediction == "under" and sel_odds_f >= 2.0:
+            logger.info(
+                "[B3/高赔率under] ❌ 拒绝 match=%s | under赔率=%.2f ≥2.0 市场强烈看大",
+                mid, sel_odds_f,
+            )
+            return self._reject(
+                match_info, analysis,
+                f"under赔率过高（{sel_odds_f:.2f}，市场强烈看大球）",
+            )
+
         # ══════════════════════════════════════════════════════════
         # 阶段C：市场一致性（盘口变化方向）
         #   C1 市场降/升盘方向与预测相反 → 拒绝
