@@ -122,7 +122,6 @@ async def ui_place_pinnacle_total(
               let pureOdds = null;
               // 滚球赔率漂移兜底：快照 odds ±0.06 找不到时，行内按 side+line 的任意赔率节点
               let sideLoose = null;
-              const scope = row || document.body;
               // 行级队名校验：目标行必须真正包含目标队名（长 token），否则禁止任何点击
               // （防「陶朗加市」2字片段误中「普雷斯顿」等无关行的赔率）
               let rowHasTeam = false;
@@ -135,6 +134,13 @@ async def ui_place_pinnacle_total(
               if (row && !rowHasTeam) {
                 return { ok: false, why: 'row_team_mismatch', sample: norm(row.innerText || '').slice(0, 120), how };
               }
+              // 无任何行含队名 token：禁止全页兜底（loose/sideloose 会扫全页点到
+              // 完全无关行的赔率——实测目标格沃古夫点到巴列卡诺）。fail 让上层
+              // 重试搜索/其他 frame。
+              if (!row) {
+                return { ok: false, why: 'row_not_found', sample: norm((document.body && document.body.innerText) || '').slice(0, 180), how };
+              }
+              const scope = row;
               if (row) {
                 try { row.scrollIntoView({ block: 'center' }); } catch (e) {}
               }
