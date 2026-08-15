@@ -104,6 +104,13 @@ async def ui_place_pinnacle_total(
                     const raw = String(el.innerText || '');
                     if (!raw.includes(lineTxt)) continue;
                     if (raw.length < 4 || raw.length > 900) continue;
+                    // line 兜底也必须含队名：盘口线数字（如2.5）全站大量重复，禁止点错行
+                    const rawN = norm(raw);
+                    const hasTeam = (tokens || []).some((tk) => {
+                      const t3 = norm(tk);
+                      return t3 && t3.length >= 3 && rawN.includes(t3);
+                    });
+                    if (!hasTeam) continue;
                     if (!row || raw.length < (row.innerText || '').length) {
                       row = el; how = 'line:' + lineTxt;
                     }
@@ -116,6 +123,18 @@ async def ui_place_pinnacle_total(
               // 滚球赔率漂移兜底：快照 odds ±0.06 找不到时，行内按 side+line 的任意赔率节点
               let sideLoose = null;
               const scope = row || document.body;
+              // 行级队名校验：目标行必须真正包含目标队名（长 token），否则禁止任何点击
+              // （防「陶朗加市」2字片段误中「普雷斯顿」等无关行的赔率）
+              let rowHasTeam = false;
+              if (row) {
+                for (const tok of (tokens || [])) {
+                  const tn2 = norm(tok);
+                  if (tn2 && tn2.length >= 3 && norm(row.innerText || '').includes(tn2)) { rowHasTeam = true; break; }
+                }
+              }
+              if (row && !rowHasTeam) {
+                return { ok: false, why: 'row_team_mismatch', sample: norm(row.innerText || '').slice(0, 120), how };
+              }
               if (row) {
                 try { row.scrollIntoView({ block: 'center' }); } catch (e) {}
               }
