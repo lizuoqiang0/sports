@@ -1014,6 +1014,41 @@ async def ui_place_pinnacle_total(
     else:
         return False, f"odds_change_reject|{why2}|{confirm_detail}"
     await page.wait_for_timeout(2200)
+
+    # 捕获站点拒绝弹窗：step2 确认后若站点拒绝（盘口失效/限额/风控），
+    # 会弹错误提示框，读出来写入 detail 便于定位（此时余额校验注定失败）
+    reject_msg = ""
+    reject_js = """() => {
+      const out = [];
+      // 1) 常规弹窗（modal/alert/dialog 类）
+      for (const el of document.querySelectorAll('[role="alert"], [class*="modal" i], [class*="dialog" i], [class*="toast" i], [class*="message" i], [class*="notice" i]')) {
+        const t = String(el.innerText || '').replace(/\\s+/g, ' ').trim();
+        const st = window.getComputedStyle(el);
+        if (!t || t.length < 4 || t.length > 400) continue;
+        if (st && (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0')) continue;
+        out.push(t.slice(0, 200));
+      }
+      // 2) body 中含拒绝关键词的短句
+      const body = String((document.body && document.body.innerText) || '');
+      for (const re of [/[^\\n]{0,30}(?:无法|失败|拒绝|已取消|不足|超过|限制|失效|错误|请稍后|无法处理|不能接受)[^\\n]{0,50}/g]) {
+        const m = body.match(re);
+        if (m) out.push(m[0].replace(/\\s+/g, ' ').slice(0, 200));
+        if (out.length > 5) break;
+      }
+      return out.slice(0, 5).join(' ;; ');
+    }"""
+    for fr in targets:
+        try:
+            msg = await asyncio.wait_for(fr.evaluate(reject_js), timeout=3.0)
+        except Exception:
+            continue
+        if msg:
+            reject_msg = str(msg)[:300]
+            break
+    if reject_msg:
+        logger.warning("pinnacle place rejected by site: %s", reject_msg)
+        confirm_detail = f"{confirm_detail}|reject:{reject_msg}"
+
     return True, f"{result.get('sample')}|{fill_detail}|{confirm_detail}|odds:{odds}"
 
 
