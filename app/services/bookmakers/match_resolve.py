@@ -78,11 +78,26 @@ def _team_similarity(a: str, b: str) -> float:
         if len(shorter) >= 2 and len(shorter) / max(len(longer), 1) >= 0.45:
             return max(0.82, SequenceMatcher(None, x, y).ratio())
     ratio = SequenceMatcher(None, x, y).ratio()
-    # 中文队名顺序颠倒：雅典aek vs aekaek雅典
+    # 中文译名顺序颠倒：雅典aek vs aekaek雅典
     if len(x) >= 3 and len(y) >= 3:
         sx, sy = "".join(sorted(x)), "".join(sorted(y))
         bag = SequenceMatcher(None, sx, sy).ratio()
         ratio = max(ratio, bag * 0.95)
+    # 中文译名前缀包含："斯托克松德" vs "斯托桑"（全译 vs 缩译）
+    # 条件收紧防误匹配：共享前缀≥2字、前缀后双方还有剩余、长度差≥2
+    # （"斯托克城/斯托克港"同为5字完整名不适用；"皇家马德里/皇家社会"长度差1不适用）
+    if len(x) >= 2 and len(y) >= 2 and x != y:
+        pfx = 0
+        for a, b in zip(x, y):
+            if a != b:
+                break
+            pfx += 1
+        if (
+            pfx >= 2
+            and pfx < min(len(x), len(y))
+            and abs(len(x) - len(y)) >= 2
+        ):
+            ratio = max(ratio, 0.75)
     # 中文译名差异（如"马尔默" vs "马模"）：用共有字符占比补齐
     if len(x) >= 2 and len(y) >= 2:
         cx, cy = set(x), set(y)
