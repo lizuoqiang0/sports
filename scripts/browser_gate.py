@@ -680,8 +680,19 @@ async def _run_odds_sync(req: OddsSyncRequest):
             # 软保活：已在盘口不 reload；掉线才恢复 venue（禁止 force 硬刷新闪烁）
             refreshed = await site_sessions.refresh(req.base_url, force=False, site_code=site_code)
 
+        async def _fetch_and_yield():
+            """采集包裹：等待期间若下单/登录到来，主动放弃让路。"""
+            task = asyncio.create_task(_fetch_with_session(sess.page if sess else None))
+            while True:
+                done, _ = await asyncio.wait({task}, timeout=3.0)
+                if done:
+                    return task.result()
+                if lane.want_login() or lane.want_bet():
+                    task.cancel()
+                    raise asyncio.CancelledError("bet/login priority, odds-sync yield")
+
         matches = await asyncio.wait_for(
-            _fetch_with_session(sess.page if sess else None),
+            _fetch_and_yield(),
             timeout=odds_timeout,
         )
         # 手动场馆站：禁止 recreate（会毁掉已进盘口页并跳到大厅）
@@ -756,6 +767,15 @@ async def _run_odds_sync(req: OddsSyncRequest):
                     )
                 except Exception:
                     pass
+    except asyncio.CancelledError:
+        # _fetch_and_yield 主动让路（bet/login 优先）：按 busy 返回而非 500
+        return {
+            "ok": False,
+            "busy": True,
+            "message": "本站验证/下单优先，盘口拉取让路",
+            "matches": [],
+            "lane": lane.key,
+        }
     except asyncio.TimeoutError:
         return {
             "ok": False,
@@ -2026,8 +2046,10 @@ async def bet_place(req: BetPlaceRequest):
     # 设置下单优先级（让 odds-sync 让路）
     lane.set_bet_priority(40.0)
 
+    # 抢锁等待须盖过单次 odds-sync-live 最长占用（70s 超时 + 前置等待），
+    # 否则下单重试连续撞上采盘导致「网关正忙」三连败
     try:
-        await asyncio.wait_for(lane.lock.acquire(), timeout=30.0)
+        await asyncio.wait_for(lane.lock.acquire(), timeout=80.0)
     except asyncio.TimeoutError:
         lane.clear_bet_priority()
         return {
