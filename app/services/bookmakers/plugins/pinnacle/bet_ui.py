@@ -252,20 +252,23 @@ async def ui_place_pinnacle_total(
         if not ordered:
             return None, "no_frames"
 
-        # 滚球列表渲染等待：主 frame 文本过短（<1500字）说明 SPA 列表未出
-        # （goto/refresh 后常见），等最多 12s 让列表渲染，避免立即 odds_not_found
+        # 滚球列表渲染等待：按「内容特征」判定而非字符数
+        # （实测 len=1632 骨架半渲染态：有导航/页脚但赛事行未出，字符数阈值会漏）
+        # 判定标准：页面含 ≥2 个滚球行特征（比分 X-X + 分钟 ' / 节次 Q1-Q4/1H2H）
         async def _wait_board_ready() -> None:
             try:
-                for _ in range(12):
+                probe = """() => {
+                  const t = ((document.body && document.body.innerText) || '');
+                  const scores = (t.match(/\\b\\d{1,2}-\\d{1,2}\\b/g) || []).length;
+                  const clocks = (t.match(/(?:^|\\s)(?:\\d{1,3}'|1H|2H|HT|Q[1-4]|P[1-4])(?:$|\\s)/gm) || []).length;
+                  return scores + clocks;
+                }"""
+                for _ in range(15):
                     try:
-                        blen = int(
-                            await page.evaluate(
-                                "() => ((document.body && document.body.innerText) || '').length"
-                            )
-                        )
+                        feats = int(await page.evaluate(probe))
                     except Exception:
-                        blen = 0
-                    if blen >= 1500:
+                        feats = 0
+                    if feats >= 4:
                         return
                     await page.wait_for_timeout(1000)
             except Exception:
