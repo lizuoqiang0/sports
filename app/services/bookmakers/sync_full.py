@@ -239,7 +239,12 @@ async def sync_user_bookmakers(db: AsyncSession, user_id: int, *, purge_demo: bo
                         try:
                             bt = BetType(ro.bet_type)
                         except ValueError:
-                            bt = BetType.MONEYLINE
+                            # 与 sync_live 一致：未知盘口跳过并告警，绝不静默降级 moneyline 污染数据
+                            logger.warning(
+                                "[sync_full] 未知 bet_type=%s 跳过 match=%s provider=%s",
+                                ro.bet_type, match_id, provider,
+                            )
+                            continue
                         # 同场同盘口只保留一条（多远程场映射到同一 match 时去重）
                         if bt in seen_bt:
                             continue

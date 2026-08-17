@@ -64,13 +64,6 @@ def is_live_site_code(code: str) -> bool:
     return c in tuple(p.code for p in list_plugins())
 
 
-def is_portal_site_code(code: str) -> bool:
-    try:
-        return bool(get_plugin(code).profile.get("portal"))
-    except ValueError:
-        return False
-
-
 def needs_manual_venue(code: str) -> bool:
     """是否等人手动进场馆。默认自动；BOOKMAKER_MANUAL_VENUE=1 时强制手动。"""
     env = (os.getenv("BOOKMAKER_MANUAL_VENUE") or "").strip().lower()

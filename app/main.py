@@ -51,12 +51,8 @@ async def lifespan(app: FastAPI):
     # 连接Redis
     try:
         await cache.connect()
-        # 清理上次进程残留的 AI 引擎运行标记（进程重启后引擎已不存在）
-        import redis.asyncio as aioredis
-        keys = await cache.client.keys("ai:engine:running:*")
-        if keys:
-            await cache.client.delete(*keys)
-            logger.info("清理残留 AI 引擎标记: %s 个", len(keys))
+        # 注意：不再全量清理 ai:engine:running:* —— 多 worker 下会误删其他进程
+        # 正在运行的引擎标记。标记现带 TTL（由引擎主循环续期），进程崩溃后自动过期。
     except Exception as e:
         logger.warning(f"Redis连接失败(继续运行): {e}")
 
@@ -83,8 +79,7 @@ async def lifespan(app: FastAPI):
     await asyncio.sleep(0.3)  # 给一次抢主机会
 
     run_jobs = bool(settings.RUN_BACKGROUND_JOBS)
-    is_leader = is_background_leader() if run_jobs else False
-    if run_jobs and not is_leader:
+    if run_jobs and not is_background_leader():
         # 单 worker 时选举几乎立即成功；多 worker 稍后由监督任务接管
         logger.info("本进程暂非 background leader，轮询交由 leader 执行")
 
@@ -95,6 +90,7 @@ async def lifespan(app: FastAPI):
         ctx_on = False
         ns_on = False
         settle_on = False
+        clean_on = False
         while True:
             try:
                 lead = bool(settings.RUN_BACKGROUND_JOBS) and is_background_leader()
@@ -138,6 +134,14 @@ async def lifespan(app: FastAPI):
                         logger.info("nowscore prefetcher started (leader)")
                     except Exception as e:
                         logger.warning(f"nowscore prefetcher 启动失败: {e}")
+                if lead and not clean_on:
+                    try:
+                        from app.services.cleanup import start_cleanup_task
+                        start_cleanup_task()
+                        clean_on = True
+                        logger.info("cleanup task started (leader)")
+                    except Exception as e:
+                        logger.warning(f"cleanup task 启动失败: {e}")
                 if not lead and live_on:
                     try:
                         from app.services.bookmakers.live_poller import stop_live_poller
@@ -173,17 +177,18 @@ async def lifespan(app: FastAPI):
                     except Exception:
                         pass
                     settle_on = False
+                if not lead and clean_on:
+                    try:
+                        from app.services.cleanup import stop_cleanup_task
+                        stop_cleanup_task()
+                    except Exception:
+                        pass
+                    clean_on = False
             except Exception:
                 logger.exception("background job supervisor error")
             await asyncio.sleep(5)
 
     bg_task = asyncio.create_task(_supervise_background_jobs(), name="ob-bg-supervisor")
-
-    # 启动数据清理任务（仅 leader 执行）
-    if run_jobs and is_leader:
-        from app.services.cleanup import start_cleanup_task
-        start_cleanup_task()
-        logger.info("cleanup task started (leader)")
 
     yield
 

@@ -516,7 +516,7 @@ async def start_recommendations_analysis(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """开始后台轮询分析当前球类滚球大小球。"""
+    """开始后台轮询分析当前球类滚球小球。"""
     from app.ai.recs_job import start_analysis_watch
     from app.config import settings as _settings
     from app.ai.strategy import load_fresh_strategy
@@ -674,7 +674,8 @@ async def one_click_bet(
     if not ok_gate:
         raise HTTPException(status_code=400, detail=f"未通过策略配置: {why_gate}")
 
-    allowed_mkt = {"total", "moneyline", "spread"}
+    # 只投小球：OB/平博下单链路仅对小球做过可靠性验证
+    allowed_mkt = {"total"}
     rec_bt = str((rec.get("recommendation") or {}).get("bet_type") or "total").lower()
     target_markets = {rec_bt} if rec_bt in allowed_mkt else {"total"}
     if req.markets:

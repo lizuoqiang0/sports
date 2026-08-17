@@ -145,34 +145,3 @@ async def gate_recommendation_for_place(
         return False, risk_why, Decimal("0"), strat
     capped = cap_stake(stake, strat)
     return True, "", capped, strat
-
-
-def apply_rec_display_gates(
-    rec: dict,
-    *,
-    strat: StrategyConfig,
-    preferred: list[str] | None,
-    excluded: list[str] | None,
-) -> Optional[str]:
-    """列表展示过滤原因；None = 可显示。"""
-    if not isinstance(rec, dict) or rec.get("error"):
-        return "invalid"
-    from app.services.bookmakers.china_match import is_china_match
-
-    if is_china_match(
-        str(rec.get("league") or ""),
-        str(rec.get("home_team") or ""),
-        str(rec.get("away_team") or ""),
-        str(rec.get("sport") or ""),
-    ):
-        return "china_match"
-    sport = str(rec.get("sport") or "")
-    if not sport_is_preferred(sport, preferred):
-        return "sport_not_preferred"
-    if team_is_excluded(
-        str(rec.get("home_team") or ""),
-        str(rec.get("away_team") or ""),
-        excluded,
-    ):
-        return "excluded_team"
-    return None

@@ -18,15 +18,25 @@ _MATCH_DELETE_BATCH_SIZE = 500
 
 
 async def _cleanup_once() -> dict:
-    """执行一次清理，返回删除统计。"""
+    """执行一次清理，返回删除统计。
+
+    注单保留期独立取 7 天（匹配胜率统计窗口 recent_betting_stats(days=7)），
+    且仅删除已结算注单 —— 未结算单关联真实资金与同场防重投，绝不能按
+    created_at 一刀切删除（否则统计样本被截断、可能对同场重复下单）。
+    """
     retention_hours = int(settings.DATA_RETENTION_HOURS)
     cutoff = datetime.now(timezone.utc) - timedelta(hours=retention_hours)
+    bet_retention_hours = max(retention_hours, 168)  # 注单至少保留 7 天
+    bet_cutoff = datetime.now(timezone.utc) - timedelta(hours=bet_retention_hours)
     stats = {"bets": 0, "matches": 0, "odds": 0, "contexts": 0, "transactions_unlinked": 0}
 
     async with AsyncSessionLocal() as db:
-        # 1. 删除过期投注记录（Transaction.bet_id 会被 SET NULL）
+        # 1. 删除过期且已结算的投注记录（Transaction.bet_id 会被 SET NULL）
         result = await db.execute(
-            delete(Bet).where(Bet.created_at < cutoff)
+            delete(Bet).where(
+                Bet.created_at < bet_cutoff,
+                Bet.settled_at.is_not(None),
+            )
         )
         stats["bets"] = result.rowcount or 0
 

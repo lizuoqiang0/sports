@@ -239,14 +239,23 @@ async def _apply_score_clock(match: Match, rm) -> None:
         extra.pop("period", None)
     match.extra_data = extra
     # 完场降级，避免「进行中」残留旧赛
-    if period == "完场" or str(getattr(rm, "status", "") or "") == "finished":
+    rm_status_l = str(getattr(rm, "status", "") or "").lower()
+    if period == "完场" or rm_status_l == "finished":
         match.status = MatchStatus.FINISHED
         if getattr(match, "end_time", None) is None:
             match.end_time = datetime.now(timezone.utc)
         extra.pop("clock", None)
         extra.pop("period", None)
         match.extra_data = extra
-    elif str(getattr(rm, "status", "") or "").lower() == "live":
+    elif rm_status_l in ("cancelled", "canceled", "postponed"):
+        # 取消/延期：置 CANCELLED，结算侧退本金（不按比分判输赢）
+        match.status = MatchStatus.CANCELLED
+        if getattr(match, "end_time", None) is None:
+            match.end_time = datetime.now(timezone.utc)
+        extra.pop("clock", None)
+        extra.pop("period", None)
+        match.extra_data = extra
+    elif rm_status_l == "live":
         match.end_time = None
 
 

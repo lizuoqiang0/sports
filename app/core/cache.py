@@ -88,14 +88,8 @@ class CacheManager:
         return await self.client.hdel(key, *fields)
 
     # === 列表操作 (流水/消息队列) ===
-    async def lpush(self, key: str, value: str) -> int:
-        return await self.client.lpush(key, value)
-
     async def lrange(self, key: str, start: int = 0, end: int = -1) -> list[str]:
         return await self.client.lrange(key, start, end)
-
-    async def ltrim(self, key: str, start: int, end: int) -> bool:
-        return await self.client.ltrim(key, start, end)
 
     # === 发布订阅 (赔率变动通知) ===
     async def publish(self, channel: str, message: dict) -> int:
@@ -106,22 +100,7 @@ class CacheManager:
         await pubsub.subscribe(channel)
         return pubsub
 
-    # === 限流 (令牌桶) ===
-    async def rate_limit(self, key: str, max_requests: int, window: int) -> tuple[bool, dict]:
-        """滑动窗口限流"""
-        t = await self.client.time()
-        now = int(t[0]) if isinstance(t, (list, tuple)) else int(t)
-        pipe = self.client.pipeline()
-        pipe.zremrangebyscore(key, 0, now - window)
-        pipe.zcard(key)
-        pipe.zadd(key, {str(now): now})
-        pipe.expire(key, window)
-        results = await pipe.execute()
-        count = results[1]
-        allowed = count < max_requests
-        return allowed, {"count": count + 1, "limit": max_requests, "window": window}
-
-    # === 分布式锁（下单防重） ===
+    # === 分布式锁（下单防重/引擎互斥） ===
     async def acquire_lock(self, key: str, *, ttl_sec: int = 120, token: str = "1") -> bool:
         """SET NX EX；成功返回 True。"""
         try:
@@ -145,7 +124,7 @@ class CacheManager:
             logger.debug("release_lock failed key=%s: %s", key, e)
 
     async def extend_lock_if_owned(self, key: str, token: str, *, ttl_sec: int) -> bool:
-        """仅续期自己持有的锁（Lua 原子校验）。"""
+        """仅续期自己持有的锁（Lua 原子校验）。用于长周期任务的看门狗。"""
         lua = """
         if redis.call('get', KEYS[1]) == ARGV[1] then
             return redis.call('expire', KEYS[1], ARGV[2])
@@ -159,29 +138,8 @@ class CacheManager:
             return False
 
     # === 便捷方法 ===
-    async def cache_odds(self, match_id: int, odds_data: dict, ttl: int = 10):
-        """缓存赛事赔率 (短TTL)"""
-        key = f"odds:match:{match_id}"
-        await self.set_json(key, odds_data, ttl=ttl)
-
     async def get_cached_odds(self, match_id: int) -> Optional[dict]:
         return await self.get_json(f"odds:match:{match_id}")
 
-    async def cache_match_list(self, sport: str, data: list, ttl: int = 60):
-        """缓存赛事列表"""
-        key = f"matches:sport:{sport}"
-        await self.set_json(key, {"items": data, "cached_at": asyncio.get_event_loop().time()}, ttl)
-
-    async def invalidate_match(self, match_id: int):
-        """使赛事缓存失效"""
-        await self.delete(f"odds:match:{match_id}")
-        # 同时清除相关赛事列表缓存
-        keys = await self.client.keys("matches:sport:*")
-        if keys:
-            await self.client.delete(*keys)
-
-
-# 延迟导入避免循环
-import asyncio
 
 cache = CacheManager()

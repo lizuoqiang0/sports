@@ -24,6 +24,21 @@ logging.basicConfig(
 logger = logging.getLogger("browser-gate")
 logging.getLogger("app.services.bookmakers").setLevel(logging.INFO)
 
+# 日志落盘：终端窗口关闭后历史诊断信息（row_not_found 等）不再丢失
+try:
+    from logging.handlers import RotatingFileHandler
+
+    _gate_log_dir = Path(__file__).resolve().parents[1] / "logs"
+    _gate_log_dir.mkdir(parents=True, exist_ok=True)
+    _fh = RotatingFileHandler(
+        _gate_log_dir / "gate.log", maxBytes=8 * 1024 * 1024, backupCount=3, encoding="utf-8"
+    )
+    _fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)-7s | %(name)s | %(message)s"))
+    logging.getLogger().addHandler(_fh)
+    logger.info("gate file log -> %s", _gate_log_dir / "gate.log")
+except Exception as _le:
+    logger.warning("gate file log disabled: %s", _le)
+
 # macOS 本机 / Linux 宿主机 / Docker 容器 统一缓存路径
 if sys.platform == "darwin":
     _stable_pw = os.path.expanduser("~/Library/Caches/ms-playwright")
@@ -73,6 +88,17 @@ _BET_CAPTURE_LOG = "/tmp/pinnacle_bet_capture.log"
 _bet_capture_hooked: set[int] = set()  # 已挂钩的 page hash，防重复
 
 
+async def _append_captured_response_body(resp) -> None:
+    """Playwright 的 Response.text 是协程，异步追加避免阻塞 response 回调。"""
+    try:
+        body = await resp.text()
+        if body:
+            with open(_BET_CAPTURE_LOG, "a", encoding="utf-8") as f:
+                f.write(f"  resp_body={body[:2000]}\n")
+    except Exception:
+        pass
+
+
 def _hook_pinnacle_bet_capture(page) -> None:
     """给平博长连接页挂全量 XHR 监听，捕获下单接口端点/payload/回执。
 
@@ -117,13 +143,8 @@ def _hook_pinnacle_bet_capture(page) -> None:
                     f.write(hdrs)
                 if body:
                     f.write(f"  req_body={body[:2000]}\n")
-                try:
-                    # 同步读取响应体（小响应可接受）
-                    rb = resp.text()[:2000] if resp.status < 400 else ""
-                    if rb:
-                        f.write(f"  resp_body={rb}\n")
-                except Exception:
-                    pass
+                if hdrs and resp.status < 400:
+                    asyncio.create_task(_append_captured_response_body(resp))
         except Exception:
             pass
 
@@ -181,22 +202,30 @@ async def _keep_sessions_refresh_loop() -> None:
                         logger.warning("keep-alive page not responsive site=%s", code or base[:40])
                         continue
                     if sess.page and not sess.page.is_closed():
+                        try:
+                            in_book = await is_in_sportsbook(sess.page)
+                        except Exception:
+                            in_book = False
+                        # 维护横幅自动恢复：整页刷新即清除（实测）。
+                        # 仅检测到横幅才刷新，不破坏 keep-alive 的「无重载」原则
                         if code == "pinnacle":
                             try:
                                 from app.services.bookmakers.plugins.pinnacle.venue import (
+                                    clear_pinnacle_maintenance,
                                     recover_pinnacle_blank_page,
                                 )
 
                                 if not await recover_pinnacle_blank_page(sess.page):
                                     logger.warning("keep-alive pinnacle page still blank")
                                     continue
+                                if await clear_pinnacle_maintenance(sess.page):
+                                    try:
+                                        in_book = await is_in_sportsbook(sess.page)
+                                    except Exception:
+                                        pass
                             except Exception as e:
-                                logger.warning("keep-alive pinnacle blank recovery failed: %s", e)
+                                logger.warning("keep-alive pinnacle recovery failed: %s", e)
                                 continue
-                        try:
-                            in_book = await is_in_sportsbook(sess.page)
-                        except Exception:
-                            in_book = False
                         # 仅场馆内刷新余额；大厅/中心钱包不写入
                         if in_book:
                             bal, recognized = await _scrape_balance_from_page(

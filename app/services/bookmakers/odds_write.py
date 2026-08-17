@@ -24,16 +24,6 @@ def unique_valid_from(base: datetime | None = None) -> datetime:
     return base + timedelta(microseconds=pid_skew + n)
 
 
-def fresh_valid_from() -> datetime:
-    """按纳秒时钟生成，适合冲突重试。"""
-    ns = time.time_ns() + (os.getpid() % 97) + next(_seq)
-    sec, rem = divmod(ns, 1_000_000_000)
-    micros = (rem // 1000) % 1_000_000
-    return datetime.fromtimestamp(sec, tz=timezone.utc).replace(tzinfo=None) + timedelta(
-        microseconds=micros
-    )
-
-
 def public_odds_data(odds_data: dict | None) -> dict:
     """去掉内部 _ob 引用，供比较/展示。"""
     if not isinstance(odds_data, dict):

@@ -104,7 +104,7 @@ async def place_site_bet(
     selection: str,
     odds: float,
     stake: Decimal,
-    bet_type: str = "moneyline",
+    bet_type: str = "total",
     odds_data: Optional[dict] = None,
     page=None,
     headed: bool = False,

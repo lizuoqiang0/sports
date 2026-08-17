@@ -218,7 +218,7 @@ async def post_place_bet(
     selection: str,
     odds: float,
     stake: float,
-    bet_type: str = "moneyline",
+    bet_type: str = "total",
     odds_data: Optional[dict] = None,
     headed: bool = False,
     timeout: float = 90.0,

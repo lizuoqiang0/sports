@@ -110,3 +110,44 @@ async def sync_balance_snapshot(user_id: int, current_total: float) -> dict:
         "snapshot_updated_at": now_iso,
         "pnl_mode": "site_balance_delta",
     }
+
+
+async def reset_pnl_baseline(user_id: int, current_total: float) -> dict:
+    """手动清零复位：删除基线快照与日基线，以当前总资产重新初始化。
+
+    调用后：
+    - 工作台「网站盈亏」= 当前总资产 - 新基线 = 0
+    - 风控日盈亏（risk_daily_pnl）同样从当前余额重新起算
+    """
+    snap_key = _BALANCE_SNAPSHOT_KEY.format(user_id=user_id)
+    today = datetime.now(timezone.utc).strftime("%Y%m%d")
+    pnl_key = _PNL_KEY.format(user_id=user_id, date=today)
+
+    deleted = await cache.delete(snap_key)
+    deleted += await cache.delete(pnl_key)
+
+    # 立即以当前余额重建快照（而非等下一次轮询）
+    total_assets = round(float(current_total or 0), 2)
+    if total_assets > 0:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        snapshot = {
+            "reference_balance": total_assets,
+            "previous_balance": total_assets,
+            "snapshot_updated_at": now_iso,
+        }
+        await cache.set_json(snap_key, snapshot, ttl=0)
+        await cache.set(pnl_key, str(total_assets), ttl=90000)
+
+    logger.info(
+        "pnl baseline reset: user=%s new_baseline=%.2f deleted_keys=%d",
+        user_id, total_assets, deleted,
+    )
+    return {
+        "total_assets": total_assets,
+        "balance_delta": 0.0,
+        "balance_change": 0.0,
+        "reference_balance": total_assets,
+        "previous_balance": total_assets,
+        "snapshot_updated_at": datetime.now(timezone.utc).isoformat(),
+        "pnl_mode": "site_balance_delta",
+    }

@@ -155,11 +155,9 @@ def _normalize_row(row: dict) -> Optional[dict]:
         or inner.get("playOptionName")
         or ""
     ).lower()
-    selection = "over"
+    selection = "under"
     if "under" in play_opt or play_opt.startswith("小") or "小" in play_opt:
         selection = "under"
-    elif "over" in play_opt or play_opt.startswith("大") or "大" in play_opt:
-        selection = "over"
     elif play_opt in ("1", "home", "主"):
         selection = "home"
     elif play_opt in ("2", "away", "客"):
@@ -267,7 +265,7 @@ async def fetch_ob_orders(*, page, session_token: str = "", days: int = 3) -> di
                         for (const e of (performance.getEntriesByType('resource')||[])) {
                           try {
                             // matchesPB 是赔率 API，它的 host 就是正确的 API host
-                            if (/matchesPB|yewu.*\/m\/|betOrder/i.test(e.name)) {
+                            if (/matchesPB|yewu.*\\/m\\/|betOrder/i.test(e.name)) {
                               const u = new URL(e.name);
                               if (out.indexOf(u.origin)<0) out.push(u.origin);
                             }

@@ -40,11 +40,6 @@ def _session_key(base_url: str) -> str:
         return _norm_host(raw)
 
 
-async def hide_browser_window(page) -> None:
-    """已废弃：始终保持可见，不再隐藏窗口。"""
-    return
-
-
 @dataclass
 class KeptSiteSession:
     key: str

@@ -16,10 +16,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import AsyncSessionLocal, get_db
 from app.models.user import (
     User,
+    UserRole,
     BookmakerAccount,
     BookmakerStatus,
 )
-from app.core.security import get_current_user
+from app.core.security import get_current_user, require_roles
 from app.core.crypto import encrypt_secret, decrypt_secret
 from app.schemas import (
     APIResponse,
@@ -569,9 +570,9 @@ async def disconnect_bookmaker(
 async def purge_and_resync_bookmaker(
     code: str,
     db: AsyncSession = Depends(get_db),
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_roles(UserRole.ADMIN)),
 ):
-    """删除指定站点脏赛事/赔率后重新同步写入。"""
+    """删除指定站点脏赛事/赔率后重新同步写入（仅管理员）。"""
     if code not in BOOKMAKER_CATALOG:
         raise HTTPException(status_code=404, detail="未知站点")
     from app.services.bookmakers.purge import (
@@ -579,15 +580,32 @@ async def purge_and_resync_bookmaker(
         purge_bookmaker_matches,
     )
 
-    purged = await purge_bookmaker_matches(db, code)
-    await db.commit()
-    cache_n = 0
+    # 与 live poller 互斥：清库期间 25s 周期的滚球轮询会把数据写回，出现
+    # 「清了又写/写一半被清」竞态（verify 链路同款处理）
+    _resume = None
     try:
-        cache_n = await clear_ai_recs_cache(site_code=code)
+        from app.services.bookmakers.live_poller import pause_live_poller, resume_live_poller
+
+        pause_live_poller()
+        _resume = resume_live_poller
     except Exception:
+        pass
+    try:
+        purged = await purge_bookmaker_matches(db, code)
+        await db.commit()
         cache_n = 0
-    # 重新拉取全部已连接站点（含目标站）；目标站未连接时仅完成清理
-    result = await sync_user_bookmakers(db, user.id)
+        try:
+            cache_n = await clear_ai_recs_cache(site_code=code)
+        except Exception:
+            cache_n = 0
+        # 重新拉取全部已连接站点（含目标站）；目标站未连接时仅完成清理
+        result = await sync_user_bookmakers(db, user.id)
+    finally:
+        if _resume:
+            try:
+                _resume()
+            except Exception:
+                pass
     return APIResponse(
         message=f"{BOOKMAKER_CATALOG[code].get('name') or code} 已重同步",
         data={"purged": purged, "cache_cleared": cache_n, "sync": result},
@@ -599,7 +617,23 @@ async def sync_bookmakers(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    result = await sync_user_bookmakers(db, user.id)
+    # 全量同步与 25s 滚球轮询并发打同一 Gate 车道，先暂停 poller 再同步
+    _resume = None
+    try:
+        from app.services.bookmakers.live_poller import pause_live_poller, resume_live_poller
+
+        pause_live_poller()
+        _resume = resume_live_poller
+    except Exception:
+        pass
+    try:
+        result = await sync_user_bookmakers(db, user.id)
+    finally:
+        if _resume:
+            try:
+                _resume()
+            except Exception:
+                pass
     return APIResponse(message="滚球已同步", data=result)
 
 
@@ -609,7 +643,7 @@ async def sync_live_bookmakers(
     user: User = Depends(get_current_user),
 ):
     """轻量滚球同步：仅足球/篮球比分/时钟/赔率。"""
-    # 手动刷新只更新滚球数据，余额由后台轮询单独维护，避免占用 Gate 车道。
+    # 余额由后台轮询维护；手动刷新只占用盘口车道，避免两站串行余额抓取超时。
     result = await sync_live_scores_odds(db, user.id, refresh_balance=False)
     return APIResponse(message="滚球已刷新", data=result)
 

@@ -157,41 +157,6 @@ async def odds_websocket(websocket: WebSocket, token: Optional[str] = None):
         await manager.disconnect(websocket, user_id)
 
 
-# === 赔率变动发布器 (供内部服务调用) ===
-async def publish_odds_update(match_id: int, odds_data: dict, bet_type: str = "moneyline"):
-    """
-    内部方法: 当赔率更新时调用，推送给所有订阅者
-
-    使用示例:
-        await publish_odds_update(123, {"home": 1.90, "away": 2.05}, "moneyline")
-    """
-    message = {
-        "type": WSEventType.ODDS_UPDATE,
-        "channel": f"odds:match:{match_id}",
-        "data": {
-            "match_id": match_id,
-            "bet_type": bet_type,
-            "odds_data": odds_data,
-            "timestamp": datetime.now(timezone.utc).isoformat()
-        }
-    }
-
-    # 推送到具体赛事频道
-    await manager.broadcast_to_channel(f"odds:match:{match_id}", message)
-
-    # 同时推送到运动类型频道
-    # (需要知道match的sport，这里简化处理)
-    await manager.broadcast_all({
-        "type": "odds_global_update",
-        "data": {"match_id": match_id, "odds_data": odds_data}
-    })
-
-    # 更新缓存（与 GET /odds 同形：数组）
-    await cache.set_json(f"odds:match:{match_id}", [odds_data], ttl=10)
-
-    logger.info(f"赔率更新推送: match={match_id}, odds={odds_data}")
-
-
 # === 辅助方法 ===
 async def _get_odds_snapshot(match_id: int) -> Optional[dict]:
     """获取赔率快照"""
