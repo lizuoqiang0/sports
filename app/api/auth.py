@@ -22,7 +22,7 @@ from app.core.security import (
     check_rate_limit, check_rate_limit_async,
 )
 from app.schemas import (
-    RegisterRequest, LoginRequest, TokenResponse,
+    RegisterRequest, LoginRequest,
     RefreshTokenRequest, UserInfoResponse, APIResponse
 )
 
