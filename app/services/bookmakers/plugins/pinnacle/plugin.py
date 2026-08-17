@@ -34,10 +34,15 @@ class PinnaclePlugin(BasePlugin):
         return list(rows) if rows else None
 
     async def after_empty_odds(self, page: Any) -> bool:
-        """已在 /live：不导航，返回 True 触发就地再刮；偏离时才 goto 恢复。"""
-        from app.services.bookmakers.plugins.pinnacle.venue import recover_pinnacle_live_list
+        """空盘先修复白屏，随后回到滚球列表并重试。"""
+        from app.services.bookmakers.plugins.pinnacle.venue import (
+            recover_pinnacle_blank_page,
+            recover_pinnacle_live_list,
+        )
 
         try:
+            if not await recover_pinnacle_blank_page(page):
+                return False
             url = ""
             try:
                 url = (page.url or "").lower()

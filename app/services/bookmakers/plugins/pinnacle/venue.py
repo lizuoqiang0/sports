@@ -25,6 +25,65 @@ def pinnacle_live_sport_urls(page_url: str = "", *, origin: str = "") -> list[st
     ]
 
 
+async def pinnacle_page_is_blank(page) -> bool:
+    """判断平博 SPA 是否落入白屏状态，避免把空页面当作无滚球。"""
+    try:
+        if page is None or page.is_closed():
+            return True
+        state = await page.evaluate(
+            """() => {
+                const body = document.body;
+                if (!body) return {ready: document.readyState, textLength: 0, hasVisibleControl: false};
+                const hasVisibleControl = [...document.querySelectorAll(
+                    'a,button,input,select,textarea,[role="button"],[data-testid],[data-test-id]'
+                )].some((el) => {
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return style.display !== 'none' && style.visibility !== 'hidden'
+                        && Number(style.opacity || 1) > 0 && rect.width > 1 && rect.height > 1;
+                });
+                return {
+                    ready: document.readyState,
+                    textLength: (body.innerText || '').trim().length,
+                    hasVisibleControl,
+                };
+            }"""
+        )
+    except Exception:
+        return True
+    if not isinstance(state, dict) or state.get("ready") != "complete":
+        return False
+    return int(state.get("textLength") or 0) < 12 and not bool(
+        state.get("hasVisibleControl")
+    )
+
+
+async def recover_pinnacle_blank_page(page, *, attempts: int = 3) -> bool:
+    """白屏时重载并复检；调用方在本轮失败后保留旧盘口，下轮继续恢复。"""
+    if not await pinnacle_page_is_blank(page):
+        return True
+
+    total_attempts = max(1, int(attempts))
+    for attempt in range(1, total_attempts + 1):
+        try:
+            logger.warning(
+                "pinnacle blank page detected, reload attempt=%s/%s url=%s",
+                attempt,
+                total_attempts,
+                (page.url or "")[:120],
+            )
+            await page.reload(wait_until="domcontentloaded", timeout=45000)
+            await page.wait_for_timeout(2500)
+        except Exception as e:
+            logger.warning("pinnacle blank page reload failed attempt=%s: %s", attempt, e)
+        if not await pinnacle_page_is_blank(page):
+            logger.info("pinnacle blank page recovered attempt=%s", attempt)
+            return True
+
+    logger.error("pinnacle blank page persists after %s reloads", total_attempts)
+    return False
+
+
 
 async def recover_pinnacle_live_list(page) -> bool:
     """
@@ -118,5 +177,4 @@ async def recover_pinnacle_live_list(page) -> bool:
         except Exception:
             continue
     return False
-
 

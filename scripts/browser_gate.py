@@ -181,6 +181,18 @@ async def _keep_sessions_refresh_loop() -> None:
                         logger.warning("keep-alive page not responsive site=%s", code or base[:40])
                         continue
                     if sess.page and not sess.page.is_closed():
+                        if code == "pinnacle":
+                            try:
+                                from app.services.bookmakers.plugins.pinnacle.venue import (
+                                    recover_pinnacle_blank_page,
+                                )
+
+                                if not await recover_pinnacle_blank_page(sess.page):
+                                    logger.warning("keep-alive pinnacle page still blank")
+                                    continue
+                            except Exception as e:
+                                logger.warning("keep-alive pinnacle blank recovery failed: %s", e)
+                                continue
                         try:
                             in_book = await is_in_sportsbook(sess.page)
                         except Exception:
