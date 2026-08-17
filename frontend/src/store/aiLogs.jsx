@@ -111,6 +111,17 @@ function _fmtWinRate(value) {
   return `${n.toFixed(0)}%`
 }
 
+function _analysisTag(item) {
+  if (item?.should_bet) return '✓推荐'
+  if (item?.status === 'skipped' || item?.selection === 'skip' || !item?.selection) return '跳过'
+  return _fmtWinRate(item?.confidence)
+}
+
+function _shortReason(value) {
+  const text = String(value || '').replace(/^\[不投注\]\s*/u, '').replace(/\s+/g, ' ').trim()
+  return text ? text.slice(0, 100) : ''
+}
+
 function _providerLabel(provider, fallback = '') {
   const p = String(provider || fallback || '').trim()
   return p || ''
@@ -133,14 +144,16 @@ export function ingestAiEventLog(detail) {
   }
 
   if (eventType === 'ai_analysis_done') {
-    const sel = String(data?.selection || '-')
+    const skipped = data?.status === 'skipped' || data?.selection === 'skip' || !data?.selection
+    const sel = skipped ? '跳过' : String(data.selection)
     const market = String(data?.bet_type || 'total')
     const marketLabel = market === 'total' ? '全场小球' : market || '-'
-    const tag = data?.should_bet ? '✓推荐' : _fmtWinRate(_num(data?.confidence, 0) * 100)
+    const tag = skipped ? '跳过' : (data?.should_bet ? '✓推荐' : _fmtWinRate(_num(data?.confidence, 0) * 100))
+    const reason = skipped ? _shortReason(data?.reasoning) : ''
     pushLogOnce(
       eventKey,
       'analysis',
-      `${data?.home_team || '-'} vs ${data?.away_team || '-'}  ${marketLabel} ${sel} @ ${_fmtOdds(data?.odds)}  ${tag}`,
+      `${data?.home_team || '-'} vs ${data?.away_team || '-'}  ${marketLabel} ${sel}${skipped ? '' : ` @ ${_fmtOdds(data?.odds)}`}  ${tag}${reason ? ` · ${reason}` : ''}`,
       data,
     )
     return
@@ -154,12 +167,14 @@ export function ingestAiEventLog(detail) {
       const key = `${eventKey}:analysis:${item.match_id || `${item.home_team || ''}-${item.away_team || ''}`}:${item.selection || ''}:${item.bet_type || ''}`
       const market = String(item.bet_type || '')
       const marketLabel = market === 'total' ? '全场小球' : market || '-'
-      const selection = String(item.selection || '-')
-      const tag = item.should_bet ? '✓推荐' : _fmtWinRate(item.confidence)
+      const skipped = item.status === 'skipped' || item.selection === 'skip' || !item.selection
+      const selection = skipped ? '跳过' : String(item.selection)
+      const tag = _analysisTag(item)
+      const reason = skipped ? _shortReason(item.reasoning) : ''
       pushLogOnce(
         key,
         'analysis',
-        `${item.home_team || '-'} vs ${item.away_team || '-'}  ${marketLabel} ${selection} @ ${_fmtOdds(item.odds)}  ${tag}`,
+        `${item.home_team || '-'} vs ${item.away_team || '-'}  ${marketLabel} ${selection}${skipped ? '' : ` @ ${_fmtOdds(item.odds)}`}  ${tag}${reason ? ` · ${reason}` : ''}`,
         item,
       )
     }
@@ -173,10 +188,14 @@ export function ingestAiEventLog(detail) {
       const key = `${eventKey}:analysis:${item.match_id || `${item.home_team || ''}-${item.away_team || ''}`}:${item.selection || ''}:${item.bet_type || ''}`
       const market = String(item.bet_type || '')
       const marketLabel = market === 'total' ? '全场小球' : market || '-'
+      const skipped = item.status === 'skipped' || item.selection === 'skip' || !item.selection
+      const selection = skipped ? '跳过' : String(item.selection)
+      const tag = _analysisTag(item)
+      const reason = skipped ? _shortReason(item.reasoning) : ''
       pushLogOnce(
         key,
         'analysis',
-        `${item.home_team || '-'} vs ${item.away_team || '-'}  ${marketLabel} ${item.selection || '-'} @ ${_fmtOdds(item.odds)}  ${_fmtWinRate(item.confidence)}`,
+        `${item.home_team || '-'} vs ${item.away_team || '-'}  ${marketLabel} ${selection}${skipped ? '' : ` @ ${_fmtOdds(item.odds)}`}  ${tag}${reason ? ` · ${reason}` : ''}`,
         item,
       )
     }

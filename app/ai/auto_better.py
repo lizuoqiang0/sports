@@ -308,6 +308,11 @@ class AIBettingEngine:
                 rec = best.get("recommendation") or {}
                 sel = str(rec.get("selection") or "").lower()
                 if sel != "under":
+                    skip_reason = str(
+                        rec.get("reasoning")
+                        or (best.get("analysis") or {}).get("reasoning")
+                        or "AI 未给出可下单的小球方向"
+                    )
                     if sel == "skip":
                         logger.info(
                             "[AI主循环] AI 判定跳过（数据不足）: match=%s %s vs %s",
@@ -322,11 +327,13 @@ class AIBettingEngine:
                         "match_id": best.get("match_id"),
                         "home_team": best.get("home_team", "?"),
                         "away_team": best.get("away_team", "?"),
-                        "selection": rec.get("selection", ""),
-                        "confidence": float(rec.get("confidence") or 0),
-                        "odds": float(rec.get("odds") or 0),
+                        "selection": "skip",
+                        "confidence": 0.0,
+                        "odds": 0.0,
                         "should_bet": False,
                         "bet_type": rec.get("bet_type") or "total",
+                        "status": "skipped",
+                        "reasoning": skip_reason,
                     })
                     return best
 
@@ -484,12 +491,16 @@ class AIBettingEngine:
         for item in analyses:
             rec = item.get("recommendation") or {}
             ana = item.get("analysis") or {}
+            selection = str(rec.get("selection") or "").lower()
+            skipped = selection != "under"
             conf_pct = float(
                 rec.get("raw_win_rate")
                 or rec.get("win_rate")
                 or 0
             )
-            if conf_pct <= 0:
+            if skipped:
+                conf_pct = 0.0
+            elif conf_pct <= 0:
                 conf = float(rec.get("raw_confidence") or rec.get("confidence") or ana.get("confidence") or 0)
                 if conf > 1:
                     conf /= 100.0
@@ -498,10 +509,16 @@ class AIBettingEngine:
                 "home_team": item.get("home_team", "?"),
                 "away_team": item.get("away_team", "?"),
                 "bet_type": rec.get("bet_type") or ana.get("bet_type") or "total",
-                "selection": rec.get("selection") or "",
+                "selection": "skip" if skipped else selection,
                 "confidence": round(conf_pct, 1),
-                "odds": float(rec.get("raw_odds") or rec.get("odds") or 0),
+                "odds": 0.0 if skipped else float(rec.get("raw_odds") or rec.get("odds") or 0),
                 "should_bet": bool(rec.get("should_bet")),
+                "status": "skipped" if skipped else "rejected",
+                "reasoning": str(
+                    rec.get("reasoning")
+                    or ana.get("reasoning")
+                    or "AI 未给出可下单的小球方向"
+                ),
             })
 
         if not approved:
