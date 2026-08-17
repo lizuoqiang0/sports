@@ -664,8 +664,17 @@ async def _run_odds_sync(req: OddsSyncRequest):
     refreshed = False
     sess = None
     matches: list = []
-    # 双球类已加速/冷却后，滚球超时可收紧
+    # 整个请求共享预算。空结果恢复最多使用首轮剩余时间，不能每次再给 70 秒，
+    # 否则客户端已经超时，Gate 仍会长期占住本站车道。
     odds_timeout = 70.0 if req.live_only else 75.0
+    odds_deadline = time.monotonic() + odds_timeout
+
+    async def _within_odds_budget(factory):
+        remaining = odds_deadline - time.monotonic()
+        if remaining <= 0:
+            raise asyncio.TimeoutError
+        return await asyncio.wait_for(factory(), timeout=remaining)
+
     try:
         async def _fetch_with_session(page):
             if lane.want_login() or lane.want_bet():
@@ -705,11 +714,13 @@ async def _run_odds_sync(req: OddsSyncRequest):
                 "lane": lane.key,
             }
 
-        sess = await site_sessions.ensure_for_odds(
-            base_url=req.base_url,
-            session_token=token,
-            site_code=site_code,
-            venue_url=(req.venue_url or "").strip(),
+        sess = await _within_odds_budget(
+            lambda: site_sessions.ensure_for_odds(
+                base_url=req.base_url,
+                session_token=token,
+                site_code=site_code,
+                venue_url=(req.venue_url or "").strip(),
+            )
         )
         if lane.want_login() or lane.want_bet():
             return {
@@ -733,59 +744,67 @@ async def _run_odds_sync(req: OddsSyncRequest):
 
         if sess:
             # 软保活：已在盘口不 reload；掉线才恢复 venue（禁止 force 硬刷新闪烁）
-            refreshed = await site_sessions.refresh(req.base_url, force=False, site_code=site_code)
+            refreshed = await _within_odds_budget(
+                lambda: site_sessions.refresh(req.base_url, force=False, site_code=site_code)
+            )
 
         async def _fetch_and_yield():
             """采集包裹：等待期间若下单/登录到来，主动放弃让路。"""
             task = asyncio.create_task(_fetch_with_session(sess.page if sess else None))
-            while True:
-                done, _ = await asyncio.wait({task}, timeout=3.0)
-                if done:
-                    return task.result()
-                if lane.want_login() or lane.want_bet():
+            try:
+                while True:
+                    done, _ = await asyncio.wait({task}, timeout=3.0)
+                    if done:
+                        return task.result()
+                    if lane.want_login() or lane.want_bet():
+                        raise asyncio.CancelledError("bet/login priority, odds-sync yield")
+            finally:
+                if not task.done():
                     task.cancel()
-                    raise asyncio.CancelledError("bet/login priority, odds-sync yield")
+                    await asyncio.gather(task, return_exceptions=True)
 
-        matches = await asyncio.wait_for(
-            _fetch_and_yield(),
-            timeout=odds_timeout,
-        )
+        matches = await _within_odds_budget(_fetch_and_yield)
         # 手动场馆站：禁止 recreate（会毁掉已进盘口页并跳到大厅）
         from app.services.bookmakers.site_profiles import needs_manual_venue
 
         # 站点插件空结果恢复（平博回滚球）；无插件恢复则 recreate / soft 重试
         if (not matches) and sess:
             try:
-                recovered = await get_plugin(site_code).after_empty_odds(sess.page)
+                recovered = await _within_odds_budget(
+                    lambda: get_plugin(site_code).after_empty_odds(sess.page)
+                )
+            except asyncio.TimeoutError:
+                raise
             except Exception as e:
                 logger.warning("%s empty recover failed: %s", site_code, e)
                 recovered = False
             if recovered:
                 try:
-                    matches = await asyncio.wait_for(
-                        _fetch_with_session(sess.page),
-                        timeout=odds_timeout,
+                    matches = await _within_odds_budget(
+                        lambda: _fetch_with_session(sess.page)
                     )
+                except asyncio.TimeoutError:
+                    raise
                 except Exception as e:
                     logger.warning("%s re-fetch after recover failed: %s", site_code, e)
             elif not lane.want_login() and not lane.want_bet() and not needs_manual_venue(site_code):
-                sess = await site_sessions.ensure_for_odds(
-                    base_url=req.base_url,
-                    session_token=token,
-                    recreate=True,
-                    site_code=site_code,
-                    venue_url=(req.venue_url or "").strip(),
+                sess = await _within_odds_budget(
+                    lambda: site_sessions.ensure_for_odds(
+                        base_url=req.base_url,
+                        session_token=token,
+                        recreate=True,
+                        site_code=site_code,
+                        venue_url=(req.venue_url or "").strip(),
+                    )
                 )
                 if sess:
-                    refreshed = (
-                        await site_sessions.refresh(
+                    refreshed = await _within_odds_budget(
+                        lambda: site_sessions.refresh(
                             req.base_url, force=False, site_code=site_code
                         )
-                        or refreshed
-                    )
-                matches = await asyncio.wait_for(
-                    _fetch_with_session(sess.page if sess else None),
-                    timeout=odds_timeout,
+                    ) or refreshed
+                matches = await _within_odds_budget(
+                    lambda: _fetch_with_session(sess.page if sess else None)
                 )
             else:
                 # 空结果重试：禁止 goto。已在滚球盘则静默再采；否则 gentle 点一次 Tab。
@@ -816,10 +835,11 @@ async def _run_odds_sync(req: OddsSyncRequest):
                             )
                         except Exception:
                             pass
-                    matches = await asyncio.wait_for(
-                        _fetch_with_session(sess.page),
-                        timeout=odds_timeout,
+                    matches = await _within_odds_budget(
+                        lambda: _fetch_with_session(sess.page)
                     )
+                except asyncio.TimeoutError:
+                    raise
                 except Exception:
                     pass
     except asyncio.CancelledError:
@@ -851,16 +871,17 @@ async def _run_odds_sync(req: OddsSyncRequest):
         try:
             from app.services.bookmakers.site_profiles import needs_manual_venue
 
-            sess = await site_sessions.ensure_for_odds(
-                base_url=req.base_url,
-                session_token=token,
-                recreate=not needs_manual_venue(site_code),
-                site_code=site_code,
-                venue_url=(req.venue_url or "").strip(),
+            sess = await _within_odds_budget(
+                lambda: site_sessions.ensure_for_odds(
+                    base_url=req.base_url,
+                    session_token=token,
+                    recreate=not needs_manual_venue(site_code),
+                    site_code=site_code,
+                    venue_url=(req.venue_url or "").strip(),
+                )
             )
-            matches = await asyncio.wait_for(
-                _fetch_with_session(sess.page if sess else None),
-                timeout=odds_timeout,
+            matches = await _within_odds_budget(
+                lambda: _fetch_with_session(sess.page if sess else None)
             )
         except Exception:
             return {

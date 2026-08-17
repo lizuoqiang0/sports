@@ -187,7 +187,9 @@ async def post_odds_sync(
         return None
     path = "/odds/sync-live" if live_only else "/odds/sync"
     if timeout is None:
-        timeout = 75.0 if live_only else 180.0
+        # Gate 可能先等同站车道（最多 35 秒），再执行一次 70 秒滚球抓取。
+        # 客户端超时必须覆盖这段排队时间，否则 Gate 已完成而后端先报同步失败。
+        timeout = 120.0 if live_only else 180.0
     try:
         async with httpx.AsyncClient(timeout=timeout, headers=_gate_headers()) as client:
             resp = await client.post(

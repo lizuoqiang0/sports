@@ -340,7 +340,7 @@ class BrowserSiteConnector(BookmakerConnector):
                 live_only=live_only,
                 limit=limit,
                 venue_url=str((self._profile or {}).get("venue_url") or ""),
-                timeout=90.0 if live_only else 75.0,
+                timeout=120.0 if live_only else 90.0,
             )
             if data is None:
                 return None
