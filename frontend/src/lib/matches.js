@@ -77,22 +77,3 @@ export function sortMatchesByDuration(list) {
   arr.sort((a, b) => matchElapsedSeconds(a) - matchElapsedSeconds(b))
   return arr
 }
-
-/** 跨站去重：相同球类 + 主客队只保留盘口最多的一条（足球/篮球绝不合并） */
-export function dedupMatches(list) {
-  const seen = new Map()
-  for (const m of list) {
-    const sport = String(m.sport || '').toLowerCase() === 'soccer' ? 'football' : String(m.sport || '').toLowerCase()
-    if (sport !== 'football' && sport !== 'basketball') continue
-    const key = `${sport}|${m.home_team}_${m.away_team}`.toLowerCase().trim()
-    if (!seen.has(key)) {
-      seen.set(key, m)
-    } else {
-      const prev = seen.get(key)
-      const prevOdds = Array.isArray(prev.odds) ? prev.odds.length : 0
-      const currOdds = Array.isArray(m.odds) ? m.odds.length : 0
-      if (currOdds > prevOdds) seen.set(key, m)
-    }
-  }
-  return [...seen.values()]
-}

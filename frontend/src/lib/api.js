@@ -60,20 +60,19 @@ export const authAPI = {
 export const matchesAPI = {
   list: (params) => api.get('/matches', { params }),
   detail: (id) => api.get(`/matches/${id}`),
-  grouped: (status) => api.get('/matches/sports/grouped', { params: { status } }),
   search: (q) => api.get('/matches/search', { params: { q } }),
   live: () => api.get('/matches/live/now'),
 }
 
 export const oddsAPI = {
   getMatch: (matchId) => api.get(`/matches/${matchId}/odds`),
-  history: (matchId, params) => api.get(`/odds/history/${matchId}`, { params }),
 }
 
 export const betsAPI = {
   place: (data) => api.post('/bets/place', data),
   history: (params) => api.get('/bets/history', { params }),
   portfolio: () => api.get('/bets/portfolio', { timeout: 45000 }),
+  resetPnl: () => api.post('/bets/portfolio/reset-pnl', null, { timeout: 30000 }),
 }
 
 export const aiAPI = {
@@ -105,7 +104,6 @@ export const aiAPI = {
       params: { sport, limit, refresh: false, provider: provider || undefined },
       timeout: 20000,
     }),
-  history: (params) => api.get('/ai/history', { params }),
   oneClickBet: (matchId, stake = 100, markets = []) =>
     api.post(`/ai/one-click-bet/${matchId}`, { stake, markets }, { timeout: 30000 }),
 }
@@ -133,7 +131,6 @@ export const bookmakersAPI = {
 }
 
 export const monitoringAPI = {
-  overview: () => api.get('/monitoring/overview'),
   getBetMode: () => api.get('/monitoring/bet-mode'),
   setBetMode: (betMode) => api.put('/monitoring/bet-mode', { bet_mode: betMode }),
 }
@@ -154,7 +151,6 @@ export const adminAPI = {
       candidate_ids: candidateIds,
       delete_candidate: deleteCandidate,
     }),
-  clearAliasCandidates: () => api.delete('/admin/nowscore/alias-candidates'),
   getAliasOverrides: (sport = 'all', limit = 100) =>
     api.get('/admin/nowscore/alias-overrides', { params: { sport, limit } }),
   exportAliasOverrides: (sport = 'all', limit = 5000) =>
@@ -169,5 +165,4 @@ export const adminAPI = {
     api.delete('/admin/nowscore/alias-overrides', { params: { record_id: recordId } }),
   deleteAliasOverridesBatch: (recordIds = []) =>
     api.delete('/admin/nowscore/alias-overrides', { data: { record_ids: recordIds } }),
-  clearAliasOverrides: () => api.delete('/admin/nowscore/alias-overrides'),
 }
