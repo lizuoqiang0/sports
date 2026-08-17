@@ -320,7 +320,7 @@ async def get_recommendation(
     match_id: int,
     current_user: User = Depends(get_current_user),
 ):
-    """获取 AI 投注建议：OB/平博单边 · 足球(独赢/让球/大小) · 篮球(大小)。"""
+    """获取 AI 全场小球投注建议。"""
     result = await analyze_and_recommend(
         match_id, current_user.id
     )
@@ -461,7 +461,7 @@ async def get_batch_recommendations(
                 "min_win_rate": round(min_conf * 100, 1),
                 "provider": provider_code or None,
                 "scope": "live",
-                "market": "moneyline,spread,total",
+                "market": "total",
                 "hint": (
                     None
                     if filtered
@@ -497,7 +497,7 @@ async def get_batch_recommendations(
             "analysis_enabled": watching,
             "provider": provider_code or None,
             "scope": "live",
-            "market": "moneyline,spread,total",
+            "market": "total",
             "status": "analyzing" if analyzing else ("ready" if live_total == 0 else "idle"),
             "progress": job.get("progress") or 0,
             "total": job.get("total") or live_total,
@@ -599,7 +599,7 @@ async def ai_bet_history(
 # === 一键投注（各盘口独立下注，互不影响） ===
 class OneClickBetRequest(BaseModel):
     stake: float = settings.AI_DEFAULT_STAKE
-    markets: list[str] = []  # 支持 total/moneyline/spread
+    markets: list[str] = []  # 仅支持 total（全场小球）
 
 
 @router.post("/one-click-bet/{match_id}", response_model=APIResponse)
@@ -609,7 +609,7 @@ async def one_click_bet(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """一键投注：OB/平博单边 · 足球(独赢/让球/大小) · 篮球(大小)。"""
+    """一键投注：OB/平博单边全场小球。"""
     from app.api.bets import place_bet
     from app.schemas import PlaceBetRequest
 

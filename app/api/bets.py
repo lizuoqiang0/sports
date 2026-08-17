@@ -144,7 +144,7 @@ async def place_bet(
     if bt != "total":
         raise HTTPException(
             status_code=400,
-            detail="仅支持全场小球（bet_type=total），独赢/让球/串关已禁用",
+            detail="仅支持全场小球（bet_type=total）",
         )
     if sel != "under":
         raise HTTPException(status_code=400, detail="仅支持小球选项（selection=under）")

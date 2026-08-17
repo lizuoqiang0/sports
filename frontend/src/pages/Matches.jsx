@@ -311,15 +311,10 @@ function MatchCard({ match, onClick }) {
           {Array.isArray(match.odds) && match.odds.length > 0 && (
             <div className="flex gap-2">
               {(() => {
-                const moneyline = match.odds.find(o => o.bet_type === 'moneyline' || o.bet_type === 'Moneyline')
-                if (!moneyline) return null
-                const odds = moneyline.odds_data || {}
+                const total = match.odds.find(o => o.bet_type === 'total' || o.bet_type === 'Total')
+                if (!total || total.odds_data?.under == null) return null
                 return (
-                  <>
-                    <OddsChip label="主" value={liveOdds?.home || odds.home} />
-                    <OddsChip label="平" value={liveOdds?.draw || odds.draw} />
-                    <OddsChip label="客" value={liveOdds?.away || odds.away} />
-                  </>
+                  <OddsChip label={`小球 ${total.total ?? ''}`} value={total.odds_data.under} />
                 )
               })()}
             </div>

@@ -135,7 +135,7 @@ export function ingestAiEventLog(detail) {
   if (eventType === 'ai_analysis_done') {
     const sel = String(data?.selection || '-')
     const market = String(data?.bet_type || 'total')
-    const marketLabel = market === 'total' ? '全场小球' : market === 'moneyline' ? '独赢' : market === 'spread' ? '亚洲让球' : market || '-'
+    const marketLabel = market === 'total' ? '全场小球' : market || '-'
     const tag = data?.should_bet ? '✓推荐' : _fmtWinRate(_num(data?.confidence, 0) * 100)
     pushLogOnce(
       eventKey,
@@ -153,7 +153,7 @@ export function ingestAiEventLog(detail) {
     for (const item of Array.isArray(data?.analysis_summary) ? data.analysis_summary : []) {
       const key = `${eventKey}:analysis:${item.match_id || `${item.home_team || ''}-${item.away_team || ''}`}:${item.selection || ''}:${item.bet_type || ''}`
       const market = String(item.bet_type || '')
-      const marketLabel = market === 'total' ? '全场小球' : market === 'moneyline' ? '独赢' : market === 'spread' ? '亚洲让球' : market || '-'
+      const marketLabel = market === 'total' ? '全场小球' : market || '-'
       const selection = String(item.selection || '-')
       const tag = item.should_bet ? '✓推荐' : _fmtWinRate(item.confidence)
       pushLogOnce(
@@ -172,7 +172,7 @@ export function ingestAiEventLog(detail) {
     for (const item of Array.isArray(data?.analysis_summary) ? data.analysis_summary : []) {
       const key = `${eventKey}:analysis:${item.match_id || `${item.home_team || ''}-${item.away_team || ''}`}:${item.selection || ''}:${item.bet_type || ''}`
       const market = String(item.bet_type || '')
-      const marketLabel = market === 'total' ? '全场小球' : market === 'moneyline' ? '独赢' : market === 'spread' ? '亚洲让球' : market || '-'
+      const marketLabel = market === 'total' ? '全场小球' : market || '-'
       pushLogOnce(
         key,
         'analysis',

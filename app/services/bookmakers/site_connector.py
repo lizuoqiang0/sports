@@ -275,7 +275,7 @@ class BrowserSiteConnector(BookmakerConnector):
                     continue
                 odds_list.append(
                     RemoteOdds(
-                        bet_type=str(od.get("bet_type") or "moneyline"),
+                        bet_type=str(od.get("bet_type") or "total"),
                         odds_data=dict(od.get("odds_data") or {}),
                         spread=float(od.get("spread") or 0),
                         total=float(od.get("total") or 0),

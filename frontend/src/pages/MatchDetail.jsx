@@ -15,7 +15,7 @@ import {
 export default function MatchDetailPage() {
   const { id } = useParams()
   const navigate = useNavigate()
-  const { subscribe, oddsUpdates, matchUpdates } = useWebSocket()
+  const { subscribe, matchUpdates } = useWebSocket()
   const [match, setMatch] = useState(null)
   const [odds, setOdds] = useState([])
   const [loading, setLoading] = useState(true)
@@ -102,22 +102,6 @@ export default function MatchDetailPage() {
     }
   }, [matchUpdates, id])
 
-  useEffect(() => {
-    const update = oddsUpdates[Number(id)]
-    if (update && Array.isArray(odds) && odds.length) {
-      setOdds((prev) => {
-        if (!Array.isArray(prev)) return prev
-        return prev.map((o) => {
-          if ((o.bet_type === 'moneyline' || o.bet_type === 'Moneyline') && update.home !== undefined) {
-            const { _updatedAt, ...rest } = update
-            return { ...o, odds_data: { ...o.odds_data, ...rest } }
-          }
-          return o
-        })
-      })
-    }
-  }, [oddsUpdates])
-
   const loadAIAnalysis = async () => {
     setLoadingAI(true)
     try {
@@ -141,8 +125,6 @@ export default function MatchDetailPage() {
   if (!match) return <div className="page text-ink-400">赛事不存在</div>
 
   const oddsList = Array.isArray(odds) ? odds : []
-  const moneylineRows = oddsList.filter((o) => o.bet_type === 'moneyline' || o.bet_type === 'Moneyline')
-  const spreadRows = oddsList.filter((o) => o.bet_type === 'spread' || o.bet_type === 'Spread')
   const totalRows = oddsList.filter((o) => o.bet_type === 'total' || o.bet_type === 'Total')
   const clockLabel = [match.period, match.clock].filter(Boolean).join(' · ')
   const readableAiReason = aiAnalysis
@@ -300,44 +282,6 @@ export default function MatchDetailPage() {
       <div className="card">
         <h3 className="font-bold mb-4">盘口 · 亚洲盘（仅供查看）</h3>
 
-        {moneylineRows.length > 0 && (
-          <div className="mb-6">
-            <div className="text-sm text-gray-400 mb-2">独赢</div>
-            <div className="space-y-3">
-              {moneylineRows.map((row) => (
-                <div key={`ml-${row.provider || row.id || 'x'}`}>
-                  <div className="text-xs text-brand-700 mb-1.5">{row.provider || '未知站点'}</div>
-                  <div className="grid grid-cols-3 gap-3">
-                    <OddsCell label={match.home_team} value={row.odds_data?.home} />
-                    <OddsCell label="平局" value={row.odds_data?.draw} />
-                    <OddsCell label={match.away_team} value={row.odds_data?.away} />
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
-
-        {spreadRows.length > 0 && (
-          <div className="mb-6">
-            <div className="text-sm text-gray-400 mb-2">亚洲让球</div>
-            <div className="space-y-3">
-              {spreadRows.map((row) => (
-                <div key={`sp-${row.provider || row.id || 'x'}`}>
-                  <div className="text-xs text-brand-700 mb-1.5">
-                    {row.provider || '未知站点'}
-                    {row.spread != null ? ` · ${row.spread > 0 ? '+' : ''}${row.spread}` : ''}
-                  </div>
-                  <div className="grid grid-cols-2 gap-3">
-                    <OddsCell label={match.home_team} value={row.odds_data?.home} />
-                    <OddsCell label={match.away_team} value={row.odds_data?.away} />
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
-
         {totalRows.length > 0 && (
           <div>
             <div className="text-sm text-gray-400 mb-2">全场小球</div>
@@ -357,7 +301,7 @@ export default function MatchDetailPage() {
           </div>
         )}
 
-        {!moneylineRows.length && !spreadRows.length && !totalRows.length && (
+        {!totalRows.length && (
           <p className="text-sm text-ink-400 text-center py-8">暂无盘口数据</p>
         )}
       </div>

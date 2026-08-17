@@ -24,8 +24,6 @@ const SEL_LABEL = {
 
 const MARKET_LABEL = {
   total: '全场小球',
-  moneyline: '独赢',
-  spread: '亚洲让球',
 }
 
 const SPORT_TABS = [
@@ -86,19 +84,6 @@ function formatCellLine(market, cell) {
   const sel = cell?.selection
   if (sel === 'under') {
     return line != null && line !== '' ? `小球 ${line}` : '小球 -'
-  }
-  if (String(market?.bet_type || '') === 'spread' && line != null && line !== '') {
-    const n = Number(line)
-    if (!Number.isFinite(n)) return String(line)
-    // 库内 line 为主队视角：主显示原值，客显示反向
-    if (sel === 'home') return n > 0 ? `+${n}` : String(n)
-    if (sel === 'away') {
-      const opp = -n
-      return opp > 0 ? `+${opp}` : String(opp)
-    }
-  }
-  if (String(market?.bet_type || '') === 'moneyline') {
-    return SEL_LABEL[sel] || sel || '-'
   }
   return SEL_LABEL[sel] || sel || '-'
 }
@@ -488,9 +473,7 @@ export default function AIPanelPage() {
     }
     setBettingId(`${rec.match_id}:primary`)
     try {
-      const bt = String(rec?.recommendation?.bet_type || 'total').toLowerCase()
-      const markets = ['moneyline', 'spread', 'total'].includes(bt) ? [bt] : ['total']
-      const res = await aiAPI.oneClickBet(rec.match_id, stake, markets)
+      const res = await aiAPI.oneClickBet(rec.match_id, stake, ['total'])
       const data = res.data || res
       const bet = (data.bets || [])[0]
       toast.success(
@@ -525,8 +508,8 @@ export default function AIPanelPage() {
 
   const handlePlaceCell = async (rec, market, cell) => {
     const bt = String(market?.bet_type || '').toLowerCase()
-    if (!['total', 'moneyline', 'spread'].includes(bt)) {
-      toast.error('不支持的盘口类型')
+    if (bt !== 'total') {
+      toast.error('仅支持全场小球盘口')
       return
     }
     if (!cell?.available || !cell.odds) {

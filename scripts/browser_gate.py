@@ -394,7 +394,7 @@ class BetPlaceRequest(BaseModel):
     selection: str
     odds: float
     stake: float
-    bet_type: str = "moneyline"
+    bet_type: str = "total"
     odds_data: dict = Field(default_factory=dict)
     headed: bool = False
     site_code: str = "ob"
@@ -939,13 +939,37 @@ async def _run_odds_sync(req: OddsSyncRequest):
             pass
         filtered.append(m)
     matches = filtered
+    # 产品边界：只把全场小球送入后端。其它盘口仍可能出现在站点页面或 XHR
+    # 中，但不应进入同步、AI 或前端展示链路。
+    small_ball_matches = []
+    dropped_market = 0
+    for match in matches:
+        small_ball_odds = []
+        for odd in getattr(match, "odds_list", None) or []:
+            if str(getattr(odd, "bet_type", "") or "").strip().lower() != "total":
+                dropped_market += 1
+                continue
+            odds_data = getattr(odd, "odds_data", None) or {}
+            if not isinstance(odds_data, dict) or odds_data.get("under") in (None, ""):
+                dropped_market += 1
+                continue
+            try:
+                odd.bet_type = "total"
+            except Exception:
+                pass
+            small_ball_odds.append(odd)
+        if small_ball_odds:
+            match.odds_list = small_ball_odds
+            small_ball_matches.append(match)
+    matches = small_ball_matches
     logger.info(
-        "odds-sync %s raw=%d out=%d drop_status=%d drop_started=%d url=%s",
+        "odds-sync %s raw=%d out=%d drop_status=%d drop_started=%d drop_market=%d url=%s",
         site_code,
         raw_n,
         len(matches),
         dropped_status,
         dropped_started,
+        dropped_market,
         page_url,
     )
 

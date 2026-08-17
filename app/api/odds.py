@@ -81,8 +81,8 @@ async def odds_websocket(websocket: WebSocket, token: Optional[str] = None):
         "channel": "odds:match:123",
         "data": {
             "match_id": 123,
-            "bet_type": "moneyline",
-            "odds_data": {"home": 1.85, "away": 2.10},
+            "bet_type": "total",
+            "odds_data": {"under": 1.85},
             "timestamp": "2024-01-01T12:00:00Z"
         }
     }
@@ -179,23 +179,15 @@ async def get_odds_history(
     user: User = Depends(get_current_user),
 ):
     """查询赔率/盘口版本历史（初盘→变盘）。"""
-    from app.ai.market_recommend import (
-        _normalize_bet_type,
-        load_market_line_movement,
-        load_odds_history_rows,
-    )
+    from app.ai.market_recommend import load_market_line_movement, load_odds_history_rows
 
     history = await load_odds_history_rows(
-        db, match_id, bet_type=bet_type, limit=limit
+        db, match_id, bet_type="total", limit=limit
     )
-    want = {_normalize_bet_type(bet_type)} if bet_type else {"moneyline", "spread", "total"}
     movements = {}
-    for bt in ("moneyline", "spread", "total"):
-        if bt not in want:
-            continue
-        move = await load_market_line_movement(db, match_id, bt)
-        if move:
-            movements[bt] = move
+    move = await load_market_line_movement(db, match_id, "total")
+    if move:
+        movements["total"] = move
     return APIResponse(data={
         "match_id": match_id,
         "history": history,

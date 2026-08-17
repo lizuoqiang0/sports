@@ -32,7 +32,7 @@ async def load_odds_matrix(
     db: AsyncSession,
     match_id: int,
     *,
-    bet_type: BetType = BetType.MONEYLINE,
+    bet_type: BetType = BetType.TOTAL,
 ) -> dict[str, dict[str, float]]:
     """返回 {selection: {provider: odds}}，仅当前有效赔率。"""
     result = await db.execute(
