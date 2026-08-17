@@ -19,7 +19,6 @@ export default function BetModeSwitch({ className = '', onChange }) {
       const res = await monitoringAPI.getBetMode()
       setBetMode(res.data?.bet_mode || 'manual')
       setMeta(res.data || null)
-      onChange?.(res.data)
     } catch {
       /* ignore */
     } finally {

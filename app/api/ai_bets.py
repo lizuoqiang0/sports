@@ -302,10 +302,10 @@ async def ai_status(
     fresh = await db.get(User, current_user.id)
     status_info = await get_engine_status(current_user.id)
     ai_enabled = bool(getattr(fresh or current_user, "ai_enabled", False))
-    # 用户已关闭 AI 时，清理可能残留的跨 worker 运行标记，避免刷新后按钮/横幅错态
+    # 状态查询必须无副作用。引擎会在下一轮自行读取持久化开关并退出；
+    # 此处仅屏蔽已关闭 AI 的过期跨 worker 标记，避免刷新页面改变运行状态。
     if not ai_enabled and bool(status_info.get("running")):
-        await stop_user_engine(current_user.id)
-        status_info = {"running": False}
+        status_info = {**status_info, "running": False}
     runtime = compose_ai_runtime_status(
         status_info=status_info,
         user=fresh or current_user,

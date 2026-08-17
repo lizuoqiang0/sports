@@ -185,6 +185,13 @@ export default function AIPanelPage() {
   const [maxScoreFilter, setMaxScoreFilter] = useState('')
   const [highScoreThreshold, setHighScoreThreshold] = useState(0.6)
   const prefetchTimerRef = useRef(null)
+  const runtimeVersionRef = useRef(0)
+
+  const applyRuntimeStatus = (runtime) => {
+    const next = runtime || {}
+    setEngineStatus(next)
+    setBetMode(next.bet_mode || 'manual')
+  }
 
   const loadDsSwitch = async () => {
     try {
@@ -532,14 +539,17 @@ export default function AIPanelPage() {
 
   const loadAll = async () => {
     setLoading(true)
+    const runtimeVersion = runtimeVersionRef.current
     try {
       // 配置与推荐解耦，避免推荐超时导致配置加载失败
       const [statusRes, configRes] = await Promise.all([
         aiAPI.status(),
         aiAPI.config(),
       ])
-      setEngineStatus(statusRes.data || {})
-      setBetMode(statusRes.data?.bet_mode || 'manual')
+      // 用户刚切换模式或启停时，不让页面初始化的旧响应覆盖最新状态。
+      if (runtimeVersion === runtimeVersionRef.current) {
+        applyRuntimeStatus(statusRes.data)
+      }
       setConfig(configRes.data)
 
       const c = configRes.data || {}
@@ -558,12 +568,12 @@ export default function AIPanelPage() {
 
   const handleStart = async () => {
     setStarting(true)
+    runtimeVersionRef.current += 1
     try {
       const res = await aiAPI.start()
       toast.success(res.message || '自动下单已启动')
       addAiLog('engine', `${res.message || '自动下单已启动'}（${res.data?.effective_label || '运行中'}）`)
-      setEngineStatus(res.data || { engine_running: true })
-      setBetMode(res.data?.bet_mode || betMode)
+      applyRuntimeStatus(res.data || { engine_running: true, bet_mode: betMode })
       updateUser({ ai_enabled: true })
       loadRecommendations(true)
     } catch (err) {
@@ -574,11 +584,12 @@ export default function AIPanelPage() {
   }
 
   const handleStop = async () => {
+    runtimeVersionRef.current += 1
     try {
       const res = await aiAPI.stop()
       toast.success(res.message || '自动下单已停止')
       addAiLog('engine', res.message || '自动下单已停止')
-      setEngineStatus(res.data || { engine_running: false, ai_enabled: false })
+      applyRuntimeStatus(res.data || { engine_running: false, ai_enabled: false, bet_mode: betMode })
       updateUser({ ai_enabled: false })
     } catch (err) {
       toast.error(err?.detail || err?.message || '停止失败')
@@ -883,10 +894,11 @@ export default function AIPanelPage() {
             <BetModeSwitch
               onChange={async (data) => {
                 if (!data) return
+                runtimeVersionRef.current += 1
                 setBetMode(data.bet_mode || 'manual')
                 try {
                   const statusRes = await aiAPI.status()
-                  setEngineStatus(statusRes.data || {})
+                  applyRuntimeStatus(statusRes.data)
                 } catch {
                   setEngineStatus((s) => ({ ...(s || {}), ...data }))
                 }
