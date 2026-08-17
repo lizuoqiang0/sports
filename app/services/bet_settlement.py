@@ -27,14 +27,17 @@ _SETTLED_CACHE_TTL = 300  # 5 分钟
 
 
 def _decide_total_outcome(*, selection: str, line: Optional[float], total: float) -> str:
-    """判定小球单输赢：won / lost / push。"""
+    """判定小球单输赢；遗留的非小球方向安全返回 unknown。"""
     if line is None:
         return "unknown"
     sel = str(selection or "").strip().lower()
-    if total > line:
-        return "lost"
-    if total < line:
-        return "won" if sel == "under" else "lost"
+    if sel == "under":
+        if total > line:
+            return "lost"
+        if total < line:
+            return "won"
+    else:
+        return "unknown"
     return "push"  # 整数线平总得分：走水退本金
 
 
@@ -51,6 +54,16 @@ def _quarter_split(line: float) -> Optional[tuple[float, float]]:
     if q % 2 == 1:
         return (float(line) - 0.25, float(line) + 0.25)
     return None
+
+
+def _split_stake(stake: Decimal, parts: int) -> tuple[Decimal, ...]:
+    """按分拆分本金，保证各部分之和始终等于原始金额。"""
+    if parts <= 1:
+        return (stake,)
+    if parts == 2:
+        first = (stake / 2).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        return (first, stake - first)
+    raise ValueError(f"unsupported stake split parts={parts}")
 
 
 async def settle_finished_bets(*, limit: int = 200) -> int:
@@ -117,21 +130,21 @@ async def settle_finished_bets(*, limit: int = 200) -> int:
                         )
                     else:
                         lines = _quarter_split(line_f) or (line_f,)
-                        half_stake = (stake_d / len(lines)).quantize(
-                            Decimal("0.01"), rounding=ROUND_HALF_UP
-                        )
+                        # 分币金额不能将同一半注分别四舍五入，否则 1.01 会变成
+                        # 0.51 + 0.51，凭空多出一分钱。第二半承担余数以守恒本金。
+                        stakes = _split_stake(stake_d, len(lines))
                         payout = Decimal("0.00")
                         parts = []
-                        for ln in lines:
+                        for ln, part_stake in zip(lines, stakes):
                             oc = _decide_total_outcome(
                                 selection=bet.selection, line=ln, total=total
                             )
                             if oc == "won":
-                                payout += (half_stake * Decimal(str(bet.odds))).quantize(
+                                payout += (part_stake * Decimal(str(bet.odds))).quantize(
                                     Decimal("0.01"), rounding=ROUND_HALF_UP
                                 )
                             elif oc in ("push", "unknown"):
-                                payout += half_stake
+                                payout += part_stake
                             parts.append(oc)
                         outcome = "/".join(parts) if len(parts) > 1 else parts[0]
 

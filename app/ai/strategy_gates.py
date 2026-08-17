@@ -42,11 +42,11 @@ def stake_bounds(strat: StrategyConfig) -> tuple[Decimal, Decimal]:
 
 
 def cap_stake(stake: Decimal | float, strat: StrategyConfig) -> Decimal:
-    """仓位夹在 [1, 配置单笔最大金额]。"""
+    """仓位夹在 [1, 配置单笔最大金额]。0/负值回退最小注（不回退满仓）。"""
     s = Decimal(str(stake or 0))
     lo, hi = stake_bounds(strat)
     if s <= 0:
-        return hi  # 默认用配置单笔上限
+        return lo
     return min(max(s, lo), hi)
 
 

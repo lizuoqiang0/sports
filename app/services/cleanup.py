@@ -5,16 +5,16 @@ import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
 
-from sqlalchemy import select, delete, func
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import exists, select, delete
 
 from app.config import settings
 from app.database import AsyncSessionLocal
-from app.models.user import Bet, Match, Odds, MatchContextRow, Transaction
+from app.models.user import Bet, Match, Odds, MatchContextRow
 
 logger = logging.getLogger(__name__)
 
 _task: asyncio.Task | None = None
+_MATCH_DELETE_BATCH_SIZE = 500
 
 
 async def _cleanup_once() -> dict:
@@ -30,36 +30,34 @@ async def _cleanup_once() -> dict:
         )
         stats["bets"] = result.rowcount or 0
 
-        # 2. 删除没有剩余投注的过期赛事（Odds / MatchContextRow 会 CASCADE 删除）
-        #    先找出有剩余投注的赛事 ID，排除它们
-        remaining_match_ids = await db.execute(
-            select(Bet.match_id).where(Bet.match_id.isnot(None)).distinct()
+        # 2. 数据库侧排除仍有关联注单的赛事；分页避免全表 ID 拉进 Python
+        #    内存和生成超大的 IN 参数。Odds / MatchContextRow 显式删除便于统计。
+        has_remaining_bet = exists(
+            select(1).where(Bet.match_id == Match.id)
         )
-        protected_ids = {row[0] for row in remaining_match_ids}
+        while True:
+            candidate_rows = await db.execute(
+                select(Match.id)
+                .where(Match.created_at < cutoff, ~has_remaining_bet)
+                .order_by(Match.id)
+                .limit(_MATCH_DELETE_BATCH_SIZE)
+            )
+            deletable_match_ids = list(candidate_rows.scalars())
+            if not deletable_match_ids:
+                break
 
-        # 查询过期赛事
-        old_matches = await db.execute(
-            select(Match.id).where(Match.created_at < cutoff)
-        )
-        old_match_ids = [row[0] for row in old_matches]
-
-        # 过滤掉有剩余投注的赛事
-        deletable_match_ids = [mid for mid in old_match_ids if mid not in protected_ids]
-
-        if deletable_match_ids:
-            # 手动删除 Odds（虽然 CASCADE 也会处理，但显式删除更可控）
-            await db.execute(
+            odds_result = await db.execute(
                 delete(Odds).where(Odds.match_id.in_(deletable_match_ids))
             )
-            # 手动删除 MatchContextRow
-            await db.execute(
+            contexts_result = await db.execute(
                 delete(MatchContextRow).where(MatchContextRow.match_id.in_(deletable_match_ids))
             )
-            # 删除赛事
             result = await db.execute(
                 delete(Match).where(Match.id.in_(deletable_match_ids))
             )
-            stats["matches"] = result.rowcount or 0
+            stats["odds"] += odds_result.rowcount or 0
+            stats["contexts"] += contexts_result.rowcount or 0
+            stats["matches"] += result.rowcount or 0
 
         await db.commit()
 

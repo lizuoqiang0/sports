@@ -658,8 +658,8 @@ async def one_click_bet(
     lo, hi = stake_bounds(strat0)
     stake = Decimal(str(req.stake or 0))
     if stake <= 0:
-        # 默认用策略单笔上限
-        stake = hi
+        # 显式 0/负值回退最小注（schema 默认已有 AI_DEFAULT_STAKE，不回退满仓）
+        stake = lo
     if stake + Decimal("0.0001") < lo:
         raise HTTPException(status_code=400, detail=f"金额需 ≥{lo:g}（AI 策略配置）")
     if stake - Decimal("0.0001") > hi:

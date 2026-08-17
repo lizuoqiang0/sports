@@ -33,9 +33,9 @@ class TestCapStake:
         strat = StrategyConfig(max_bet_amount=100.0)
         assert cap_stake(0.5, strat) == Decimal("1")
 
-    def test_zero_defaults_to_max(self):
+    def test_zero_defaults_to_minimum(self):
         strat = StrategyConfig(max_bet_amount=100.0)
-        assert cap_stake(0, strat) == Decimal("100")
+        assert cap_stake(0, strat) == Decimal("1")
 
 
 class TestMinStakeFloor:

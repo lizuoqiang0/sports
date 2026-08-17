@@ -16,6 +16,7 @@ from fastapi import WebSocket
 logger = logging.getLogger(__name__)
 
 _WS_FANOUT_CHANNEL = "ob:ws:fanout"
+_SEND_TIMEOUT_SEC = 3.0
 
 
 class ConnectionManager:
@@ -148,29 +149,60 @@ class ConnectionManager:
         await self._send(websocket, {"type": "unsubscribed", "channel": channel})
 
     async def _local_broadcast_channel(self, channel: str, message: dict) -> None:
-        subscribers = self.channel_subscribers.get(channel, set()).copy()
+        subscribers = tuple(self.channel_subscribers.get(channel, set()))
         if not subscribers:
             return
-        disconnected = []
-        for ws in subscribers:
-            try:
-                await ws.send_json(message)
-            except Exception:
-                disconnected.append(ws)
-        for ws in disconnected:
-            self.subscriptions.pop(ws, None)
+        delivered = await asyncio.gather(
+            *(self._send(ws, message) for ws in subscribers),
+            return_exceptions=True,
+        )
+        disconnected = [
+            ws for ws, ok in zip(subscribers, delivered)
+            if ok is not True
+        ]
+        if disconnected:
+            await self._drop_connections(disconnected)
 
     async def _local_broadcast_user(self, user_id: int, message: dict) -> None:
-        connections = self.active_connections.get(user_id, set()).copy()
-        for ws in connections:
-            await self._send(ws, message)
+        connections = tuple(self.active_connections.get(user_id, set()))
+        if connections:
+            delivered = await asyncio.gather(
+                *(self._send(ws, message) for ws in connections),
+                return_exceptions=True,
+            )
+            disconnected = [
+                ws for ws, ok in zip(connections, delivered) if ok is not True
+            ]
+            if disconnected:
+                await self._drop_connections(disconnected)
 
     async def _local_broadcast_all(self, message: dict) -> None:
         all_ws = set()
         for conns in self.active_connections.values():
             all_ws.update(conns)
-        for ws in all_ws:
-            await self._send(ws, message)
+        connections = tuple(all_ws)
+        if connections:
+            delivered = await asyncio.gather(
+                *(self._send(ws, message) for ws in connections),
+                return_exceptions=True,
+            )
+            disconnected = [
+                ws for ws, ok in zip(connections, delivered) if ok is not True
+            ]
+            if disconnected:
+                await self._drop_connections(disconnected)
+
+    async def _drop_connections(self, websockets: list[WebSocket]) -> None:
+        """移除已经超时或断开的连接，避免其反复拖慢赔率广播。"""
+        stale = set(websockets)
+        async with self._lock:
+            for ws in stale:
+                for channel in self.subscriptions.pop(ws, set()):
+                    self.channel_subscribers.get(channel, set()).discard(ws)
+            for user_id, connections in list(self.active_connections.items()):
+                connections.difference_update(stale)
+                if not connections:
+                    del self.active_connections[user_id]
 
     async def broadcast_to_channel(self, channel: str, message: dict):
         await self._local_broadcast_channel(channel, message)
@@ -184,11 +216,12 @@ class ConnectionManager:
         await self._local_broadcast_all(message)
         await self._publish_fanout({"kind": "all", "message": message})
 
-    async def _send(self, ws: WebSocket, message: dict):
+    async def _send(self, ws: WebSocket, message: dict) -> bool:
         try:
-            await ws.send_json(message)
+            await asyncio.wait_for(ws.send_json(message), timeout=_SEND_TIMEOUT_SEC)
+            return True
         except Exception:
-            pass
+            return False
 
     def _total_connections(self) -> int:
         return sum(len(v) for v in self.active_connections.values())
@@ -200,11 +233,25 @@ class ConnectionManager:
             all_ws = set()
             for conns in self.active_connections.values():
                 all_ws.update(conns)
-            for ws in all_ws:
-                try:
-                    await ws.send_text(ping_msg)
-                except Exception:
-                    pass
+            connections = tuple(all_ws)
+            if not connections:
+                continue
+            delivered = await asyncio.gather(
+                *(self._send_text(ws, ping_msg) for ws in connections),
+                return_exceptions=True,
+            )
+            disconnected = [
+                ws for ws, ok in zip(connections, delivered) if ok is not True
+            ]
+            if disconnected:
+                await self._drop_connections(disconnected)
+
+    async def _send_text(self, ws: WebSocket, message: str) -> bool:
+        try:
+            await asyncio.wait_for(ws.send_text(message), timeout=_SEND_TIMEOUT_SEC)
+            return True
+        except Exception:
+            return False
 
 
 manager = ConnectionManager()

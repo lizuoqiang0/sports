@@ -29,6 +29,24 @@ router = APIRouter(prefix="/api/v1/bets", tags=["投注"])
 LOCAL_RECORDED_BET_STATUSES = frozenset({BetStatus.SUCCESS})
 PENDING_RECONCILE_TIMEOUT_SEC = 4.0
 PENDING_LIST_TIMEOUT_SEC = 2.0
+_BET_LOCK_TTL_SEC = 180
+_BET_LOCK_RENEW_SEC = 30
+
+
+async def _renew_bet_lock(key: str, token: str) -> None:
+    """在真实站点响应缓慢时保持下单互斥锁，避免 TTL 到期后重复提交。"""
+    from app.core.cache import cache
+
+    try:
+        while True:
+            await asyncio.sleep(_BET_LOCK_RENEW_SEC)
+            if not await cache.extend_lock_if_owned(
+                key, token, ttl_sec=_BET_LOCK_TTL_SEC
+            ):
+                logger.error("下单锁续期失败 key=%s；等待当前请求结束", key)
+                return
+    except asyncio.CancelledError:
+        raise
 
 
 async def _load_pending_items_for_view(user_id: int, *, scene: str) -> list[dict]:
@@ -111,6 +129,7 @@ async def place_bet(
             Bet.user_id == current_user.id,
             Bet.match_id.in_(sib_ids),
             Bet.status == BetStatus.SUCCESS,
+            Bet.settled_at.is_(None),
         ).limit(1)
     )
     if existing_open.scalar_one_or_none() is not None:
@@ -286,19 +305,6 @@ async def place_bet(
             detail=f"{provider_label or provider_code} 余额不足（当前 {float(site_acc.balance or 0):.2f}）",
         )
 
-    # 每日限额：必须在真实下单之前检查（避免已扣款却返回 400）
-    today = datetime.now(timezone.utc).date()
-    today_start = datetime.combine(today, datetime.min.time(), tzinfo=timezone.utc)
-    daily_count_result = await db.execute(
-        select(func.count(Bet.id)).where(
-            Bet.user_id == current_user.id,
-            Bet.created_at >= today_start,
-        )
-    )
-    daily_count = daily_count_result.scalar_one()
-    if daily_count >= settings.MAX_DAILY_BETS:
-        raise HTTPException(status_code=400, detail=f"今日投注已达上限({settings.MAX_DAILY_BETS}笔)")
-
     connector = get_connector(
         provider_code,
         base_url=site_acc.base_url,
@@ -339,6 +345,9 @@ async def place_bet(
     acc_id_val = site_acc.id
     stake_val = req.stake
     odds_val = final_odds
+    potential_payout = (
+        Decimal(str(stake_val)) * Decimal(str(odds_val))
+    ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     selection_val = req.selection
     bet_type_val = place_payload["bet_type"]
     # 结算用盘口线
@@ -356,24 +365,43 @@ async def place_bet(
 
     await release_db_session(db)
 
-    # Redis 同场下单锁：覆盖 Gate 调用 + 写库，防多 worker / 一键+自动双发
+    # 同一用户的下单串行化：限额检查、同场防重、站点提交和落库必须属于同一个
+    # 临界区，否则不同赛事的并发请求可越过每日限额，或在落库前重复提交。
     from app.core.cache import cache
     import uuid
 
     lock_token = uuid.uuid4().hex
-    lock_key = f"bet:place:{user_id_val}:{sorted(sib_ids)[0] if sib_ids else match_id_val}"
-    got_lock = await cache.acquire_lock(lock_key, ttl_sec=150, token=lock_token)
+    lock_key = f"bet:place:user:{user_id_val}"
+    got_lock = await cache.acquire_lock(lock_key, ttl_sec=_BET_LOCK_TTL_SEC, token=lock_token)
     if not got_lock:
-        raise HTTPException(status_code=409, detail="该场比赛正在下单中，请稍候")
+        raise HTTPException(status_code=409, detail="当前账户正在下单中，请稍候")
+    lock_renew_task = asyncio.create_task(
+        _renew_bet_lock(lock_key, lock_token), name=f"ob-bet-lock:{user_id_val}"
+    )
 
     try:
-        # 抢锁后再次确认无未结算注单
+        # 抢锁后再检查每日限额和同场未结算单，避免跨 worker 并发穿透。
         async with AsyncSessionLocal() as cdb:
+            today = datetime.now(timezone.utc).date()
+            today_start = datetime.combine(today, datetime.min.time(), tzinfo=timezone.utc)
+            daily_count_result = await cdb.execute(
+                select(func.count(Bet.id)).where(
+                    Bet.user_id == user_id_val,
+                    Bet.created_at >= today_start,
+                )
+            )
+            daily_count = daily_count_result.scalar_one()
+            if daily_count >= settings.MAX_DAILY_BETS:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"今日投注已达上限({settings.MAX_DAILY_BETS}笔)",
+                )
             again = await cdb.execute(
                 select(Bet.id).where(
                     Bet.user_id == user_id_val,
                     Bet.match_id.in_(sib_ids or [match_id_val]),
                     Bet.status == BetStatus.SUCCESS,
+                    Bet.settled_at.is_(None),
                 ).limit(1)
             )
             await cdb.commit()
@@ -401,62 +429,79 @@ async def place_bet(
         provider_label = provider_name(provider_code)
         placed_on_site = True
     finally:
-        await cache.release_lock(lock_key, lock_token)
+        # 站点拒绝、超时等没有产生本地成功单时可立即放锁；站点已受理则
+        # 必须继续持有到本地订单事务提交完毕。
+        if not placed_on_site:
+            lock_renew_task.cancel()
+            try:
+                await lock_renew_task
+            except asyncio.CancelledError:
+                pass
+            await cache.release_lock(lock_key, lock_token)
 
     # 4. 必须落到真实站点，否则拒绝（不扣本地余额）
     if not placed_on_site:
         raise HTTPException(status_code=400, detail="下单未落到真实站点")
 
-    # 5–6. 短会话写库（余额/注单/流水）
-    async with AsyncSessionLocal() as wdb:
-        site_acc = await wdb.get(BookmakerAccount, acc_id_val)
-        user_row = await wdb.get(User, user_id_val)
-        if site_acc is None or user_row is None:
-            raise HTTPException(status_code=500, detail="下单成功但写库失败：账户丢失")
+    # 5–6. 短会话写库（余额/注单/流水）。无论落库成功或失败，都在此处
+    # 结束用户锁；失败时至少会在响应前留下明确错误而不是制造并发重复提交。
+    try:
+        async with AsyncSessionLocal() as wdb:
+            site_acc = await wdb.get(BookmakerAccount, acc_id_val)
+            user_row = await wdb.get(User, user_id_val)
+            if site_acc is None or user_row is None:
+                raise HTTPException(status_code=500, detail="下单成功但写库失败：账户丢失")
+            try:
+                bal = await connector.fetch_balance()
+                site_acc.balance = bal
+            except Exception:
+                if place.balance_after and place.balance_after > 0:
+                    site_acc.balance = place.balance_after
+                else:
+                    site_acc.balance = Decimal(str(site_acc.balance or 0)) - stake_val
+
+            bet = Bet(
+                user_id=user_id_val,
+                match_id=match_id_val,
+                bet_type=bet_type_val,
+                selection=selection_val,
+                odds=odds_val,
+                stake=stake_val,
+                potential_payout=potential_payout,
+                actual_payout=Decimal("0"),  # 未结算，由 bet_settlement 按完场比分写回
+                line=line_val,
+                status=BetStatus.SUCCESS,
+                provider=provider_label,
+                external_bet_id=external_bet_id,
+            )
+            wdb.add(bet)
+            await wdb.flush()
+
+            tx = Transaction(
+                user_id=user_id_val,
+                type=TransactionType.BET_PLACE,
+                amount=Decimal("0"),
+                balance_after=user_row.balance,
+                bet_id=bet.id,
+                description=(
+                    f"站点投注: {match_home} vs {match_away} [{selection_val} @ {odds_val}]"
+                    f" @{provider_label}"
+                    + (f" 单号={external_bet_id}" if external_bet_id else "")
+                ),
+            )
+            wdb.add(tx)
+            await wdb.commit()
+            await wdb.refresh(bet)
+            balance_after_user = user_row.balance
+            bet_id_val = bet.id
+            bet_status_val = bet.status.value if hasattr(bet.status, "value") else str(bet.status)
+    finally:
+        lock_renew_task.cancel()
         try:
-            bal = await connector.fetch_balance()
-            site_acc.balance = bal
-        except Exception:
-            if place.balance_after and place.balance_after > 0:
-                site_acc.balance = place.balance_after
-            else:
-                site_acc.balance = Decimal(str(site_acc.balance or 0)) - stake_val
-
-        bet = Bet(
-            user_id=user_id_val,
-            match_id=match_id_val,
-            bet_type=bet_type_val,
-            selection=selection_val,
-            odds=odds_val,
-            stake=stake_val,
-            potential_payout=potential_payout,
-            actual_payout=Decimal("0"),  # 未结算，由 bet_settlement 按完场比分写回
-            line=line_val,
-            status=BetStatus.SUCCESS,
-            provider=provider_label,
-            external_bet_id=external_bet_id,
-        )
-        wdb.add(bet)
-        await wdb.flush()
-
-        tx = Transaction(
-            user_id=user_id_val,
-            type=TransactionType.BET_PLACE,
-            amount=Decimal("0"),
-            balance_after=user_row.balance,
-            bet_id=bet.id,
-            description=(
-                f"站点投注: {match_home} vs {match_away} [{selection_val} @ {odds_val}]"
-                f" @{provider_label}"
-                + (f" 单号={external_bet_id}" if external_bet_id else "")
-            ),
-        )
-        wdb.add(tx)
-        await wdb.commit()
-        await wdb.refresh(bet)
-        balance_after_user = user_row.balance
-        bet_id_val = bet.id
-        bet_status_val = bet.status.value if hasattr(bet.status, "value") else str(bet.status)
+            await lock_renew_task
+        except asyncio.CancelledError:
+            pass
+        await cache.release_lock(lock_key, lock_token)
 
     # 8. WebSocket推送
     await manager.broadcast_to_user(user_id_val, {

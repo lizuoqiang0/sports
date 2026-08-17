@@ -172,7 +172,9 @@ async def sync_live_scores_odds(
             provider = provider_name(acc_code)
             written_keys: set[tuple] = set()
 
-            # 每站独立短会话写库，避免跨站污染 / 断连
+            # 每站独立短会话写库，避免跨站污染 / 断连。
+            # 仅在提交成功后发送事件，避免客户端看到最终回滚的数据。
+            committed_updates: list[tuple[Match, list[dict]]] = []
             async with AsyncSessionLocal() as wdb:
                 local_by_id = await _reload_live_map(wdb)
                 acc = await wdb.get(BookmakerAccount, acc_id)
@@ -251,11 +253,14 @@ async def sync_live_scores_odds(
                             "is_live": True,
                         })
 
-                    await _broadcast_match_update(match, odds_payload, now)
+                    committed_updates.append((match, odds_payload))
 
                 acc.last_sync_at = now.replace(tzinfo=None) if getattr(now, "tzinfo", None) else now
                 acc.last_error = None
                 await wdb.commit()
+
+            for changed_match, odds_payload in committed_updates:
+                await _broadcast_match_update(changed_match, odds_payload, now)
         except Exception as e:
             err_txt = str(e)
             logger.exception("live sync failed %s", acc_code)
@@ -324,9 +329,14 @@ async def sync_live_scores_odds(
     except Exception:
         logger.debug("stale/not-started live demote failed", exc_info=True)
 
-    # 清列表缓存，下一轮 HTTP 拉到新比分
+    # 清列表缓存，下一轮 HTTP 拉到新比分。SCAN 是渐进迭代，不阻塞 Redis。
     try:
-        keys = await cache.client.keys("matches:list:*")
+        keys: list[str] = []
+        async for key in cache.client.scan_iter(match="matches:list:*", count=200):
+            keys.append(key)
+            if len(keys) >= 200:
+                await cache.client.delete(*keys)
+                keys.clear()
         if keys:
             await cache.client.delete(*keys)
     except Exception:

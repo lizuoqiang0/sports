@@ -63,8 +63,11 @@ async def _try_acquire() -> bool:
         return True
     cur = await client.get(_LEADER_KEY)
     if cur == _worker_id:
-        await client.expire(_LEADER_KEY, _LEADER_TTL)
-        return True
+        # GET 与 EXPIRE 之间 key 可能过期并被其它 worker 抢到；必须原子校验
+        # 所有权后再续租，否则旧 leader 会短暂和新 leader 同时执行后台任务。
+        return await cache.extend_lock_if_owned(
+            _LEADER_KEY, _worker_id, ttl_sec=_LEADER_TTL
+        )
     return False
 
 
