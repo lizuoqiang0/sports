@@ -19,6 +19,10 @@ if [[ ! -f frontend/dist/index.html ]]; then
   exit 1
 fi
 
+echo "==> 启动宿主机 Browser Gate"
+BOOKMAKER_BROWSER_HEADLESS="${BOOKMAKER_BROWSER_HEADLESS:-0}" \
+  bash scripts/ensure_browser_gate.sh start
+
 echo "==> 同步最新代码到镜像（无需 Docker Hub 重建）"
 services=(backend frontend)
 # AI 引擎是独立进程；已启用时必须随 API 一起重启，才能加载最新策略代码。
@@ -56,5 +60,5 @@ else
 fi
 
 echo "生产栈已启动。前端请经反向代理 HTTPS；API docs 默认关闭。"
-echo "Gate: bash scripts/ensure_browser_gate.sh fix  （会读取 .env 中的 INTERNAL_API_TOKEN）"
+echo "Gate: http://127.0.0.1:${GATE_PORT:-9277}/health"
 echo "打开: http://127.0.0.1:3000"
