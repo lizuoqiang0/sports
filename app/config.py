@@ -86,6 +86,7 @@ class Settings(BaseSettings):
     AI_MIN_CONFIDENCE: float = 0.47        # 下单最低置信度（含纯盘口模式）
     AI_MIN_ODDS: float = 1.65              # 下单最低赔率
     AI_MAX_ODDS: float = 5.00              # 下单最高赔率
+    LIVE_ODDS_MAX_AGE_SEC: int = 90        # 滚球下单允许的赔率最大年龄
 
     AI_SCAN_INTERVAL_SEC: int = 120        # AI 引擎扫描间隔（秒）
     AI_RECS_LIMIT: int = 80                # 推荐页分析上限

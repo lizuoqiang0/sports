@@ -234,6 +234,20 @@ async def place_bet(
         raise HTTPException(status_code=400, detail=f"无效选项: {req.selection}")
     current_odds = float(raw_odds)
 
+    if match.status == MatchStatus.LIVE:
+        valid_from = odds_obj.valid_from
+        if valid_from is None:
+            raise HTTPException(status_code=409, detail="滚球赔率时间缺失，请先重新同步盘口")
+        if getattr(valid_from, "tzinfo", None) is None:
+            valid_from = valid_from.replace(tzinfo=timezone.utc)
+        odds_age = (datetime.now(timezone.utc) - valid_from).total_seconds()
+        max_age = max(1, int(settings.LIVE_ODDS_MAX_AGE_SEC))
+        if odds_age < -5 or odds_age > max_age:
+            raise HTTPException(
+                status_code=409,
+                detail=f"滚球赔率已过期（{max(0, int(odds_age))}秒），请刷新盘口后再下单",
+            )
+
     # 提前加载策略，用于赔率变动判断
     from app.ai.strategy import load_fresh_strategy
     from app.ai.strategy_gates import stake_bounds
