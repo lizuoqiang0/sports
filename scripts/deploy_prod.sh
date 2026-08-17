@@ -21,7 +21,7 @@ fi
 
 echo "==> 启动宿主机 Browser Gate"
 BOOKMAKER_BROWSER_HEADLESS="${BOOKMAKER_BROWSER_HEADLESS:-0}" \
-  bash scripts/ensure_browser_gate.sh start
+  bash scripts/ensure_browser_gate.sh watch
 
 echo "==> 同步最新代码到镜像（无需 Docker Hub 重建）"
 services=(backend frontend)
