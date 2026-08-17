@@ -6,9 +6,11 @@ import { usePagePoll } from '../hooks/usePagePoll.js'
 import { useAuth } from '../store/auth.jsx'
 import { useWebSocket } from '../store/websocket.jsx'
 import PageHeader from '../components/PageHeader.jsx'
+import { extractErrorMessage } from '../lib/httpError.js'
+import toast from 'react-hot-toast'
 import {
   TrendingUp, TrendingDown, Wallet,
-  Bot, Radio, Loader2
+  Bot, Radio, Loader2, RotateCcw
 } from 'lucide-react'
 import { formatMoney, toNumber } from '../lib/format.js'
 
@@ -23,6 +25,7 @@ export default function DashboardPage() {
   const [aiStatus, setAiStatus] = useState({ running: false })
   const [siteBalances, setSiteBalances] = useState({ sites: [], total_balance: 0 })
   const [loading, setLoading] = useState(true)
+  const [resetting, setResetting] = useState(false)
 
   const loadDashboard = useCallback(async ({ silent = false } = {}) => {
     if (!silent) setLoading(true)
@@ -45,6 +48,24 @@ export default function DashboardPage() {
       setLoading(false)
     }
   }, [])
+
+  const handleResetPnl = useCallback(async () => {
+    if (resetting) return
+    if (!window.confirm('确认清零网站盈亏？将以当前总余额作为新基准。')) return
+
+    setResetting(true)
+    try {
+      const result = await betsAPI.resetPnl()
+      setStats((previous) => ({ ...previous, ...(result.data || {}) }))
+      toast.success(result.data?.message || '网站盈亏已清零')
+      await loadDashboard({ silent: true })
+    } catch (err) {
+      console.error('Reset pnl error:', err)
+      toast.error(extractErrorMessage(err, '清零复位失败，请重试'))
+    } finally {
+      setResetting(false)
+    }
+  }, [loadDashboard, resetting])
 
   useEffect(() => {
     loadDashboard()
@@ -171,10 +192,24 @@ export default function DashboardPage() {
         <div className="card">
           <div className="flex items-center justify-between mb-3">
             <span className="text-xs font-semibold text-ink-500 tracking-wide">网站盈亏</span>
-            <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${
-              balanceDelta >= 0 ? 'bg-brand-50 text-brand-700' : 'bg-rose-50 text-rose-700'
-            }`}>
-              {balanceDelta >= 0 ? <TrendingUp size={15} strokeWidth={1.8} /> : <TrendingDown size={15} strokeWidth={1.8} />}
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={handleResetPnl}
+                disabled={resetting}
+                aria-label="清零网站盈亏"
+                title="清零网站盈亏"
+                className="w-8 h-8 rounded-lg bg-ink-50 text-ink-500 hover:bg-ink-100 hover:text-ink-700 flex items-center justify-center transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {resetting
+                  ? <Loader2 size={14} strokeWidth={1.8} className="animate-spin" />
+                  : <RotateCcw size={14} strokeWidth={1.8} />}
+              </button>
+              <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${
+                balanceDelta >= 0 ? 'bg-brand-50 text-brand-700' : 'bg-rose-50 text-rose-700'
+              }`}>
+                {balanceDelta >= 0 ? <TrendingUp size={15} strokeWidth={1.8} /> : <TrendingDown size={15} strokeWidth={1.8} />}
+              </div>
             </div>
           </div>
           <div className={`metric-value text-[1.5rem] ${balanceDelta >= 0 ? 'text-brand-700' : 'text-rose-600'}`}>
