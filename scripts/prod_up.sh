@@ -12,6 +12,16 @@ cd "$ROOT"
 export DOCKER_BUILDKIT=1
 export COMPOSE_DOCKER_CLI_BUILD=1
 
+usage() {
+  cat <<'EOF'
+Mac/GUI 生产启动（docker-compose 编排 + 宿主机 Browser Gate）
+  bash scripts/prod_up.sh              # 日常：有镜像则秒级 up，不重建
+  bash scripts/prod_up.sh --build      # 代码/依赖变更后重建镜像
+  bash scripts/prod_up.sh --pull       # 仅预拉基础镜像
+  bash scripts/prod_up.sh --with-ai    # 同时启动 AI 引擎
+EOF
+}
+
 WITH_AI=0
 FORCE_BUILD=0
 PULL_ONLY=0
@@ -21,7 +31,7 @@ for arg in "$@"; do
     --build) FORCE_BUILD=1 ;;
     --pull) PULL_ONLY=1 ;;
     -h|--help)
-      sed -n '2,8p' "$0"
+      usage
       exit 0
       ;;
   esac
