@@ -72,7 +72,6 @@ async def _load_pending_items_for_view(user_id: int, *, scene: str) -> list[dict
 @router.post("/place", response_model=APIResponse)
 async def place_bet(
     req: PlaceBetRequest,
-    dry_run: bool = False,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -355,39 +354,6 @@ async def place_bet(
     except Exception:
         line_val = None
 
-    potential_payout = (stake_val * Decimal(str(odds_val))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    if dry_run:
-        logger.info(
-            "DRY-RUN 下单验证通过: user=%s match=%s type=%s sel=%s stake=%s odds=%.2f provider=%s",
-            user_id_val, match_id_val, bet_type_val, selection_val, stake_val, odds_val, provider_label,
-        )
-        return APIResponse(
-            message="dry-run 验证通过，未提交真实站点",
-            data={
-                "bet_id": None,
-                "status": "dry_run",
-                "stake": stake_val,
-                "odds": odds_val,
-                "potential_payout": potential_payout,
-                "balance_after": current_user.balance,
-                "site_balance": Decimal(str(site_acc.balance or 0)),
-                "provider": provider_label,
-                "provider_code": provider_code,
-                "external_bet_id": None,
-                "dry_run": True,
-                "validation_passed": True,
-                "match_id": match_id_val,
-                "match_label": f"{match_home} vs {match_away}",
-                "selection": selection_val,
-                "bet_type": bet_type_val,
-                "line": line_val,
-                "place_payload": {
-                    **place_payload,
-                    "stake": float(stake_val),
-                    "odds": float(odds_val),
-                },
-            },
-        )
     await release_db_session(db)
 
     # Redis 同场下单锁：覆盖 Gate 调用 + 写库，防多 worker / 一键+自动双发

@@ -91,7 +91,7 @@ ensure_deps() {
     fi
     PY="$ROOT/.venv/bin/python"
     "$PY" -m pip install -U pip setuptools wheel
-    "$PY" -m pip install -r "$ROOT/requirements-gate.txt"
+    "$PY" -m pip install -r "$ROOT/requirements.txt"
     if ! has_playwright "$PY"; then
       echo "Playwright 安装后仍无法 import，请手动检查: $PY -c 'import playwright'" >&2
       return 1

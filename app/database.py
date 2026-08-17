@@ -19,7 +19,7 @@ engine = create_async_engine(
     pool_recycle=settings.DB_POOL_RECYCLE,
     pool_pre_ping=True,
     pool_use_lifo=True,  # 热连接优先，降低冷连接延迟
-    echo=settings.DEBUG,
+    echo=False,
 )
 
 # 会话工厂

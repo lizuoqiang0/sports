@@ -10,8 +10,6 @@ docker exec -w /app -e PYTHONPATH=/app \
   -e CLEAN_KEEP_USER="${CLEAN_KEEP_USER:?请设置环境变量 CLEAN_KEEP_USER}" \
   -e CLEAN_KEEP_PASSWORD="${CLEAN_KEEP_PASSWORD:?请设置环境变量 CLEAN_KEEP_PASSWORD}" \
   -e CLEAN_KEEP_BALANCE="${CLEAN_KEEP_BALANCE:-0}" \
-  -e FORCE_LIVE_MODE=true \
-  -e ENVIRONMENT=production \
   ob-backend python scripts/clean_env.py
 
 echo "==> 清空 Redis"

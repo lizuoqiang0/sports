@@ -38,16 +38,15 @@ _WEAK_SECRETS = {
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用启动/关闭钩子"""
-    logger.info("%s v%s starting (%s)", settings.APP_NAME, settings.APP_VERSION, settings.ENVIRONMENT)
+    logger.info("%s v%s starting (production)", settings.APP_NAME, settings.APP_VERSION)
 
-    if settings.WEAK_SECRET_BLOCK_IN_PROD and settings.ENVIRONMENT == "production":
-        if settings.SECRET_KEY in _WEAK_SECRETS or len(settings.SECRET_KEY or "") < 32:
-            logger.error("生产环境禁止弱/过短 SECRET_KEY，请用 openssl rand -hex 32")
-            raise RuntimeError("weak SECRET_KEY blocked in production")
-        token = (settings.INTERNAL_API_TOKEN or "").strip()
-        if not token or token in _WEAK_SECRETS:
-            logger.error("生产环境必须配置强 INTERNAL_API_TOKEN（Backend↔Gate 鉴权）")
-            raise RuntimeError("weak INTERNAL_API_TOKEN blocked in production")
+    if settings.SECRET_KEY in _WEAK_SECRETS or len(settings.SECRET_KEY or "") < 32:
+        logger.error("禁止弱/过短 SECRET_KEY，请用 openssl rand -hex 32")
+        raise RuntimeError("weak SECRET_KEY blocked")
+    token = (settings.INTERNAL_API_TOKEN or "").strip()
+    if not token or token in _WEAK_SECRETS:
+        logger.error("必须配置强 INTERNAL_API_TOKEN（Backend↔Gate 鉴权）")
+        raise RuntimeError("weak INTERNAL_API_TOKEN blocked")
 
     # 连接Redis
     try:
@@ -234,19 +233,13 @@ async def lifespan(app: FastAPI):
     logger.info("👋 已安全关闭")
 
 
-# === 创建App ===
-_expose_docs = bool(settings.EXPOSE_API_DOCS) and settings.ENVIRONMENT != "production"
-# 显式 EXPOSE_API_DOCS=true 时生产也可开（仅建议内网排障）
-if settings.ENVIRONMENT == "production" and settings.EXPOSE_API_DOCS:
-    _expose_docs = True
-
 app = FastAPI(
     title="OB Sports Betting Platform",
     description="体育赔率监控与 OB/平博单边投注平台",
     version=settings.APP_VERSION,
-    docs_url="/docs" if _expose_docs else None,
-    redoc_url="/redoc" if _expose_docs else None,
-    openapi_url="/openapi.json" if _expose_docs else None,
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
     lifespan=lifespan,
 )
 
@@ -261,29 +254,22 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type", "X-Request-ID", "X-Internal-Token"],
 )
-_hosts = list(settings.ALLOWED_HOSTS or ["*"])
-# 生产已收紧：默认不含通配 *；如经域名/LAN IP 访问，请在 .env 的 ALLOWED_HOSTS 追加该主机
-if settings.ENVIRONMENT == "production" and "*" not in _hosts:
+_hosts = list(settings.ALLOWED_HOSTS or [])
+if "*" not in _hosts:
     for h in ("localhost", "127.0.0.1", "backend", "ob-backend"):
         if h not in _hosts:
             _hosts.append(h)
 app.add_middleware(
     TrustedHostMiddleware,
-    allowed_hosts=_hosts if _hosts else ["*"],
+    allowed_hosts=_hosts,
 )
 
 # === 异常处理 ===
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    # 生产不回传完整校验明细，避免泄露输入结构
-    if settings.ENVIRONMENT == "production" and not settings.DEBUG:
-        return JSONResponse(
-            status_code=422,
-            content={"success": False, "message": "参数校验失败"},
-        )
     return JSONResponse(
         status_code=422,
-        content={"success": False, "message": "参数校验失败", "errors": exc.errors()},
+        content={"success": False, "message": "参数校验失败"},
     )
 
 @app.exception_handler(SQLAlchemyError)
@@ -344,7 +330,7 @@ async def root():
     payload = {
         "service": settings.APP_NAME,
         "version": settings.APP_VERSION,
-        "environment": settings.ENVIRONMENT,
+        "environment": "production",
         "endpoints": {
             "health": "/health",
             "ready": "/ready",
@@ -355,6 +341,4 @@ async def root():
             "bookmakers": "/api/v1/bookmakers",
         },
     }
-    if _expose_docs:
-        payload["docs"] = "/docs"
     return payload

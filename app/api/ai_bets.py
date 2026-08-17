@@ -600,7 +600,6 @@ async def ai_bet_history(
 class OneClickBetRequest(BaseModel):
     stake: float = settings.AI_DEFAULT_STAKE
     markets: list[str] = []  # 支持 total/moneyline/spread
-    dry_run: bool = False
 
 
 @router.post("/one-click-bet/{match_id}", response_model=APIResponse)
@@ -650,17 +649,6 @@ async def one_click_bet(
             raise HTTPException(status_code=400, detail=f"AI分析失败: {e}")
 
     if rec.get("error"):
-        if req.dry_run:
-            return APIResponse(
-                message="模拟通过失败",
-                data={
-                    "dry_run": True,
-                    "eligible": False,
-                    "match_id": match_id,
-                    "block_reason": str(rec["error"]),
-                    "recommendation": rec.get("recommendation") or {},
-                },
-            )
         raise HTTPException(status_code=400, detail=str(rec["error"]))
 
     from app.ai.strategy_gates import gate_recommendation_for_place, stake_bounds
@@ -684,18 +672,6 @@ async def one_click_bet(
         user_id=current_user.id, rec=rec, stake=stake, db=db
     )
     if not ok_gate:
-        if req.dry_run:
-            return APIResponse(
-                message="模拟通过失败",
-                data={
-                    "dry_run": True,
-                    "eligible": False,
-                    "match_id": match_id,
-                    "block_reason": str(why_gate),
-                    "stake": float(stake),
-                    "recommendation": rec.get("recommendation") or {},
-                },
-            )
         raise HTTPException(status_code=400, detail=f"未通过策略配置: {why_gate}")
 
     allowed_mkt = {"total", "moneyline", "spread"}
@@ -740,7 +716,7 @@ async def one_click_bet(
                 odds=float(single["odds"]),
                 provider=provider_code,
             )
-            resp = await place_bet(bet_req, db=db, current_user=current_user, dry_run=bool(req.dry_run))
+            resp = await place_bet(bet_req, db=db, current_user=current_user)
             data = getattr(resp, "data", None) or {}
             if isinstance(resp, dict):
                 data = resp.get("data") or resp
@@ -752,7 +728,6 @@ async def one_click_bet(
                 "provider": provider_label,
                 "provider_code": provider_code,
                 "status": (data or {}).get("status") or "pending",
-                "dry_run": bool((data or {}).get("dry_run") or req.dry_run),
                 "potential_payout": float((data or {}).get("potential_payout") or 0),
                 "site_balance": float((data or {}).get("site_balance") or 0),
                 "place_payload": (data or {}).get("place_payload") or {},
@@ -764,22 +739,10 @@ async def one_click_bet(
             logger.warning("一键单边投注失败 market=%s site=%s: %s", bt, provider_code, e)
 
     if not placed_bets and failed_bets:
-        if req.dry_run:
-            return APIResponse(
-                message="模拟通过完成，但没有可下单结果",
-                data={
-                    "dry_run": True,
-                    "eligible": False,
-                    "match_id": match_id,
-                    "failed": failed_bets,
-                    "recommendation": rec.get("recommendation") or {},
-                },
-            )
         raise HTTPException(status_code=400, detail=f"全部下注失败: {failed_bets}")
 
     total_stake = sum(b["stake"] for b in placed_bets)
-    mode_label = "模拟通过" if req.dry_run else "已提交"
-    msg = f"{mode_label} {len(placed_bets)} 笔"
+    msg = f"已提交 {len(placed_bets)} 笔"
     if failed_bets:
         msg += f"，失败 {len(failed_bets)} 笔"
 
@@ -792,6 +755,5 @@ async def one_click_bet(
             "success_count": len(placed_bets),
             "failed_count": len(failed_bets),
             "provider": "平博",
-            "dry_run": bool(req.dry_run),
         },
     )

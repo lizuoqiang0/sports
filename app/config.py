@@ -30,30 +30,10 @@ def _parse_str_list(v: Any) -> Any:
     return [p.strip().strip("\"'") for p in s.split(",") if p.strip()]
 
 
-def _parse_debug_flag(v: Any) -> Any:
-    """兼容部署环境里常见的 DEBUG 写法，如 release/debug。"""
-    if isinstance(v, bool) or v is None:
-        return v
-    if isinstance(v, (int, float)):
-        return bool(v)
-    if not isinstance(v, str):
-        return v
-    s = v.strip().lower()
-    if s in {"1", "true", "yes", "on", "debug", "dev", "development"}:
-        return True
-    if s in {"0", "false", "no", "off", "release", "prod", "production", "staging"}:
-        return False
-    return v
-
-
 class Settings(BaseSettings):
     # === 应用基础配置 ===
     APP_NAME: str = "OB Sports Betting Platform"
     APP_VERSION: str = "2.0.0"
-    DEBUG: bool = False
-    ENVIRONMENT: str = "production"  # production / staging / development
-    # 强制真实场景：禁止 .demo、模拟器、dry_run / simulate（本地调试可设 false）
-    FORCE_LIVE_MODE: bool = True
 
     # === Redis ===
     REDIS_URL: str = "redis://localhost:6379/0"
@@ -62,7 +42,7 @@ class Settings(BaseSettings):
 
     # === 数据库 ===
     DATABASE_URL: str = "postgresql+asyncpg://ob_user:ob_password@localhost:5432/ob_sports"
-    # 线上建议 8/12：workers×(pool+overflow) 勿超过 Postgres max_connections
+    # workers×(pool+overflow) 勿超过 Postgres max_connections
     DB_POOL_SIZE: int = 8
     DB_MAX_OVERFLOW: int = 12
     DB_POOL_TIMEOUT: int = 20
@@ -83,11 +63,8 @@ class Settings(BaseSettings):
     BCRYPT_ROUNDS: int = 12
 
     # === CORS ===
-    # 用 Any：避免 pydantic-settings 在 validator 前对 list 强制 json.loads
-    # （Docker Compose 会把 ["http://x"] 剥成 [http://x]）
-    CORS_ORIGINS: Any = [
-        "http://localhost:3000",
-    ]
+    # 用 Any：避免 pydantic-settings 在 validator 前对 list 强制 json.loads。
+    CORS_ORIGINS: Any = []
 
     # --- GPT API（唯一模型） ---
     GPT_API_KEY: Optional[str] = None
@@ -170,12 +147,8 @@ class Settings(BaseSettings):
     MONITORING_ENABLED: bool = True
     # 默认下单模式：manual=人工 / active=自动（可被用户开关覆盖）
     DEFAULT_BET_MODE: str = "manual"
-    ALLOWED_HOSTS: Any = ["localhost", "127.0.0.1", "backend", "ob-backend"]
-    WEAK_SECRET_BLOCK_IN_PROD: bool = True
-    # 生产关闭开放注册；需要时在 .env 设 true
+    ALLOWED_HOSTS: Any = []
     ALLOW_PUBLIC_REGISTER: bool = False
-    # 生产默认关闭 /docs /redoc；排障可临时 true
-    EXPOSE_API_DOCS: bool = False
     # 内部服务鉴权（Backend ↔ Browser Gate）
     INTERNAL_API_TOKEN: str = ""
 
@@ -186,11 +159,6 @@ class Settings(BaseSettings):
     @classmethod
     def _coerce_str_lists(cls, v: Any) -> Any:
         return _parse_str_list(v)
-
-    @field_validator("DEBUG", mode="before")
-    @classmethod
-    def _coerce_debug_flag(cls, v: Any) -> Any:
-        return _parse_debug_flag(v)
 
     model_config = {
         "env_file": ".env",

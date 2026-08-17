@@ -1,10 +1,6 @@
-"""生产/真实场景门禁：禁止演示 URL、模拟器与 dry_run。
-
-默认强制真实：仅当显式 FORCE_LIVE_MODE=0/false 时关闭。
-"""
+"""线上真实场景门禁：禁止演示 URL 和模拟执行。"""
 from __future__ import annotations
 
-import os
 from urllib.parse import urlparse
 
 from fastapi import HTTPException
@@ -17,23 +13,8 @@ def _is_demo_url(base_url: str) -> bool:
 
 
 def force_live_mode() -> bool:
-    """
-    强制真实线上场景。
-    - FORCE_LIVE_MODE=0/false → 关闭（仅本地调试）
-    - FORCE_LIVE_MODE=1/true → 开启
-    - 未设置 → 默认开启（与 settings.FORCE_LIVE_MODE 默认 True 一致）
-    """
-    v = (os.getenv("FORCE_LIVE_MODE") or "").strip().lower()
-    if v in ("0", "false", "no", "off"):
-        return False
-    if v in ("1", "true", "yes", "on"):
-        return True
-    try:
-        from app.config import settings
-
-        return bool(settings.FORCE_LIVE_MODE)
-    except Exception:
-        return True
+    """项目仅支持真实线上执行。"""
+    return True
 
 
 def reject_demo_url(base_url: str, *, field: str = "网址") -> None:

@@ -1,4 +1,4 @@
-# 线上 / 本机统一编排（高性能 · 低延迟 · 多 worker）
+# 生产编排（高性能 · 低延迟 · 多 worker）
 # 数据持久化: ./data/postgres ./data/redis ./logs
 # 快速启动: bash scripts/prod_up.sh
 # AI 引擎可选: bash scripts/prod_up.sh --with-ai
@@ -145,13 +145,9 @@ services:
       DATABASE_URL: postgresql+asyncpg://ob_user:${POSTGRES_PASSWORD:-ob_password}@postgres:5432/ob_sports
       REDIS_URL: redis://redis:6379/0
       LOG_FILE: /app/logs/app.log
-      ENVIRONMENT: ${ENVIRONMENT:-production}
-      DEBUG: ${DEBUG:-false}
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      FORCE_LIVE_MODE: ${FORCE_LIVE_MODE:-true}
+      LOG_LEVEL: ${LOG_LEVEL:-WARNING}
       RUN_BACKGROUND_JOBS: ${RUN_BACKGROUND_JOBS:-true}
       SECRET_KEY: ${SECRET_KEY:-ob-prod-please-override-with-openssl-rand-hex-32}
-      WEAK_SECRET_BLOCK_IN_PROD: ${WEAK_SECRET_BLOCK_IN_PROD:-true}
       ALGORITHM: ${ALGORITHM:-HS256}
       ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-30}
       REFRESH_TOKEN_EXPIRE_DAYS: ${REFRESH_TOKEN_EXPIRE_DAYS:-7}
@@ -159,12 +155,12 @@ services:
       # 逗号分隔，避免 Compose 剥掉 JSON 数组引号导致启动失败
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
       ALLOWED_HOSTS: ${ALLOWED_HOSTS:-localhost,127.0.0.1,backend,ob-backend}
-      UVICORN_WORKERS: ${UVICORN_WORKERS:-0}
-      UVICORN_LIMIT_CONCURRENCY: ${UVICORN_LIMIT_CONCURRENCY:-400}
+      UVICORN_WORKERS: ${UVICORN_WORKERS:-4}
+      UVICORN_LIMIT_CONCURRENCY: ${UVICORN_LIMIT_CONCURRENCY:-200}
       UVICORN_BACKLOG: ${UVICORN_BACKLOG:-2048}
       UVICORN_KEEPALIVE: ${UVICORN_KEEPALIVE:-5}
-      DB_POOL_SIZE: ${DB_POOL_SIZE:-32}
-      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-64}
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-8}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-12}
       DB_POOL_TIMEOUT: ${DB_POOL_TIMEOUT:-20}
       DB_POOL_RECYCLE: ${DB_POOL_RECYCLE:-1800}
       REDIS_MAX_CONNECTIONS: ${REDIS_MAX_CONNECTIONS:-100}
@@ -204,6 +200,8 @@ services:
       NOWSCORE_PROXY_URL: ${NOWSCORE_PROXY_URL:-http://host.docker.internal:7897}
       AI_ENABLED: ${AI_ENABLED:-true}
       DEFAULT_BET_MODE: ${DEFAULT_BET_MODE:-manual}
+      ALLOW_PUBLIC_REGISTER: ${ALLOW_PUBLIC_REGISTER:-false}
+      MIN_BET_AMOUNT: ${MIN_BET_AMOUNT:-100}
       EXECUTION_GATEWAY_ENABLED: ${EXECUTION_GATEWAY_ENABLED:-true}
       MONITORING_ENABLED: ${MONITORING_ENABLED:-true}
       BOOKMAKER_BROWSER_GATE_URL: ${BOOKMAKER_BROWSER_GATE_URL:-http://host.docker.internal:9277}
@@ -218,15 +216,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-      # 弹出浏览器：使用宿主机 Gate（host.docker.internal）
-      # Mac Docker Desktop 自带该 DNS，勿覆盖 host-gateway（会 Network unreachable）
     volumes:
       - ./logs:/app/logs
-      # 本机改代码后重启容器仍生效（勿再依赖 docker cp）
-      - ./app:/app/app
-      - ./alembic:/app/alembic
-      - ./alembic.ini:/app/alembic.ini:ro
-      - ./scripts:/app/scripts
     ulimits:
       nofile:
         soft: 65535
@@ -234,11 +225,11 @@ services:
     cpus: ${BACKEND_CPUS:-4.0}
     mem_limit: ${BACKEND_MEM:-3g}
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
-      interval: 5s
-      timeout: 3s
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/ready"]
+      interval: 10s
+      timeout: 5s
       retries: 12
-      start_period: 25s
+      start_period: 30s
     restart: unless-stopped
     logging: *default-logging
 
@@ -249,13 +240,10 @@ services:
     image: ob-sports-betting-frontend:latest
     container_name: ob-frontend
     ports:
-      - "${FRONTEND_PORT:-3000}:3000"
+      - "127.0.0.1:${FRONTEND_PORT:-3000}:3000"
     depends_on:
       backend:
         condition: service_healthy
-    volumes:
-      # 本机构建的前端静态文件，改 UI 后 npm run build 即生效
-      - ./frontend/dist:/usr/share/nginx/html:ro
     ulimits:
       nofile:
         soft: 65535
@@ -282,8 +270,6 @@ services:
       DATABASE_URL: postgresql+asyncpg://ob_user:${POSTGRES_PASSWORD:-ob_password}@postgres:5432/ob_sports
       REDIS_URL: redis://redis:6379/0
       LOG_FILE: /app/logs/app.log
-      ENVIRONMENT: ${ENVIRONMENT:-production}
-      FORCE_LIVE_MODE: ${FORCE_LIVE_MODE:-true}
       SECRET_KEY: ${SECRET_KEY:-ob-prod-please-override-with-openssl-rand-hex-32}
       GPT_API_KEY: ${GPT_API_KEY:-}
       GPT_BASE_URL: ${GPT_BASE_URL:-https://xfastapi.ai/v1}
@@ -312,8 +298,6 @@ services:
         condition: service_healthy
     volumes:
       - ./logs:/app/logs
-      - ./app:/app/app
-      - ./scripts:/app/scripts
     cpus: ${AI_CPUS:-1.5}
     mem_limit: ${AI_MEM:-1g}
     restart: unless-stopped

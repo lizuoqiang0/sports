@@ -8,23 +8,16 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_DEFAULT_TIMEOUT=60
 
-# 国内源加速 apt（腾讯云 / Debian 官方镜像均可）
+# 安装运行期健康检查工具。
 RUN set -eux; \
-    if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
-      sed -i 's|deb.debian.org|mirrors.cloud.tencent.com|g; s|security.debian.org|mirrors.cloud.tencent.com|g' /etc/apt/sources.list.d/debian.sources; \
-    elif [ -f /etc/apt/sources.list ]; then \
-      sed -i 's|deb.debian.org|mirrors.cloud.tencent.com|g; s|security.debian.org|mirrors.cloud.tencent.com|g' /etc/apt/sources.list; \
-    fi; \
     apt-get update \
     && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements-prod.txt .
-# 国内 PyPI + BuildKit 缓存，二次构建通常几十秒内完成
+COPY requirements.txt .
+# BuildKit 缓存保留已验证的下载包。
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install -i https://mirrors.cloud.tencent.com/pypi/simple \
-      --trusted-host mirrors.cloud.tencent.com \
-      -r requirements-prod.txt
+    pip install -r requirements.txt
 
 COPY app ./app
 COPY alembic ./alembic

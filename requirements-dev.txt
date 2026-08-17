@@ -1,4 +1,0 @@
-# Local development and test dependencies. Production images use requirements-prod.txt.
--r requirements-prod.txt
-pytest==8.3.3
-pytest-asyncio==0.24.0

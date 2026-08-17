@@ -49,7 +49,6 @@ if [[ ! -f .env ]]; then
     SK="$(openssl rand -hex 32 2>/dev/null || python3 -c 'import secrets;print(secrets.token_hex(32))')"
     echo "SECRET_KEY=${SK}" >> .env
   fi
-  grep -q '^WEAK_SECRET_BLOCK_IN_PROD=' .env 2>/dev/null || echo "WEAK_SECRET_BLOCK_IN_PROD=true" >> .env
   echo "已写入 .env，请按需补充 API Key"
 fi
 
