@@ -30,6 +30,10 @@ async def pinnacle_page_is_blank(page) -> bool:
     try:
         if page is None or page.is_closed():
             return True
+        page_url = (page.url or "").lower()
+        # 登录/验证页的初始 DOM 可能短暂为空，绝不能在认证流程中反复刷新。
+        if any(marker in page_url for marker in ("/login", "/signin", "/verify", "/captcha")):
+            return False
         state = await page.evaluate(
             """() => {
                 const body = document.body;
@@ -177,4 +181,3 @@ async def recover_pinnacle_live_list(page) -> bool:
         except Exception:
             continue
     return False
-

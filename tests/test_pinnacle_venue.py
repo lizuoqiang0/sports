@@ -32,6 +32,12 @@ def test_blank_page_is_detected():
     assert asyncio.run(pinnacle_page_is_blank(page)) is True
 
 
+def test_login_page_is_not_treated_as_blank():
+    page = FakePage([{"ready": "complete", "textLength": 0, "hasVisibleControl": False}])
+    page.url = "https://example.test/zh-cn/login"
+    assert asyncio.run(pinnacle_page_is_blank(page)) is False
+
+
 def test_blank_page_reloads_until_recovered():
     page = FakePage([
         {"ready": "complete", "textLength": 0, "hasVisibleControl": False},
