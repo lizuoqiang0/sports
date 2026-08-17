@@ -234,10 +234,66 @@ async def place_bet(
         raise HTTPException(status_code=400, detail=f"无效选项: {req.selection}")
     current_odds = float(raw_odds)
 
+    if not provider_label:
+        provider_label = odds_obj.provider or "本地"
+    if not provider_code:
+        provider_code = _code_by_provider(provider_label) or (
+            "ob" if str(match.external_id or "").startswith("ob:") else ""
+        )
+
     if match.status == MatchStatus.LIVE:
         fresh_at = match.updated_at or odds_obj.valid_from
         if fresh_at is None:
-            raise HTTPException(status_code=409, detail="滚球赔率时间缺失，请先重新同步盘口")
+            # 赔率版本可能来自历史数据但没有时间字段；先仅同步当前站点，
+            # 再读取新盘口，不能带着缺失时间的行进入真实下单。
+            try:
+                refresh_acc_res = await db.execute(
+                    select(BookmakerAccount).where(
+                        BookmakerAccount.user_id == current_user.id,
+                        BookmakerAccount.code == provider_code,
+                        BookmakerAccount.enabled.is_(True),
+                    )
+                )
+                refresh_acc = refresh_acc_res.scalar_one_or_none()
+                if refresh_acc is not None:
+                    from app.services.bookmakers.sync import sync_live_scores_odds
+
+                    async with AsyncSessionLocal() as sync_db:
+                        await sync_live_scores_odds(
+                            sync_db,
+                            user_id=current_user.id,
+                            only_account_id=refresh_acc.id,
+                            refresh_balance=False,
+                        )
+                    await db.rollback()
+                    match = await db.get(Match, req.match_id)
+                    refreshed_odds = await db.execute(
+                        select(Odds).where(
+                            Odds.match_id == req.match_id,
+                            Odds.bet_type == _BTEnum(bt),
+                            Odds.provider == provider_label,
+                            Odds.valid_to.is_(None),
+                        )
+                    )
+                    odds_obj = refreshed_odds.scalar_one_or_none()
+                    if match is not None and odds_obj is not None:
+                        raw_odds = (odds_obj.odds_data or {}).get(sel)
+                        if raw_odds is None or isinstance(raw_odds, (dict, list)):
+                            raise HTTPException(
+                                status_code=409,
+                                detail="自动同步后未获取到可下注的小球赔率",
+                            )
+                        current_odds = float(raw_odds)
+                        fresh_at = match.updated_at or odds_obj.valid_from
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.warning("滚球赔率缺少时间，自动同步失败 user=%s: %s", current_user.id, e)
+            if fresh_at is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="滚球赔率时间缺失，自动重新同步后仍不可用，请稍后重试",
+                )
         if getattr(fresh_at, "tzinfo", None) is None:
             fresh_at = fresh_at.replace(tzinfo=timezone.utc)
         odds_age = (datetime.now(timezone.utc) - fresh_at).total_seconds()
@@ -265,13 +321,6 @@ async def place_bet(
         final_odds = current_odds
     else:
         final_odds = float(req.odds)
-
-    if not provider_label:
-        provider_label = odds_obj.provider or "本地"
-    if not provider_code:
-        provider_code = _code_by_provider(provider_label) or (
-            "ob" if str(match.external_id or "").startswith("ob:") else ""
-        )
 
     # 3. 验证投注金额：严格按 AI 策略「单笔最大金额」
     lo, hi = stake_bounds(strat)
