@@ -235,12 +235,12 @@ async def place_bet(
     current_odds = float(raw_odds)
 
     if match.status == MatchStatus.LIVE:
-        valid_from = odds_obj.valid_from
-        if valid_from is None:
+        fresh_at = match.updated_at or odds_obj.valid_from
+        if fresh_at is None:
             raise HTTPException(status_code=409, detail="滚球赔率时间缺失，请先重新同步盘口")
-        if getattr(valid_from, "tzinfo", None) is None:
-            valid_from = valid_from.replace(tzinfo=timezone.utc)
-        odds_age = (datetime.now(timezone.utc) - valid_from).total_seconds()
+        if getattr(fresh_at, "tzinfo", None) is None:
+            fresh_at = fresh_at.replace(tzinfo=timezone.utc)
+        odds_age = (datetime.now(timezone.utc) - fresh_at).total_seconds()
         max_age = max(1, int(settings.LIVE_ODDS_MAX_AGE_SEC))
         if odds_age < -5 or odds_age > max_age:
             raise HTTPException(
