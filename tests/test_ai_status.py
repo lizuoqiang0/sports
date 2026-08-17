@@ -4,6 +4,7 @@ from unittest import IsolatedAsyncioTestCase
 from unittest.mock import AsyncMock, patch
 
 from app.api.ai_bets import ai_status
+from app.ai import auto_better
 
 
 class _Db:
@@ -32,3 +33,21 @@ class TestAIStatus(IsolatedAsyncioTestCase):
         self.assertFalse(response.data["engine_running"])
         self.assertEqual(response.data["bet_mode"], "active")
         stop_engine.assert_not_awaited()
+
+    async def test_start_recovers_lock_only_when_running_marker_is_absent(self):
+        class _Cache:
+            def __init__(self):
+                self.client = SimpleNamespace(eval=AsyncMock(return_value=1))
+
+            async def get(self, _key):
+                return "stale-owner"
+
+            async def exists(self, _key):
+                return False
+
+        cache = _Cache()
+        with patch("app.core.cache.cache", cache):
+            cleared = await auto_better._clear_stale_engine_lock(7, "ai:engine:lock:7")
+
+        self.assertTrue(cleared)
+        cache.client.eval.assert_awaited_once()

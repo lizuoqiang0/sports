@@ -247,14 +247,20 @@ async def start_ai(
                 cfg.preferred_sports = ["football", "basketball"]
         await db.flush()
 
-        await start_user_engine(current_user.id)
+        start_result = await start_user_engine(current_user.id)
+        status_info = await get_engine_status(current_user.id)
+        if not status_info.get("running"):
+            logger.error("AI 引擎启动未确认: user=%s result=%s", current_user.id, start_result)
+            raise HTTPException(status_code=503, detail="AI 引擎未确认启动，请稍后重试")
         result = compose_ai_runtime_status(
-            status_info=await get_engine_status(current_user.id),
+            status_info=status_info,
             user=current_user,
             manual_analysis_sports=[],
         )
         await db.commit()
-        message = "自动下单已启动"
+        message = "自动下单已在运行" if start_result.get("status") == "already_running" else "自动下单已启动"
+        if start_result.get("status") == "recovered_stale_lock":
+            message += "，已清理失效引擎锁"
         if manual_analysis_sports:
             message += "，已停止手动分析"
         return APIResponse(message=message, data=result)

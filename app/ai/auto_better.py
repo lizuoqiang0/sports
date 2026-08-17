@@ -2136,6 +2136,27 @@ def _engine_running_key(user_id: int) -> str:
     return f"ai:engine:running:{user_id}"
 
 
+async def _clear_stale_engine_lock(user_id: int, lock_key: str) -> bool:
+    """仅在没有运行心跳时，原子删除遗留的引擎锁。"""
+    from app.core.cache import cache
+
+    running_key = _engine_running_key(user_id)
+    try:
+        owner = await cache.get(lock_key)
+        if not owner or await cache.exists(running_key):
+            return False
+        lua = """
+        if redis.call('get', KEYS[1]) == ARGV[1] and redis.call('exists', KEYS[2]) == 0 then
+            return redis.call('del', KEYS[1])
+        end
+        return 0
+        """
+        return bool(await cache.client.eval(lua, 2, lock_key, running_key, owner))
+    except Exception as e:
+        logger.warning("AI 引擎失效锁清理失败: user=%s error=%s", user_id, e)
+        return False
+
+
 async def start_user_engine(user_id: int) -> dict:
     """为用户启动AI引擎。一律真实下单，并由 bet_mode 控制是否自动执行。
 
@@ -2149,8 +2170,12 @@ async def start_user_engine(user_id: int) -> dict:
 
     lock_key = _engine_lock_key(user_id)
     token = f"{worker_id()}:{_uuid.uuid4().hex[:8]}"
+    recovered_stale_lock = False
     try:
         got = await cache.client.set(lock_key, token, nx=True, ex=_ENGINE_LOCK_TTL)
+        if not got and await _clear_stale_engine_lock(user_id, lock_key):
+            recovered_stale_lock = True
+            got = await cache.client.set(lock_key, token, nx=True, ex=_ENGINE_LOCK_TTL)
     except Exception:
         got = True  # Redis 不可用时降级为单进程内存互斥
     if not got:
@@ -2164,15 +2189,28 @@ async def start_user_engine(user_id: int) -> dict:
     engine = AIBettingEngine(user_id)
     engine._engine_lock_token = token
     _active_engines[user_id] = engine
-    await engine.start()
-
-    # 写入 Redis 供跨 worker 查询（带 TTL，由主循环周期续期）
     try:
+        # 启动即写入心跳，避免首轮分析尚未完成时只有锁、没有运行状态。
         await cache.set(_engine_running_key(user_id), "1", ttl=_ENGINE_LOCK_TTL)
+    except Exception as e:
+        # Redis 不可用时保留本地引擎，避免降级模式下无法启动。
+        logger.warning("AI 引擎运行心跳写入失败: user=%s error=%s", user_id, e)
+    try:
+        await engine.start()
     except Exception:
-        pass
+        _active_engines.pop(user_id, None)
+        try:
+            await cache.delete(_engine_running_key(user_id))
+            await cache.release_lock(lock_key, token)
+        except Exception:
+            pass
+        raise
 
-    return {"status": "started", "user_id": user_id, "bet_mode_gated": True}
+    return {
+        "status": "recovered_stale_lock" if recovered_stale_lock else "started",
+        "user_id": user_id,
+        "bet_mode_gated": True,
+    }
 
 
 async def stop_user_engine(user_id: int) -> dict:
