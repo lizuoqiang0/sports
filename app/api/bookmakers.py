@@ -609,7 +609,8 @@ async def sync_live_bookmakers(
     user: User = Depends(get_current_user),
 ):
     """轻量滚球同步：仅足球/篮球比分/时钟/赔率。"""
-    result = await sync_live_scores_odds(db, user.id)
+    # 手动刷新只更新滚球数据，余额由后台轮询单独维护，避免占用 Gate 车道。
+    result = await sync_live_scores_odds(db, user.id, refresh_balance=False)
     return APIResponse(message="滚球已刷新", data=result)
 
 

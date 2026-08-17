@@ -249,12 +249,14 @@ export default function BookmakersPage() {
     setSyncing(true)
     const toastId = toast.loading('正在同步滚球…')
     try {
-      const res = await bookmakersAPI.sync()
-      toast.success(res.message || '滚球已同步', { id: toastId })
+      const res = await bookmakersAPI.syncLive()
+      toast.success(res.message || '滚球已刷新', { id: toastId })
       await load()
     } catch (e) {
-      const msg = e.message || e.detail || (e.code === 'ECONNABORTED' ? '同步超时，请确认 Browser Gate 已启动' : '同步失败')
-      toast.error(msg, { id: toastId })
+      const fallback = e?.code === 'ECONNABORTED'
+        ? '同步超时，请确认 Browser Gate 已启动'
+        : '同步失败，请稍后重试'
+      toast.error(extractErrorMessage(e, fallback), { id: toastId })
     } finally {
       setSyncing(false)
     }

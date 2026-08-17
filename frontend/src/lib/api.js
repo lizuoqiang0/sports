@@ -127,8 +127,7 @@ export const bookmakersAPI = {
       { timeout: 180000 },
     ),
   disconnect: (code) => api.post(`/bookmakers/${code}/disconnect`, null, { timeout: 15000 }),
-  sync: () => api.post('/bookmakers/sync', null, { timeout: 240000 }),
-  syncLive: () => api.post('/bookmakers/sync-live', null, { timeout: 120000 }),
+  syncLive: () => api.post('/bookmakers/sync-live', null, { timeout: 210000 }),
   gateHealth: () => api.get('/bookmakers/gate-health', { timeout: 5000 }),
   oddsCompare: (matchId) => api.get(`/bookmakers/odds-compare/${matchId}`),
 }
