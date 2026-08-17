@@ -144,6 +144,20 @@ class CacheManager:
         except Exception as e:
             logger.debug("release_lock failed key=%s: %s", key, e)
 
+    async def extend_lock_if_owned(self, key: str, token: str, *, ttl_sec: int) -> bool:
+        """仅续期自己持有的锁（Lua 原子校验）。"""
+        lua = """
+        if redis.call('get', KEYS[1]) == ARGV[1] then
+            return redis.call('expire', KEYS[1], ARGV[2])
+        end
+        return 0
+        """
+        try:
+            return bool(await self.client.eval(lua, 1, key, token, int(ttl_sec)))
+        except Exception as e:
+            logger.debug("extend_lock_if_owned failed key=%s: %s", key, e)
+            return False
+
     # === 便捷方法 ===
     async def cache_odds(self, match_id: int, odds_data: dict, ttl: int = 10):
         """缓存赛事赔率 (短TTL)"""
