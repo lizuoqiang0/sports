@@ -1482,18 +1482,18 @@ def _parse_h2h(html: str, home_team: str = "", away_team: str = "") -> dict[str,
                 away_wins += 1
     # 进球统计
     total_goals_list = []
-    over_2_5 = 0
+    under_2_5 = 0
     for row in unique:
         hg = row.get("home_goals")
         ag = row.get("away_goals")
         if hg is not None and ag is not None:
             total = int(hg) + int(ag)
             total_goals_list.append(total)
-            if total > 2:
-                over_2_5 += 1
+            if total <= 2:
+                under_2_5 += 1
 
     avg_goals = round(sum(total_goals_list) / len(total_goals_list), 2) if total_goals_list else 0
-    over_rate = round(over_2_5 / len(total_goals_list), 3) if total_goals_list else 0
+    under_rate = round(under_2_5 / len(total_goals_list), 3) if total_goals_list else 0
 
     return {
         "matches": unique[:10],
@@ -1503,7 +1503,7 @@ def _parse_h2h(html: str, home_team: str = "", away_team: str = "") -> dict[str,
             "draws": draws,
             "away_wins": away_wins,
             "avg_total_goals": avg_goals,
-            "over_2_5_rate": over_rate,
+            "under_2_5_rate": under_rate,
         },
     }
 
@@ -1563,8 +1563,8 @@ def _parse_recent_form(
         if hg is not None and ag is not None:
             total_goals_list.append(int(hg) + int(ag))
     avg_goals = round(sum(total_goals_list) / len(total_goals_list), 2) if total_goals_list else 0
-    over_2_5 = sum(1 for t in total_goals_list if t > 2)
-    over_rate = round(over_2_5 / len(total_goals_list), 3) if total_goals_list else 0
+    under_2_5 = sum(1 for t in total_goals_list if t <= 2)
+    under_rate = round(under_2_5 / len(total_goals_list), 3) if total_goals_list else 0
 
     return {
         "matches": matches[:10],
@@ -1575,7 +1575,7 @@ def _parse_recent_form(
             "losses": losses,
             "win_rate": round(wins / len(matches), 3) if matches else 0,
             "avg_total_goals": avg_goals,
-            "over_2_5_rate": over_rate,
+            "under_2_5_rate": under_rate,
         },
     }
 
@@ -1872,7 +1872,7 @@ def _parse_odds_trend_tables(html: str) -> dict[str, Any]:
     if not tables:
         tables = _tables_with_keywords(_parse_tables(html), ("赔率", "亚盘", "大小", "欧赔", "盘路"))
     if not tables:
-        # 盘路走势：分析页中的赢/走/输/大球统计
+        # 盘路走势：分析页中的赢/走/输与小球统计
         tables = _tables_after_marker(html, "盘路走势", max_tables=6)
     if not tables:
         return {"tables": [], "initial_odds": []}

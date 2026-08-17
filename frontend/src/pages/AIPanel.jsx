@@ -16,15 +16,14 @@ import {
 } from 'lucide-react'
 
 const SEL_LABEL = {
-  over: '大',
-  under: '小',
+  under: '小球',
   home: '主',
   away: '客',
   draw: '平',
 }
 
 const MARKET_LABEL = {
-  total: '亚洲大小',
+  total: '全场小球',
   moneyline: '独赢',
   spread: '亚洲让球',
 }
@@ -85,9 +84,8 @@ function normalizeFormData(source, fallback = DEFAULT_FORM_DATA) {
 function formatCellLine(market, cell) {
   const line = market?.line
   const sel = cell?.selection
-  if (sel === 'over' || sel === 'under') {
-    const tag = sel === 'over' ? '大' : '小'
-    return line != null && line !== '' ? `${tag} ${line}` : `${tag} -`
+  if (sel === 'under') {
+    return line != null && line !== '' ? `小球 ${line}` : '小球 -'
   }
   if (String(market?.bet_type || '') === 'spread' && line != null && line !== '') {
     const n = Number(line)
@@ -441,7 +439,7 @@ export default function AIPanelPage() {
     }
   }
 
-  // 后台分析开启时：短轮询拉取进度与 AI 大小球推荐
+  // 后台分析开启时：短轮询拉取进度与 AI 小球推荐
   usePagePoll(
     () => loadRecommendations(false, sportTab, siteTab, { silent: true }),
     4000,
@@ -451,7 +449,7 @@ export default function AIPanelPage() {
   const placeOneLeg = async ({ matchId, betType, selection, odds, stake, provider }) => {
     const bt = String(betType || 'total').toLowerCase()
     const allowed = {
-      total: ['over', 'under'],
+      total: ['under'],
       moneyline: ['home', 'away', 'draw'],
       spread: ['home', 'away'],
     }
@@ -509,7 +507,7 @@ export default function AIPanelPage() {
     }
   }
 
-  // 一键投注：大小球下注
+  // 一键投注：小球下注
   const handleOneClickAll = async (matchId) => {
     const stake = Number(stakeByMatch[matchId] || formData.max_bet_amount || minBetAmount || 1)
     setBettingId(`${matchId}:all`)
@@ -538,7 +536,7 @@ export default function AIPanelPage() {
     const primarySel = rec?.recommendation?.selection
     const primaryBt = String(rec?.recommendation?.bet_type || '').toLowerCase()
     if (primaryBt && bt !== primaryBt) {
-      toast.error('仅可投注大小球盘口')
+      toast.error('仅可投注全场小球盘口')
       return
     }
     if (primarySel && cell.selection !== primarySel) {
@@ -896,7 +894,7 @@ export default function AIPanelPage() {
       <PageHeader
         eyebrow="智能"
         title="AI 投注"
-        description={`OB / 平博滚球 · 大小球 · ${scanSummary}`}
+        description={`OB / 平博滚球 · 全场小球 · ${scanSummary}`}
         actions={(
           <>
             <BetModeSwitch
@@ -1669,7 +1667,7 @@ export default function AIPanelPage() {
               {tab.label}
             </button>
           ))}
-          <span className="text-xs text-ink-400 ml-1">滚球 · 大小球</span>
+          <span className="text-xs text-ink-400 ml-1">滚球 · 全场小球</span>
         </div>
 
         {!isAuto && analysisOn && (
@@ -1748,7 +1746,7 @@ export default function AIPanelPage() {
                       <div className="text-xs text-ink-500 mt-0.5">
                         {rec.league || `赛事 #${rec.match_id}`}
                         <span className="mx-1.5">·</span>
-                        大小球 · {SITE_NAMES[siteTab] || siteTab}
+                        全场小球 · {SITE_NAMES[siteTab] || siteTab}
                       </div>
                     </div>
                     <div className="text-right">
@@ -1764,7 +1762,7 @@ export default function AIPanelPage() {
                     </div>
                   </div>
 
-                  {/* 大小球盘口网格 */}
+                  {/* 全场小球盘口 */}
                   {visibleMarkets.length > 0 ? (
                     <div className="overflow-x-auto mb-3">
                       <div
@@ -1786,8 +1784,7 @@ export default function AIPanelPage() {
                             ) : null}
                           </div>
                         ))}
-                        {/* 按行渲染：大小球最多 2 行 */}
-                        {[0, 1, 2].flatMap((rowIdx) =>
+                        {[0].flatMap((rowIdx) =>
                           visibleMarkets.map((m) => {
                             const cell = (m.cells || [])[rowIdx]
                             if (!cell) {

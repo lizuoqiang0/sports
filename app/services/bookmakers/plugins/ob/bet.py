@@ -397,9 +397,11 @@ async def place_ybty_bet(
                         mtype = 1
                     remote = None
                     bt = str(bet_type or "total").lower()
-                    if bt == "total":
+                    # 小球盘口别名归一（与 site_bet/market_recommend 对齐）：
+                    # 否则 "ou"/"totals" 会静默落入独赢刷新分支拿不到 oid/hid
+                    if bt in ("total", "totals", "ou", "大小"):
                         remote = _total_from_hps(hps, mid=mid, csid=csid, tid=tid, match_type=mtype)
-                    elif bt == "spread":
+                    elif bt in ("spread", "ah", "handicap", "asian_handicap"):
                         remote = _spread_from_hps(hps, mid=mid, csid=csid, tid=tid, match_type=mtype)
                     else:
                         remote = _moneyline_from_hps(hps, mid=mid, csid=csid, tid=tid, match_type=mtype)
@@ -501,11 +503,9 @@ async def place_ybty_bet(
         score_bm = str(ref.get("scoreBenchmark") or ref.get("score") or "").strip()
         if score_bm:
             detail["scoreBenchmark"] = score_bm
-        # 大小球：补 playOptions
+        # 小球：补 playOptions
         sel_l = str(selection or "").lower()
-        if sel_l == "over":
-            detail["playOptions"] = "Over"
-        elif sel_l == "under":
+        if sel_l == "under":
             detail["playOptions"] = "Under"
         logger.info(
             "OB bet body mid=%s hid=%s oid=%s hpid=%s stake=%s odds=%s ov=%s mv=%s",

@@ -32,14 +32,6 @@ class LoginRequest(BaseModel):
     password: str = Field(..., description="密码")
 
 
-class TokenResponse(BaseModel):
-    access_token: str
-    refresh_token: str
-    token_type: str = "bearer"
-    expires_in: int = Field(..., description="access token过期秒数")
-    user: "UserInfoResponse"
-
-
 class RefreshTokenRequest(BaseModel):
     refresh_token: str
 
@@ -134,8 +126,8 @@ class OddsSubscriptionRequest(BaseModel):
 # === 投注 ===
 class PlaceBetRequest(BaseModel):
     match_id: int = Field(..., description="赛事ID")
-    bet_type: str = Field(..., description="投注类型: moneyline/spread/total/parlay")
-    selection: str = Field(..., description="选择: home/away/draw/over/under")
+    bet_type: str = Field(..., description="投注类型: total（仅小球）")
+    selection: str = Field(..., description="选择: under（仅小球）")
     stake: Decimal = Field(..., gt=0, description="投注金额")
     odds: float = Field(..., gt=1.0, description="确认赔率(防篡改)")
     # 可选：指定站点 code（ob/pinnacle）或站点中文名

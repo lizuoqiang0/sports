@@ -206,7 +206,13 @@ async def sync_live_scores_odds(
                         try:
                             bt = BetType(ro.bet_type)
                         except ValueError:
-                            bt = BetType.MONEYLINE
+                            # 未知 bet_type 不静默降级为独赢：那会把小球/让球数据
+                            # 污染进 moneyline 矩阵且无从发现。跳过并告警。
+                            logger.warning(
+                                "[odds-sync] 跳过未知 bet_type=%r provider=%s match_id=%s",
+                                ro.bet_type, provider, match_id,
+                            )
+                            continue
 
                         write_key = (match_id, provider, bt.value if hasattr(bt, "value") else str(bt))
                         if write_key in written_keys:

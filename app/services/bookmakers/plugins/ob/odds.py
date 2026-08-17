@@ -177,10 +177,14 @@ def _parse_msc_score(msc: Any) -> tuple[int, int]:
             s = str(item)
             if s.startswith(pref) and "|" in s:
                 return _parse_score_pair(s.split("|", 1)[1])
+    # 兜底：仅接受「S+单个数字」键（S1/S0/S2/S3...），拒绝 S13/S14 等
+    # 多位段键 —— 那些是篮球单节比分，误当全场分会严重污染结算输入。
     for item in msc:
         s = str(item)
-        if "|" in s:
-            part = s.split("|", 1)[1]
+        if "|" not in s:
+            continue
+        key, part = s.split("|", 1)
+        if len(key) == 2 and key[0] == "S" and key[1].isdigit():
             if ":" in part or "-" in part:
                 hs, aws = _parse_score_pair(part)
                 if hs or aws:
@@ -433,7 +437,10 @@ def _total_from_hps(
             odds_data: dict[str, Any] = {}
             selections: dict[str, dict] = {}
             hv = str(line.get("hv") or "").strip()
-            total = parse_asian_line(hv) or 0.0
+            total = parse_asian_line(hv)
+            if not total:
+                # 线解析失败：跳过该盘口（0.0 占位会成为毒数据，结算端只能退本金）
+                continue
             hid = str(line.get("hid") or "")
             hpid = str(block.get("hpid") or "2")
             # hs: 0 开盘；非 0 常为锁盘/关盘，跳过以免下单 0402008
@@ -450,9 +457,7 @@ def _total_from_hps(
                 ot = str(ol.get("ot") or "").lower()
                 on = str(ol.get("on") or "")
                 key = None
-                if ot == "over" or on.startswith("大"):
-                    key = "over"
-                elif ot == "under" or on.startswith("小"):
+                if ot == "under" or on.startswith("小"):
                     key = "under"
                 if not key:
                     continue
@@ -469,7 +474,7 @@ def _total_from_hps(
                     "tid": tid,
                     "match_type": match_type,
                 }
-            if "over" in odds_data and "under" in odds_data:
+            if "under" in odds_data:
                 odds_data["_ob"] = {
                     "mid": mid,
                     "csid": csid,
@@ -554,7 +559,10 @@ def parse_matches_pb(rows: list, *, limit: int = 800) -> list[RemoteMatch]:
         period = _parse_ob_period(row, sport=sport) if status == "live" else ""
         # 完场/取消不再当滚球
         mmp = str(row.get("mmp") or "").strip()
-        if period == "完场" or mmp in ("8", "100", "999", "12"):
+        if mmp == "12":  # 码表：12=取消 → 走取消结算（退本金），绝不能按比分判输赢
+            status = "cancelled"
+            clock = ""
+        elif period == "完场" or mmp in ("8", "100", "999"):
             status = "finished"
             clock = ""
         out.append(
@@ -637,20 +645,31 @@ async def fetch_ybty_matches_odds(
             pass
 
     def _sport_ctx_from_url(u: str) -> tuple[str, str, str]:
-        """从场馆 URL 提取 (h5_url, sport_token, cuid)。"""
+        """从场馆 URL 提取 (h5_url, sport_token, cuid)。
+
+        排除裸根 API 端点（如 https://api.xxx.com/?token=...）：goto 它只会
+        得到 JSON/空白页，恢复长连接时页面会被带到该地址卡死（实测）。
+        """
         u = (u or "").strip()
         if not u or "token=" not in u:
             return "", "", ""
         low = u.lower()
+        _p = urlparse(u)
+        # 无条件排除裸根 API 端点（如 https://api.xxx.com/?token=...）：
+        # goto 只会得到 JSON/空白页，恢复长连接时页面会被带到该地址卡死。
+        # 注意：下方特征列表含 "token=" 使原 any 分支恒假（死代码），
+        # 排除逻辑必须独立在此执行
+        if (_p.path or "/") in ("/", "") and not (_p.fragment or ""):
+            return "", "", ""
         # 综合站大厅带 token 的不算；场馆 H5 / yewu / app-h5 才算
         if not any(
             x in low
-            for x in ("yewu", "app-h5", "zlshelves", "token=", "/#/match", "sportstype")
+            for x in ("yewu", "app-h5", "zlshelves", "/#/match", "sportstype")
         ):
             # 仍允许显式 h5Url（常含 token= 与第三方域名）
             if "http" not in low:
                 return "", "", ""
-        qs = parse_qs(urlparse(u).query)
+        qs = parse_qs(_p.query)
         sport_token = (qs.get("token") or [""])[0]
         session_id = (qs.get("sessionId") or [""])[0]
         cuid = ""
@@ -660,6 +679,11 @@ async def fetch_ybty_matches_odds(
         if not sport_token:
             return "", "", ""
         return u, sport_token, cuid
+
+    def _push_uniq(items: list[str], value: Any) -> None:
+        s = str(value or "").strip()
+        if s and s not in items:
+            items.append(s)
 
     async def _collect_page_urls(page) -> list[str]:
         urls: list[str] = []
@@ -731,43 +755,193 @@ async def fetch_ybty_matches_odds(
                 uniq.append(u)
         return uniq
 
-    async def _fetch_matches_pb(page, sport_token: str, cuid: str) -> list:
-        payloads = await page.evaluate(
-            """async ({ sportToken, cuid, specs }) => {
-              const headers = {
-                'content-type': 'application/json',
-                'lang': 'zh',
-                'requestid': sportToken,
-              };
-              const outs = [];
-              for (const spec of specs) {
-                try {
-                  const resp = await fetch(
-                    'https://api.rccg5fz.com/yewu11/v1/m/matchesPB?t=' + Date.now(),
-                    {
-                      method: 'POST',
-                      headers,
-                      body: JSON.stringify({
-                        cuid: cuid || '',
-                        euid: String(spec.euid || ''),
-                        type: Number(spec.type || 3),
-                        sort: 1,
-                        device: 'v2_h5_st',
-                        hpsFlag: 1,
-                        category: 1,
-                      }),
-                    }
-                  );
-                  const json = await resp.json();
-                  outs.push(json);
-                } catch (e) {
-                  outs.push({ error: String(e) });
+    async def _discover_runtime_ctx(page) -> dict[str, Any]:
+        probe_js = """() => {
+          const data = {
+            currentUrl: '',
+            urls: [],
+            tokens: [],
+            sessionIds: [],
+            apiHosts: [],
+          };
+          const push = (arr, val) => {
+            if (!val) return;
+            const s = String(val).trim();
+            if (s && arr.indexOf(s) < 0) arr.push(s);
+          };
+          const pushHost = (val) => {
+            try {
+              const u = new URL(String(val), location.href);
+              if (u.origin && data.apiHosts.indexOf(u.origin) < 0) data.apiHosts.push(u.origin);
+            } catch (e) {}
+          };
+          const scanValue = (val, depth = 0) => {
+            if (val == null || depth > 5) return;
+            if (typeof val === 'string') {
+              const s = val.trim();
+              if (!s) return;
+              if (s.includes('token=')) {
+                push(data.urls, s);
+                pushHost(s);
+              }
+              try {
+                const j = JSON.parse(s);
+                if (j && typeof j === 'object') scanValue(j, depth + 1);
+              } catch (e) {}
+              return;
+            }
+            if (Array.isArray(val)) {
+              for (const item of val) scanValue(item, depth + 1);
+              return;
+            }
+            if (typeof val !== 'object') return;
+            for (const [k, v] of Object.entries(val)) {
+              const key = String(k || '').toLowerCase();
+              if (typeof v === 'string') {
+                if ((key.includes('token') || key === 'requestid' || key === 'requestId') && !String(v).includes('http')) {
+                  push(data.tokens, v);
+                }
+                if (key === 'sessionid' || key === 'sid') push(data.sessionIds, v);
+                if (key.includes('url') || key.includes('venue') || key.includes('launch') || key.includes('sport')) {
+                  if (String(v).includes('token=')) push(data.urls, v);
+                  pushHost(v);
                 }
               }
-              return outs;
-            }""",
-            {"sportToken": sport_token, "cuid": cuid, "specs": query_specs},
-        )
+              scanValue(v, depth + 1);
+            }
+          };
+          try {
+            data.currentUrl = String(location.href || '');
+            push(data.urls, data.currentUrl);
+            pushHost(data.currentUrl);
+          } catch (e) {}
+          try {
+            const stores = [localStorage, sessionStorage];
+            for (const store of stores) {
+              if (!store) continue;
+              for (let i = 0; i < store.length; i++) {
+                const key = store.key(i) || '';
+                const val = store.getItem(key) || '';
+                const low = key.toLowerCase();
+                if ((low.includes('token') || low === 'requestid') && val && !val.includes('http')) {
+                  push(data.tokens, val);
+                }
+                if (low === 'sessionid' && val) push(data.sessionIds, val);
+                scanValue(val, 0);
+              }
+            }
+          } catch (e) {}
+          try {
+            for (const e of (performance.getEntriesByType('resource') || [])) {
+              const name = String(e.name || '');
+              if (!name) continue;
+              if (/matchesPB|betOrder|yewu|api\\.|rccg|zlshelves|kaiyun/i.test(name)) {
+                pushHost(name);
+                if (name.includes('token=')) push(data.urls, name);
+              }
+            }
+          } catch (e) {}
+          try {
+            document.querySelectorAll('iframe').forEach((f) => {
+              try {
+                const src = String(f.src || '').trim();
+                if (src) {
+                  push(data.urls, src);
+                  pushHost(src);
+                }
+              } catch (e) {}
+            });
+          } catch (e) {}
+          return data;
+        }"""
+        urls: list[str] = []
+        tokens: list[str] = []
+        session_ids: list[str] = []
+        api_hosts: list[str] = []
+        targets: list[Any] = []
+        probe_samples: list[dict[str, Any]] = []
+        raw_targets = [page]
+        try:
+            raw_targets.extend(list(getattr(page, "frames", []) or []))
+        except Exception:
+            pass
+        for tgt in raw_targets:
+            try:
+                probe = await tgt.evaluate(probe_js)
+            except Exception:
+                continue
+            if not isinstance(probe, dict):
+                continue
+            cur_url = str(probe.get("currentUrl") or "").strip()
+            frame_relevant = any(
+                x in cur_url.lower()
+                for x in ("zlshelves", "yewu", "app-h5", "token=", "ybty", "match")
+            )
+            for u in probe.get("urls") or []:
+                _push_uniq(urls, u)
+            for t in probe.get("tokens") or []:
+                _push_uniq(tokens, sanitize_token(str(t or "")))
+            for sid in probe.get("sessionIds") or []:
+                _push_uniq(session_ids, sid)
+            for host in probe.get("apiHosts") or []:
+                hs = str(host or "").rstrip("/")
+                if hs:
+                    _push_uniq(api_hosts, hs)
+            if frame_relevant or probe.get("tokens") or probe.get("urls") or probe.get("apiHosts"):
+                if tgt not in targets:
+                    targets.append(tgt)
+            probe_samples.append(
+                {
+                    "url": cur_url[:140],
+                    "tokens": len(probe.get("tokens") or []),
+                    "urls": len(probe.get("urls") or []),
+                    "api_hosts": len(probe.get("apiHosts") or []),
+                }
+            )
+        if not targets:
+            targets = [page]
+
+        h5 = ""
+        sport_token = ""
+        cuid = ""
+        for u in urls:
+            hu, st, cu = _sport_ctx_from_url(u)
+            if hu and not h5:
+                h5 = hu
+            if st and not sport_token:
+                sport_token = st
+            if cu and not cuid:
+                cuid = cu
+            if h5 and sport_token and cuid:
+                break
+        if not sport_token and tokens:
+            sport_token = tokens[0]
+        if not cuid:
+            for sid in session_ids:
+                m = re.match(r"^(\d{15,22})", str(sid or ""))
+                if m:
+                    cuid = m.group(1)
+                    break
+        for pref in ("https://api.937kddt.com", "https://api.rccg5fz.com"):
+            _push_uniq(api_hosts, pref)
+        api_hosts = sorted(
+            api_hosts,
+            key=lambda h: (
+                0 if "api." in h.lower() else 1,
+                0 if "937kddt" in h.lower() else 1,
+                h,
+            ),
+        )[:6]
+        return {
+            "h5_url": h5,
+            "sport_token": sport_token,
+            "cuid": cuid,
+            "api_hosts": api_hosts,
+            "targets": targets,
+            "probe_samples": probe_samples[:6],
+        }
+
+    def _decode_matches_payloads(payloads: Any) -> list[dict[str, Any]]:
         merged: dict[str, dict] = {}
         for payload in payloads or []:
             if not isinstance(payload, dict):
@@ -786,6 +960,79 @@ async def fetch_ybty_matches_odds(
                     merged[mid] = row
         return list(merged.values())
 
+    async def _fetch_matches_pb(
+        page,
+        sport_token: str,
+        cuid: str,
+        *,
+        api_hosts: list[str] | None = None,
+        eval_targets: list[Any] | None = None,
+    ) -> list:
+        js = """async ({ sportToken, cuid, specs, hosts }) => {
+          const uniqHosts = [];
+          const pushHost = (raw) => {
+            if (!raw) return;
+            try {
+              const u = new URL(String(raw), location.href);
+              if (u.origin && uniqHosts.indexOf(u.origin) < 0) uniqHosts.push(u.origin);
+            } catch (e) {}
+          };
+          for (const host of (hosts || [])) pushHost(host);
+          try { pushHost(location.origin); } catch (e) {}
+          for (const host of ['https://api.937kddt.com', 'https://api.rccg5fz.com']) pushHost(host);
+          const headers = {
+            'content-type': 'application/json',
+            'lang': 'zh',
+            'requestid': sportToken,
+          };
+          const outs = [];
+          for (const host of uniqHosts) {
+            for (const path of ['/yewu11/v1/m/matchesPB', '/yewu13/v1/m/matchesPB']) {
+              for (const spec of specs) {
+                try {
+                  const resp = await fetch(host + path + '?t=' + Date.now(), {
+                    method: 'POST',
+                    headers,
+                    body: JSON.stringify({
+                      cuid: cuid || '',
+                      euid: String(spec.euid || ''),
+                      type: Number(spec.type || 3),
+                      sort: 1,
+                      device: 'v2_h5_st',
+                      hpsFlag: 1,
+                      category: 1,
+                    }),
+                    credentials: 'include',
+                  });
+                  const json = await resp.json();
+                  if (json && typeof json === 'object') outs.push(json);
+                } catch (e) {
+                  outs.push({ error: String(e), host, path, euid: String(spec.euid || '') });
+                }
+              }
+            }
+          }
+          return outs;
+        }"""
+        targets = eval_targets or [page]
+        for tgt in targets:
+            try:
+                payloads = await tgt.evaluate(
+                    js,
+                    {
+                        "sportToken": sport_token,
+                        "cuid": cuid,
+                        "specs": query_specs,
+                        "hosts": api_hosts or [],
+                    },
+                )
+            except Exception:
+                continue
+            rows = _decode_matches_payloads(payloads)
+            if rows:
+                return rows
+        return []
+
     async def _run_on_page(page) -> list:
         nonlocal h5_url, rows
         from app.services.bookmakers.browser_login import (
@@ -793,21 +1040,51 @@ async def fetch_ybty_matches_odds(
             dismiss_h5_orient_tip,
         )
 
+        async def _try_fetch_current_ctx(*, log_label: str = "") -> list:
+            nonlocal h5_url
+            ctx = await _discover_runtime_ctx(page)
+            st = str(ctx.get("sport_token") or "")
+            cu = str(ctx.get("cuid") or "")
+            hu = str(ctx.get("h5_url") or "")
+            if hu:
+                h5_url = hu
+                try:
+                    from app.services.bookmakers.site_session import site_sessions
+
+                    sess = site_sessions.get(base)
+                    if sess:
+                        sess.venue_url = hu
+                except Exception:
+                    pass
+            if not st:
+                return []
+            if log_label:
+                logger.info(
+                    "OB odds: %s token_source hosts=%s probe=%s",
+                    log_label,
+                    ctx.get("api_hosts") or [],
+                    ctx.get("probe_samples") or [],
+                )
+            try:
+                await dismiss_h5_orient_tip(page)
+            except Exception:
+                pass
+            return await _fetch_matches_pb(
+                page,
+                st,
+                cu,
+                api_hosts=list(ctx.get("api_hosts") or []),
+                eval_targets=list(ctx.get("targets") or [page]),
+            )
+
         # 主站必须桌面视口，否则会落到 APP 下载页
         await apply_desktop_viewport(page)
 
         # ---------- 优先：复用已手动进入的场馆页（禁止 goto 冲掉） ----------
         try:
-            for u in await _collect_page_urls(page):
-                hu, st, cuid = _sport_ctx_from_url(u)
-                if st:
-                    h5_url = hu
-                    logger.info("OB odds: reuse current venue url (no navigate)")
-                    try:
-                        await dismiss_h5_orient_tip(page)
-                    except Exception:
-                        pass
-                    return await _fetch_matches_pb(page, st, cuid)
+            rows = await _try_fetch_current_ctx(log_label="reuse current venue (no navigate)")
+            if rows:
+                return rows
         except Exception as e:
             logger.debug("OB reuse current venue failed: %s", e)
 
@@ -820,29 +1097,16 @@ async def fetch_ybty_matches_odds(
                 )
 
                 if await page_already_on_live_board(page) or await is_in_sportsbook(page):
-                    for u in await _collect_page_urls(page):
-                        hu, st, cuid = _sport_ctx_from_url(u)
-                        if st:
-                            h5_url = hu
-                            try:
-                                await dismiss_h5_orient_tip(page)
-                            except Exception:
-                                pass
-                            logger.info("OB odds: already in venue — no reload/goto")
-                            return await _fetch_matches_pb(page, st, cuid)
+                    rows = await _try_fetch_current_ctx(log_label="already in venue")
+                    if rows:
+                        return rows
             except Exception:
                 pass
             # refresh_first 不再 reload 长连接页（易白屏乱跳）
             try:
-                for u in await _collect_page_urls(page):
-                    hu, st, cuid = _sport_ctx_from_url(u)
-                    if st:
-                        h5_url = hu
-                        try:
-                            await dismiss_h5_orient_tip(page)
-                        except Exception:
-                            pass
-                        return await _fetch_matches_pb(page, st, cuid)
+                rows = await _try_fetch_current_ctx()
+                if rows:
+                    return rows
             except Exception:
                 pass
 
@@ -862,16 +1126,14 @@ async def fetch_ybty_matches_odds(
                             await dismiss_h5_orient_tip(page)
                         except Exception:
                             pass
-                        for u in await _collect_page_urls(page):
-                            hu2, st2, cuid2 = _sport_ctx_from_url(u)
-                            if st2:
-                                h5_url = hu2
-                                restored = True
-                                return await _fetch_matches_pb(page, st2, cuid2)
+                        rows = await _try_fetch_current_ctx(log_label="restore venue_url")
+                        if rows:
+                            restored = True
+                            return rows
                         # URL 已含 token 但 frames 未就绪：直接用保存的 token 拉 API
                         h5_url = hu
                         restored = True
-                        return await _fetch_matches_pb(page, st, cuid)
+                        return await _fetch_matches_pb(page, st, cuid, api_hosts=["https://api.937kddt.com", "https://api.rccg5fz.com"])
                     except Exception as e:
                         logger.warning("OB restore venue_url failed: %s", e)
 
@@ -911,29 +1173,21 @@ async def fetch_ybty_matches_odds(
                         except Exception:
                             continue
                     await page.wait_for_timeout(2500)
-                    for u in await _collect_page_urls(page):
-                        hu, st, cuid = _sport_ctx_from_url(u)
-                        if st:
-                            h5_url = hu
-                            try:
-                                from app.services.bookmakers.site_session import site_sessions
-
-                                sess = site_sessions.get(base)
-                                if sess:
-                                    sess.venue_url = hu
-                            except Exception:
-                                pass
-                            try:
-                                await dismiss_h5_orient_tip(page)
-                            except Exception:
-                                pass
-                            return await _fetch_matches_pb(page, st, cuid)
+                    rows = await _try_fetch_current_ctx(log_label="soft re-enter")
+                    if rows:
+                        return rows
                 except Exception as e:
                     logger.warning("OB soft re-enter failed: %s", e)
 
+            probe = {}
+            try:
+                probe = await _discover_runtime_ctx(page)
+            except Exception:
+                probe = {}
             logger.warning(
-                "OB venue page has no sport token after restore/re-enter; url=%s",
+                "OB venue page has no sport token after restore/re-enter; url=%s probe=%s",
                 (getattr(page, "url", "") or "")[:160],
+                probe.get("probe_samples") if isinstance(probe, dict) else [],
             )
             return []
 
@@ -1011,8 +1265,18 @@ async def fetch_ybty_matches_odds(
 
             _, sport_token, cuid = _sport_ctx_from_url(h5_url)
             if not sport_token:
-                return []
-            return await _fetch_matches_pb(page, sport_token, cuid)
+                rows = await _try_fetch_current_ctx(log_label="own-browser h5 fallback")
+                return rows
+            rows = await _fetch_matches_pb(
+                page,
+                sport_token,
+                cuid,
+                api_hosts=["https://api.937kddt.com", "https://api.rccg5fz.com"],
+                eval_targets=[page] + list(getattr(page, "frames", []) or []),
+            )
+            if rows:
+                return rows
+            return await _try_fetch_current_ctx(log_label="own-browser post-h5")
         except Exception:
             logger.exception("fetch_ybty_matches_odds failed")
             return []

@@ -1,9 +1,9 @@
-"""端到端验证：预取 nowscore 基本面到 Redis + 触发 AI 大小球分析。
+"""端到端验证：预取 nowscore 基本面到 Redis + 触发 AI 小球分析。
 
 流程：
 1. prefetch_today_all_contexts("football")  -> Redis/DB 写入基本面
 2. 选一场有实时盘口的比赛 -> analyze_and_recommend(match_id, user_id)
-3. 打印 AI 大小球走向结果
+3. 打印 AI 小球分析结果
 """
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ async def main():
     fb_count = await prefetch_today_all_contexts(sport="football", concurrency=8)
     logger.info("足球基本面缓存比赛数: %d", fb_count)
 
-    # ── Step 2: 选比赛并触发 AI 大小球分析 ──
+    # ── Step 2: 选比赛并触发 AI 小球分析 ──
     # match 1019: 德文波特城前锋 vs 朗赛斯顿城 (2-0 上半场, total line ~3.5)
     # match 1016: 阿尔弗斯通SC vs 东南联 (1-0 上半场, total line 3.5/3.75)
     match_id = int(sys.argv[1]) if len(sys.argv) > 1 else 1019
@@ -63,8 +63,8 @@ async def main():
     else:
         logger.warning("Redis 未命中基本面，将触发 nowscore 实时抓取")
 
-    # ── Step 3: 触发 AI 大小球分析（实时盘口 + 基本面）──
-    logger.info("=== Step 3: 触发 AI 大小球分析 match=%s user=%s ===", match_id, user_id)
+    # ── Step 3: 触发 AI 小球分析（实时盘口 + 基本面）──
+    logger.info("=== Step 3: 触发 AI 小球分析 match=%s user=%s ===", match_id, user_id)
     from app.ai.auto_better import analyze_and_recommend
 
     result = await analyze_and_recommend(match_id=match_id, user_id=user_id)

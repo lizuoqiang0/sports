@@ -118,34 +118,23 @@ def _recover_teams_from_league(home: str, away: str, league: str) -> tuple[str, 
 
 
 def _parse_total_from_raw(raw: str, *, sport: str = "football") -> Optional[dict]:
-    """从 DOM 行文本解析全场大小（大/小 + 盘口）。"""
+    """从 DOM 行文本解析全场小球盘口与赔率。"""
     text = (raw or "").replace("\u200e", " ").replace("\u200f", " ")
-    if not text or not re.search(r"大|小|Over|Under|\bO\b|\bU\b", text, re.I):
+    if not text or not re.search(r"小|Under|\bU\b", text, re.I):
         return None
     m = re.search(
-        r"(?:大|O(?:ver)?)\s*([0-9]+(?:\.[0-9]+)?)\s+(\d{1,2}\.\d{1,3}).{0,48}?"
-        r"(?:小|U(?:nder)?)\s*(?:[0-9]+(?:\.[0-9]+)?\s+)?(\d{1,2}\.\d{1,3})",
+        r"(?:小|U(?:nder)?)\s*([0-9]+(?:\.[0-9]+)?)\s+(\d{1,2}\.\d{1,3})",
         text,
         re.I,
     )
-    over_first = True
-    if not m:
-        m = re.search(
-            r"(?:小|U(?:nder)?)\s*([0-9]+(?:\.[0-9]+)?)\s+(\d{1,2}\.\d{1,3}).{0,48}?"
-            r"(?:大|O(?:ver)?)\s*(?:[0-9]+(?:\.[0-9]+)?\s+)?(\d{1,2}\.\d{1,3})",
-            text,
-            re.I,
-        )
-        over_first = False
     if not m:
         return None
     try:
         line = float(m.group(1))
-        a = float(m.group(2))
-        b = float(m.group(3))
+        under = float(m.group(2))
     except (TypeError, ValueError):
         return None
-    if a <= 1 or b <= 1:
+    if under <= 1:
         return None
     # 球类盘口合理性
     if sport == "football" and not (0.5 <= line <= 12):
@@ -154,9 +143,7 @@ def _parse_total_from_raw(raw: str, *, sport: str = "football") -> Optional[dict
         # 允许未识别球类时的宽松线
         if not (0.5 <= line <= 280):
             return None
-    if over_first:
-        return {"line": line, "over": a, "under": b}
-    return {"line": line, "under": a, "over": b}
+    return {"line": line, "under": under}
 
 
 async def capture_venue_payloads(
@@ -371,30 +358,26 @@ async def scrape_dom_matches(page, *, site_code: str, live_only: bool = False, l
                   (clockLive && (hs > 0 || as_ > 0))
                 );
 
-                // 全场大小：从行文本抽 大/小 + 盘口线 + 赔率
-                let total_line = null, over = null, under = null;
-                const ou = t.match(/(?:大|O(?:ver)?)\\s*([0-9]+(?:\\.[0-9]+)?)\\s+(\\d{1,2}\\.\\d{1,3}).{0,48}?(?:小|U(?:nder)?)\\s*(?:[0-9]+(?:\\.[0-9]+)?\\s+)?(\\d{1,2}\\.\\d{1,3})/i)
-                  || t.match(/(?:小|U(?:nder)?)\\s*([0-9]+(?:\\.[0-9]+)?)\\s+(\\d{1,2}\\.\\d{1,3}).{0,48}?(?:大|O(?:ver)?)\\s*(?:[0-9]+(?:\\.[0-9]+)?\\s+)?(\\d{1,2}\\.\\d{1,3})/i);
+                // 全场小球：从行文本抽盘口线与小球赔率。
+                let total_line = null, under = null;
+                const ou = t.match(/(?:小|U(?:nder)?)\\s*([0-9]+(?:\\.[0-9]+)?)\\s+(\\d{1,2}\\.\\d{1,3})/i);
                 if (ou) {
                   const ln = Number(ou[1]);
                   const a = Number(ou[2]);
-                  const b = Number(ou[3]);
-                  if (Number.isFinite(ln) && a > 1 && b > 1) {
+                  if (Number.isFinite(ln) && a > 1) {
                     total_line = ln;
-                    if (/^(?:小|U)/i.test(ou[0])) { under = a; over = b; }
-                    else { over = a; under = b; }
+                    under = a;
                   }
-                } else if (/大|小|Over|Under|\bO\b|\bU\b/i.test(t)) {
-                  // 盘口线：.0/.25/.5/.75（足球）或 120–280（篮球）；末两档亚赔视作大/小
+                } else if (/小|Under|\bU\b/i.test(t)) {
+                  // 盘口线：.0/.25/.5/.75（足球）或 120–280（篮球）；末档亚赔视作小球。
                   const lineHit = parts.map(Number).find((n) =>
                     Number.isFinite(n) && (
                       (n >= 0.5 && n <= 12 && Math.abs(n * 4 - Math.round(n * 4)) < 1e-6) ||
                       (n >= 120 && n <= 280)
                     )
                   );
-                  if (lineHit != null && odds.length >= 2) {
+                  if (lineHit != null && odds.length >= 1) {
                     total_line = lineHit;
-                    over = odds[odds.length - 2];
                     under = odds[odds.length - 1];
                   }
                 }
@@ -411,7 +394,6 @@ async def scrape_dom_matches(page, *, site_code: str, live_only: bool = False, l
                   live,
                   sport_hint: sportHint,
                   total_line,
-                  over,
                   under,
                   raw: t.slice(0, 220),
                 });
@@ -622,7 +604,7 @@ async def scrape_dom_matches(page, *, site_code: str, live_only: bool = False, l
             )
         ]
         # 额外赔率对：尝试 spread（启发式）
-        if len(odds_vals) >= 4 and not (item.get("over") and item.get("under")):
+        if len(odds_vals) >= 4 and not item.get("under"):
             odds_list.append(
                 RemoteOdds(
                     bet_type="spread",
@@ -635,34 +617,33 @@ async def scrape_dom_matches(page, *, site_code: str, live_only: bool = False, l
                 )
             )
 
-        # 全场大小球（DOM 正则 / 关键词兜底）
-        over_v = coerce_float_european(item.get("over"))
+        # 全场小球（DOM 正则 / 关键词兜底）
         under_v = coerce_float_european(item.get("under"))
         try:
             total_line = float(item.get("total_line")) if item.get("total_line") is not None else None
         except (TypeError, ValueError):
             total_line = None
-        if (not over_v or not under_v) and item.get("raw"):
+        if not under_v and item.get("raw"):
             tot = _parse_total_from_raw(str(item.get("raw") or ""), sport=sport)
             if tot:
-                over_v = over_v or tot.get("over")
                 under_v = under_v or tot.get("under")
                 if total_line is None:
                     total_line = tot.get("line")
-        if over_v and under_v and over_v > 1 and under_v > 1:
+        # 线缺失（None）时跳过该 total 盘：用 0 占位会一路写进 Odds.total，
+        # 结算端只能退本金兜底 —— 源头不产毒
+        if under_v and under_v > 1 and total_line:
             odds_list.append(
                 RemoteOdds(
                     bet_type="total",
-                    total=float(total_line or 0),
+                    total=float(total_line),
                     odds_data={
-                        "over": float(over_v),
                         "under": float(under_v),
                         "_site": {
                             "bet_type": "total",
                             "source": "dom",
                             "site_code": prefix,
                             "sport": sport,
-                            "line": float(total_line or 0),
+                            "line": float(total_line),
                         },
                     },
                 )
@@ -800,6 +781,24 @@ async def fetch_venue_live_odds(
         already_in = False
         try:
             already_in = await _in_book_now(page)
+            # 网关入口页（/game/sport/ob）只是 iframe 壳，不是真正的场馆 H5，
+            # 必须导航进 H5 才能采盘（否则 matchesPB API 无 token）。
+            if already_in and code0 == "ob":
+                try:
+                    _cur_url = (page.url or "").lower()
+                    if "/game/sport/" in _cur_url and "token=" not in _cur_url and "yewu" not in _cur_url:
+                        from app.services.bookmakers.plugins.ob.odds import _collect_page_urls, _sport_ctx_from_url
+                        _has_token = False
+                        for _u in await _collect_page_urls(page):
+                            _, _st, _ = _sport_ctx_from_url(_u)
+                            if _st:
+                                _has_token = True
+                                break
+                        if not _has_token:
+                            already_in = False
+                            logger.info("venue live ob: gateway shell detected, force re-enter venue")
+                except Exception:
+                    pass
         except Exception:
             already_in = False
         if not already_in and not needs_manual_venue(site_code):

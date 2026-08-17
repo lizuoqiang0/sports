@@ -3,7 +3,7 @@ AI 自动投注引擎 - 主调度器
 
 工作流程:
 1. 定时扫描 OB / 平博 各自滚球（足球/篮球）赛事
-2. 用 LLM + 盘口矩阵分析全场大小球
+2. 用 LLM + 盘口矩阵分析全场小球
 3. 策略引擎评估投注决策
 4. 自动执行真实下单（人工模式仅推荐；每轮最多 N 单、不同比赛）
 5. 风控监控 (止损/止盈/限额)
@@ -28,11 +28,11 @@ from app.models.user import (
 from app.ai.analyzer import analyzer
 from app.ai.strategy import (
     BetDecision,
+    StrategyConfig,
     StrategyEngine,
     decision_passes_strategy,
     effective_strategy_from_ai_config,
     load_fresh_strategy,
-    strategy_engine,
 )
 from app.core.websocket import manager
 from app.services.bet_mode import get_user_bet_mode, is_active_mode
@@ -47,6 +47,35 @@ logger = logging.getLogger(__name__)
 # 单边模式可下注站点：平博 + OB
 SINGLE_SIDE_PROVIDER_NAMES = frozenset({"平博", "OB体育"})
 SINGLE_SIDE_PROVIDER_CODES = frozenset({"pinnacle", "ob"})
+
+
+async def connected_provider_names(db: AsyncSession, user_id: int) -> set[str]:
+    """用户已连接站点（enabled + CONNECTED + 真实站）的 provider 名称集合。
+
+    分析/扫描阶段的赔率只从已连接站点加载 —— 未连接站的赔率若参与分析，
+    AI 会选中它（decision.provider=ob），执行层只能失败或被动切站。
+    """
+    from sqlalchemy import select as _sa_select
+
+    from app.models.user import BookmakerAccount, BookmakerStatus
+    from app.services.bookmakers.catalog import provider_name
+    from app.services.bookmakers.registry import is_real_live_account
+
+    res = await db.execute(
+        _sa_select(BookmakerAccount).where(
+            BookmakerAccount.user_id == int(user_id),
+            BookmakerAccount.enabled.is_(True),
+            BookmakerAccount.status == BookmakerStatus.CONNECTED,
+            BookmakerAccount.code.in_(list(SINGLE_SIDE_PROVIDER_CODES)),
+        )
+    )
+    names: set[str] = set()
+    for acc in res.scalars().all():
+        if is_real_live_account(acc.code, acc.base_url or ""):
+            names.add(provider_name(acc.code))
+    return names
+
+
 # 每轮最多分析的滚球场次（按站点+球类覆盖）
 _LIVE_SCAN_LIMIT = max(
     60, int(getattr(settings, "AI_LIVE_SCAN_LIMIT", 120) or 120)
@@ -68,6 +97,8 @@ class AIBettingEngine:
         self.user_id = user_id
         self.is_running = False
         self._task: Optional[asyncio.Task] = None
+        self._cycle_ai_config = None  # 每轮缓存，避免逐场查 DB
+        self._cycle_strat_cfg = None
 
     # === 生命周期 ===
     async def start(self):
@@ -93,18 +124,39 @@ class AIBettingEngine:
 
     async def _main_loop(self):
         """主循环：分析/下单一轮后休眠（默认 120 秒）"""
-        while self.is_running:
+        try:
+            while self.is_running:
+                try:
+                    await self._run_cycle()
+                    # 周期续期跨进程锁/运行标记（TTL 900s，每轮 ~120s 续一次）
+                    try:
+                        from app.core.cache import cache
+
+                        token = getattr(self, "_engine_lock_token", "")
+                        if token:
+                            await cache.extend_lock_if_owned(
+                                f"ai:engine:lock:{self.user_id}", token, ttl_sec=_ENGINE_LOCK_TTL
+                            )
+                        await cache.set(f"ai:engine:running:{self.user_id}", "1", ttl=_ENGINE_LOCK_TTL)
+                    except Exception:
+                        pass
+                    # 每轮间隔：默认 120s（热读 settings，改 .env 后重启生效）
+                    interval = max(120, int(getattr(settings, "AI_SCAN_INTERVAL_SEC", 120) or 120))
+                    logger.info("AI 引擎本轮结束，%s 秒后下一轮", interval)
+                    await asyncio.sleep(interval)
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger.error(f"AI引擎异常: {e}", exc_info=True)
+                    await asyncio.sleep(settings.AI_RETRY_SLEEP_SEC)
+        finally:
+            # 引擎退出（停止/风控自停/异常）：清运行标记，让锁随 TTL 自然过期或被下次启动复用
             try:
-                await self._run_cycle()
-                # 每轮间隔：默认 120s（热读 settings，改 .env 后重启生效）
-                interval = max(120, int(getattr(settings, "AI_SCAN_INTERVAL_SEC", 120) or 120))
-                logger.info("AI 引擎本轮结束，%s 秒后下一轮", interval)
-                await asyncio.sleep(interval)
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"AI引擎异常: {e}", exc_info=True)
-                await asyncio.sleep(settings.AI_RETRY_SLEEP_SEC)
+                from app.core.cache import cache
+
+                await cache.delete(f"ai:engine:running:{self.user_id}")
+            except Exception:
+                pass
 
     # === 单次执行周期 ===
     async def _run_cycle(self):
@@ -132,6 +184,8 @@ class AIBettingEngine:
                 return
 
             ai_config, strat_cfg = await load_fresh_strategy(self.user_id)
+            self._cycle_ai_config = ai_config  # 缓存供本轮复用
+            self._cycle_strat_cfg = strat_cfg
             if not ai_config or not getattr(ai_config, "is_active", True):
                 self.is_running = False
                 return
@@ -222,8 +276,7 @@ class AIBettingEngine:
         })
 
         # --- Phase 2 + 3 合并：流式分析→评估→下单（分析完立即下单，不等其他组）---
-        user_engine = StrategyEngine(strat_cfg)
-        strategy_engine.config = strat_cfg
+        user_engine = StrategyEngine(strat_cfg, user_id=self.user_id)
         uid = self.user_id
         sem = asyncio.Semaphore(_LIVE_ANALYZE_CONCURRENCY)
         analyses: list[dict] = []
@@ -238,7 +291,7 @@ class AIBettingEngine:
             async with sem:
                 # 1. LLM 分析
                 try:
-                    recs = await analyze_fixture_group(ids, uid)
+                    recs = await analyze_fixture_group(ids, uid, strat_override=strat_cfg)
                     best = pick_best_rec_for_fixture(recs)
                 except Exception as e:
                     logger.warning("滚球同场分析失败 ids=%s: %s", ids, e)
@@ -254,7 +307,7 @@ class AIBettingEngine:
                 analyses.append(best)
                 rec = best.get("recommendation") or {}
                 sel = str(rec.get("selection") or "").lower()
-                if sel not in ("over", "under"):
+                if sel != "under":
                     if sel == "skip":
                         logger.info(
                             "[AI主循环] AI 判定跳过（数据不足）: match=%s %s vs %s",
@@ -374,10 +427,10 @@ class AIBettingEngine:
                         if not user or not user.ai_enabled:
                             self.is_running = False
                             return best
-                        ai_config2, strat_cfg2 = await load_fresh_strategy(self.user_id)
+                        ai_config2 = self._cycle_ai_config
+                        strat_cfg2 = self._cycle_strat_cfg
                         if not ai_config2:
                             return best
-                        strategy_engine.config = strat_cfg2
                         # 风控实时检查
                         should_stop, reason = await self._check_risk(db, user, ai_config2)
                         if should_stop:
@@ -570,11 +623,19 @@ class AIBettingEngine:
 
         from app.ai.strategy_gates import team_is_excluded
 
+        # 只分析已连接站点可下注的赔率：未连接站（如未开 OB）的赔率参与分析
+        # 会让 AI 选中它，执行时只能失败/被动切站（下单失败根因）
+        connected_names = await connected_provider_names(db, self.user_id)
+        if not connected_names:
+            logger.info("[AI扫描] 无已连接站点，跳过本轮扫描 user=%s", self.user_id)
+            return []
+
         excluded = list(getattr(ai_config, "excluded_teams", None) or [])
 
         # 刚开赛优先扫描
         matches = sort_just_started_first(matches)
         candidates = []
+        pre_filtered: list = []
         for m in matches:
             if _already_bet(m):
                 continue
@@ -594,11 +655,27 @@ class AIBettingEngine:
             if why:
                 logger.debug("scan skip match=%s reason=%s", m.id, why)
                 continue
-            from app.ai.market_recommend import load_all_market_odds_pack
+            pre_filtered.append((m, sport_key, site))
 
-            odds_pack = await load_all_market_odds_pack(
-                db, m.id, sport_key, providers_filter=SINGLE_SIDE_PROVIDER_NAMES
-            )
+        # 并行加载赔率包（串行 N 场 -> 并行 gather，大幅缩短扫描耗时）
+        from app.ai.market_recommend import load_all_market_odds_pack
+
+        async def _load_odds(m, sport_key, site):
+            try:
+                pack = await load_all_market_odds_pack(
+                    db, m.id, sport_key, providers_filter=connected_names
+                )
+                return m, sport_key, site, pack
+            except Exception:
+                return m, sport_key, site, None
+
+        odds_results = await asyncio.gather(
+            *[_load_odds(m, sk, st) for m, sk, st in pre_filtered]
+        ) if pre_filtered else []
+
+        for m, sport_key, site, odds_pack in odds_results:
+            if not odds_pack:
+                continue
             markets_odds = odds_pack.get("markets") or {}
             odds = dict(odds_pack.get("flat") or {})
             if not markets_odds and not odds:
@@ -612,11 +689,9 @@ class AIBettingEngine:
                 odds_map={"markets": markets_odds, **odds},
             )
             if why:
-                if why == "odds_out_of_range":
-                    why = None
-                else:
-                    logger.debug("scan skip match=%s reason=%s", m.id, why)
-                    continue
+                # 赔率区间外也跳过：E1 闸门会再次拦截，放行只浪费 LLM 调用
+                logger.debug("scan skip match=%s reason=%s", m.id, why)
+                continue
 
             candidates.append({
                 "id": m.id,
@@ -693,7 +768,6 @@ class AIBettingEngine:
             logger.warning("无 AI 策略配置，拒绝自动下单 user=%s", user.id)
             return False
         strat_cfg = effective_strategy_from_ai_config(ai_config)
-        strategy_engine.config = strat_cfg
 
         odds_result = await db.execute(
             select(Match).where(Match.id == decision.match_id)
@@ -730,7 +804,7 @@ class AIBettingEngine:
 
         sel = str(decision.selection or "").lower()
         bet_type = str(getattr(decision, "bet_type", None) or "total").lower()
-        if bet_type != "total" or sel not in ("over", "under"):
+        if bet_type != "total" or sel != "under":
             logger.warning(
                 "[AI下单] ❌ 不支持的盘口/方向: match=%s type=%s sel=%s",
                 decision.match_id, bet_type, sel,
@@ -768,6 +842,55 @@ class AIBettingEngine:
                 provider_code = "pinnacle"
         provider_label = provider_name(provider_code)
 
+        # --- 检查站点连接状态，未连接则自动切换到已连接的站点 ---
+        from app.services.provider_utils import code_by_provider as _code_by_provider
+        conn_res = await db.execute(
+            select(BookmakerAccount).where(
+                BookmakerAccount.user_id == user.id,
+                BookmakerAccount.enabled.is_(True),
+                BookmakerAccount.status == BookmakerStatus.CONNECTED,
+                BookmakerAccount.code.in_(list(SINGLE_SIDE_PROVIDER_CODES)),
+            )
+        )
+        connected_codes: set[str] = set()
+        for acc in conn_res.scalars().all():
+            if is_real_live_account(acc.code, acc.base_url or ""):
+                connected_codes.add(acc.code)
+
+        if provider_code not in connected_codes:
+            # 尝试切换到已连接且有赔率的站点
+            odds_by_provider = pack.get("odds_by_provider") or {}
+            switched = False
+            for pname, sel_odds in odds_by_provider.items():
+                alt_code = _code_by_provider(pname) or ""
+                if alt_code not in connected_codes or alt_code == provider_code:
+                    continue
+                if sel not in (sel_odds or {}):
+                    continue
+                logger.info(
+                    "[AI下单] 站点切换: %s未连接 -> 切换至%s | match=%s sel=%s odds=%.2f",
+                    provider_label, provider_name(alt_code), decision.match_id, sel, float(sel_odds[sel]),
+                )
+                provider_code = alt_code
+                provider_label = provider_name(provider_code)
+                best_meta = {
+                    "provider": pname,
+                    "provider_code": alt_code,
+                    "odds": float(sel_odds[sel]),
+                }
+                switched = True
+                break
+            if not switched:
+                logger.warning(
+                    "AI 下单失败：站点未连接且无可用替代 site=%s connected=%s",
+                    provider_code, connected_codes or "无",
+                )
+                await self._notify(user.id, "bet_failed", {
+                    "match_id": decision.match_id,
+                    "message": f"请先连接{provider_label}后再自动下单",
+                })
+                return False
+
         ids = dict((match.extra_data or {}).get("ids") or {})
         match_ext = str(ids.get(provider_code) or "")
         if not match_ext and str(match.external_id or "").startswith(f"{provider_code}:"):
@@ -780,11 +903,7 @@ class AIBettingEngine:
             })
             return False
 
-        bt_enum = {
-            "total": BetType.TOTAL,
-            "moneyline": BetType.MONEYLINE,
-            "spread": BetType.SPREAD,
-        }[bet_type]
+        bt_enum = BetType.TOTAL
         odds_row = await self._get_odds_row(
             db,
             decision.match_id,
@@ -793,16 +912,14 @@ class AIBettingEngine:
         )
         odds_payload = dict(odds_row.odds_data or {}) if odds_row else {}
         line_val = None
+        # line 必须来自下单站点自己的行：兜底行可能是兄弟站的（两家 line 常差
+        # 0.25/0.5），拿别站的线结算会错判输赢。行 provider 不匹配时宁可走
+        # decision.line（分析时刻的 canonical 线）也不用错行。
+        row_is_own_site = bool(odds_row and str(odds_row.provider or "") == provider_label)
         if bet_type == "total":
-            if odds_row and odds_row.total is not None:
+            if row_is_own_site and odds_row.total is not None:
                 try:
                     line_val = float(odds_row.total)
-                except (TypeError, ValueError):
-                    line_val = None
-        elif bet_type == "spread":
-            if odds_row and odds_row.spread is not None:
-                try:
-                    line_val = float(odds_row.spread)
                 except (TypeError, ValueError):
                     line_val = None
         if line_val is None and decision.line is not None:
@@ -818,8 +935,6 @@ class AIBettingEngine:
         if line_val is not None:
             if bet_type == "total":
                 odds_payload = {**odds_payload, "line": line_val, "total": line_val}
-            elif bet_type == "spread":
-                odds_payload = {**odds_payload, "line": line_val, "spread": line_val}
 
         try:
             # 优先用数据库最新赔率，其次用决策赔率
@@ -877,9 +992,14 @@ class AIBettingEngine:
             })
             return False
 
-        stake = Decimal(str(decision.suggested_stake or strat_cfg.max_bet_amount or 1)).quantize(Decimal("0.01"))
+        # 仓位为 0/负 = 异常决策，直接拒绝下单（绝不静默回退到满仓上限）
+        stake = Decimal(str(decision.suggested_stake or 0)).quantize(Decimal("0.01"))
         if stake < Decimal("1.00"):
-            stake = Decimal("1.00")
+            logger.warning(
+                "[AI下单] ❌ 拒绝 match=%s | 仓位异常 suggested_stake=%s（不回退满仓）",
+                decision.match_id, decision.suggested_stake,
+            )
+            return False
         if float(site_acc.balance or 0) < float(stake):
             logger.warning("站点余额不足: need=%s, have=%s", stake, site_acc.balance)
             return False
@@ -925,8 +1045,6 @@ class AIBettingEngine:
                     if line_val is not None:
                         if bet_type == "total":
                             fresh_payload = {**fresh_payload, "line": line_val, "total": line_val}
-                        elif bet_type == "spread":
-                            fresh_payload = {**fresh_payload, "line": line_val, "spread": line_val}
                     odds_payload = fresh_payload
                     try:
                         current_odds = float(
@@ -940,6 +1058,11 @@ class AIBettingEngine:
                     "补单重试 %s/%s: match=%s 最新赔率=%.3f",
                     attempt, retry_count, decision.match_id, current_odds,
                 )
+
+            # 队名注入 odds_data：UI 下单依赖队名定位赛事行
+            # （短格式 external_id 如 pinnacle:1634071712 无法解析队名）
+            odds_payload["_home_team"] = match.home_team or ""
+            odds_payload["_away_team"] = match.away_team or ""
 
             place = await connector.place_bet(
                 match_external_id=str(match_ext or match.external_id),
@@ -1118,7 +1241,7 @@ class AIBettingEngine:
         provider_name_prefer: str = "平博",
         bet_type: BetType = BetType.TOTAL,
     ) -> Optional[Odds]:
-        """优先取指定站盘口行（默认全场大小球）。
+        """优先取指定站盘口行（默认全场小球）。
 
         canonical=OB 时平博赔率存在兄弟 match_id 名下（跨站同场未合并），
         扩展查询兄弟场后再按 provider 优先挑选。
@@ -1156,7 +1279,8 @@ class AIBettingEngine:
         )
         odds_list = result.scalars().all()
         if odds_list:
-            # 平博行优先（其 _site 带 API 下单所需 sel_id）
+            # 无 prefer 站行时兜底：平博行优先（其 _site 带 API 下单所需 sel_id），
+            # 但绝不因此改变调用方已确定的下单站点 —— line 由调用方按行 provider 校验
             for o in odds_list:
                 if str(o.provider or "") == "平博":
                     return o
@@ -1222,11 +1346,12 @@ class AIBettingEngine:
         return await calc_daily_pnl(db, user.id)
 
     async def _count_active_bets(self, db: AsyncSession, user: User) -> int:
-        """统计活跃投注数"""
+        """统计当前未结算的成功注单数（真实持仓，用于仓位风险折扣）。"""
         result = await db.execute(
             select(func.count(Bet.id)).where(
                 Bet.user_id == user.id,
-                Bet.status == BetStatus.SUCCESS
+                Bet.status == BetStatus.SUCCESS,
+                Bet.settled_at.is_(None),
             )
         )
         return result.scalar_one()
@@ -1344,6 +1469,13 @@ async def analyze_and_recommend(
 
     # --- Phase 1: 短事务加载赛事 + 用户 AI 策略 ---
     async with AsyncSessionLocal() as db:
+        # 手动分析同样只看已连接站点赔率（未连接站的赔率选不中、下不了单）
+        try:
+            _conn_names = await connected_provider_names(db, user_id)
+            if _conn_names:
+                providers_filter = _conn_names
+        except Exception:
+            pass
         match_result = await db.execute(select(Match).where(Match.id == match_id))
         match = match_result.scalar_one_or_none()
         if not match:
@@ -1358,8 +1490,7 @@ async def analyze_and_recommend(
             )).scalar_one_or_none()
         else:
             ai_config, strat_cfg = await load_fresh_strategy(user_id)
-        user_engine = StrategyEngine(strat_cfg)
-        strategy_engine.config = strat_cfg
+        user_engine = StrategyEngine(strat_cfg, user_id=user_id)
 
         from app.ai.strategy_gates import sport_is_preferred, team_is_excluded
 
@@ -1453,7 +1584,7 @@ async def analyze_and_recommend(
         if skip_why:
             await db.commit()
             reason_map = {
-                "score_over_line": "当前比分已超过大小球盘口，跳过分析",
+                "score_exceeds_line": "当前比分已超过小球盘口，跳过分析",
                 "ending_soon": "比赛预计 10 分钟内结束，跳过分析",
                 "china_match": "中国赛事已过滤，跳过分析",
             }
@@ -1627,7 +1758,7 @@ async def analyze_and_recommend(
         conf_use = float(analysis.get("confidence") or conf0 or 0)
         conf_use = max(0.0, min(0.99, conf_use))
         pred = str(analysis.get("prediction") or "").lower().strip()
-        if pred not in ("over", "under"):
+        if pred != "under":
             pred = ""
 
         markets = await build_match_market_recommendations(
@@ -1673,7 +1804,7 @@ async def analyze_and_recommend(
             if cell.get("available") and cell.get("odds") and cell.get("selection"):
                 market_odds_flat.setdefault(str(cell["selection"]), float(cell["odds"]))
 
-        analysis_pick_allowed = bool(use_llm) and pred in ("over", "under")
+        analysis_pick_allowed = bool(use_llm) and pred == "under"
         consensus_ok = True if not use_llm else bool(analysis.get("consensus_reached", True))
         if analysis_pick_allowed:
             sel = str(primary.get("selection") or pred or "").lower()
@@ -1692,7 +1823,7 @@ async def analyze_and_recommend(
                 conf_use = max(0.01, min(0.99, wr))
         except (TypeError, ValueError):
             pass
-        if analysis_pick_allowed and sel in ("over", "under"):
+        if analysis_pick_allowed and sel == "under":
             analysis = {
                 **analysis,
                 "prediction": sel,
@@ -1731,7 +1862,7 @@ async def analyze_and_recommend(
         if (
             not analysis_pick_allowed
             or not primary
-            or sel not in ("over", "under")
+            or sel != "under"
             or sel_odds <= 1
         ):
             decision = BetDecision(
@@ -1787,7 +1918,8 @@ async def analyze_and_recommend(
             sug_stake = Decimal(str(decision.suggested_stake or 0))
         if decision.should_bet:
             if sug_stake <= 0:
-                sug_stake = Decimal(str(strat_cfg.max_bet_amount or 1))
+                # 异常仓位按最小注兜底（展示用途；执行层仍会拒绝 ≤0 的单）
+                sug_stake = Decimal("1")
             sug_stake = min(sug_stake, Decimal(str(strat_cfg.max_bet_amount or 1)))
             if sug_stake < Decimal("1"):
                 sug_stake = Decimal("1")
@@ -1873,12 +2005,12 @@ async def analyze_and_recommend(
             },
             "current_odds": {
                 k: v for k, v in (market_odds_flat or {}).items()
-                if k in ("over", "under", "home", "away", "draw") and isinstance(v, (int, float))
+                if k == "under" and isinstance(v, (int, float))
             },
             "best_by_selection": mkt_pack.get("best_by_selection") or {},
             "odds_by_provider": mkt_pack.get("odds_by_provider") or {},
             "site_scope": "ob,pinnacle",
-            "market_scope": "moneyline,spread,total" if str(sport_key).lower() in ("football", "soccer") else "total",
+            "market_scope": "total",
             "match_status": match_status,
         }
 
@@ -1889,6 +2021,7 @@ async def analyze_fixture_group(
     *,
     stake: float | None = None,
     skip_match_context: bool | None = None,
+    strat_override: Optional[StrategyConfig] = None,
 ) -> list[dict]:
     """
     同场多站点（OB/平博）只跑一次 LLM，盘口/下单决策按各站 match_id 分别生成。
@@ -1918,8 +2051,11 @@ async def analyze_fixture_group(
         skip_match_context = not bool(
             getattr(settings, "AI_MATCH_CONTEXT_IN_BATCH", False)
         )
-    # Load strategy once for the entire fixture group (avoid redundant load_fresh_strategy per match)
-    _, strat_cfg = await load_fresh_strategy(user_id)
+    # 使用传入的策略缓存，避免每个 fixture group 重复查 DB
+    if strat_override is not None:
+        strat_cfg = strat_override
+    else:
+        _, strat_cfg = await load_fresh_strategy(user_id)
     canonical = pick_canonical_match(ordered)
     primary = await analyze_and_recommend(
         int(canonical.id),
@@ -1989,19 +2125,50 @@ def pick_best_rec_for_fixture(recs: list[dict]) -> Optional[dict]:
 _active_engines: dict[int, AIBettingEngine] = {}
 
 
+_ENGINE_LOCK_TTL = 900  # 引擎锁/运行标记 TTL：进程崩溃后最多 15 分钟自动过期
+
+
+def _engine_lock_key(user_id: int) -> str:
+    return f"ai:engine:lock:{user_id}"
+
+
+def _engine_running_key(user_id: int) -> str:
+    return f"ai:engine:running:{user_id}"
+
+
 async def start_user_engine(user_id: int) -> dict:
-    """为用户启动AI引擎。一律真实下单，并由 bet_mode 控制是否自动执行。"""
+    """为用户启动AI引擎。一律真实下单，并由 bet_mode 控制是否自动执行。
+
+    跨进程互斥：Redis SET NX 锁防止多 worker 同时为同一用户跑引擎
+    （否则双引擎并发扫描会导致重复下单）。
+    """
+    import uuid as _uuid
+
+    from app.core.cache import cache
+    from app.core.worker_leader import worker_id
+
+    lock_key = _engine_lock_key(user_id)
+    token = f"{worker_id()}:{_uuid.uuid4().hex[:8]}"
+    try:
+        got = await cache.client.set(lock_key, token, nx=True, ex=_ENGINE_LOCK_TTL)
+    except Exception:
+        got = True  # Redis 不可用时降级为单进程内存互斥
+    if not got:
+        logger.warning("AI 引擎启动被拒：用户 %s 的引擎已在其他实例运行", user_id)
+        return {"status": "already_running", "user_id": user_id, "bet_mode_gated": True}
+
     if user_id in _active_engines:
         await _active_engines[user_id].stop()
+        del _active_engines[user_id]
 
     engine = AIBettingEngine(user_id)
+    engine._engine_lock_token = token
     _active_engines[user_id] = engine
     await engine.start()
 
-    # 写入 Redis 供跨 worker 查询
+    # 写入 Redis 供跨 worker 查询（带 TTL，由主循环周期续期）
     try:
-        from app.core.cache import cache
-        await cache.set(f"ai:engine:running:{user_id}", "1", ttl=0)
+        await cache.set(_engine_running_key(user_id), "1", ttl=_ENGINE_LOCK_TTL)
     except Exception:
         pass
 
@@ -2010,13 +2177,22 @@ async def start_user_engine(user_id: int) -> dict:
 
 async def stop_user_engine(user_id: int) -> dict:
     """停止用户AI引擎"""
+    from app.core.cache import cache
+
     if user_id in _active_engines:
-        await _active_engines[user_id].stop()
+        engine = _active_engines[user_id]
+        await engine.stop()
         del _active_engines[user_id]
+        # 只释放本实例持有的锁（token 校验，Lua 保证原子性）
+        token = getattr(engine, "_engine_lock_token", "")
+        if token:
+            try:
+                await cache.release_lock(_engine_lock_key(user_id), token)
+            except Exception:
+                pass
     # 清除 Redis 标记
     try:
-        from app.core.cache import cache
-        await cache.delete(f"ai:engine:running:{user_id}")
+        await cache.delete(_engine_running_key(user_id))
     except Exception:
         pass
     return {"status": "stopped", "user_id": user_id}
@@ -2027,10 +2203,10 @@ async def get_engine_status(user_id: int) -> dict:
     engine = _active_engines.get(user_id)
     if engine and engine.is_running:
         return {"running": True}
-    # 当前 worker 无引擎，查 Redis 看是否在其他 worker 运行
+    # 当前 worker 无引擎，查 Redis 看是否在其他 worker 运行（TTL 兜底防僵尸标记）
     try:
         from app.core.cache import cache
-        val = await cache.get(f"ai:engine:running:{user_id}")
+        val = await cache.get(_engine_running_key(user_id))
         if val and str(val) in ("1", "true", "True"):
             return {"running": True}
     except Exception:

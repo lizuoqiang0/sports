@@ -29,11 +29,12 @@ export function WSProvider({ children }) {
         [mid]: { ...data.odds_data, _updatedAt: Date.now() },
       }))
     } else if (Array.isArray(data.odds)) {
-      const ml = data.odds.find((o) => o.bet_type === 'moneyline' || o.bet_type === 'Moneyline')
-      if (ml?.odds_data) {
+      // 业务仅支持小球：优先取 total/under 盘口。
+      const total = data.odds.find((o) => String(o.bet_type || '').toLowerCase() === 'total')
+      if (total?.odds_data) {
         setOddsUpdates((prev) => ({
           ...prev,
-          [mid]: { ...ml.odds_data, _updatedAt: Date.now() },
+          [mid]: { ...total.odds_data, _updatedAt: Date.now() },
         }))
       }
     }

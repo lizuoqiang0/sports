@@ -7,11 +7,10 @@
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 import re
 from decimal import Decimal
-from typing import Any, Optional
+from typing import Optional
 
 from app.services.bookmakers.base import PlaceBetResult
 from app.services.bookmakers.plugins.ob.odds import sanitize_token
@@ -174,6 +173,12 @@ async def place_site_bet(
 
         # 解析队名必须在盘口恢复之前（平博 board recovery 依赖 home/away）
         home, away = _parse_teams_from_external_id(match_external_id)
+        # 队名 fallback：短格式 external_id（如 pinnacle:1634071712）无法解析队名，
+        # 从 odds_data 中取 auto_better 注入的队名（来自 matches 表 home_team/away_team）
+        if not home and (odds_data or {}).get("_home_team"):
+            home = str(odds_data["_home_team"])
+        if not away and (odds_data or {}).get("_away_team"):
+            away = str(odds_data["_away_team"])
 
         # 1) 页面内通用下注 POST：仅作探测；成功必须以余额扣减或明确订单号为准（禁止假成功）
         api_result = await page.evaluate(
@@ -303,7 +308,7 @@ async def place_site_bet(
                     # 侧栏空壳也会有「体育/滚球」字样；要求滚球盘+盘口词+赔率数字
                     if not any(x in t for x in ("滚球盘", "投下", "投注单", "独赢")):
                         return False
-                    if not any(x in t for x in ("让球", "独赢", "让分", "大小球", "@")):
+                    if not any(x in t for x in ("让球", "独赢", "让分", "小球", "@")):
                         return False
                     return bool(re.search(r"(?<![0-9])1\.\d{2,3}(?![0-9])", t))
 
@@ -315,36 +320,25 @@ async def place_site_bet(
                     )
                 except Exception:
                     full_t = ""
-                # 维护横幅 = 过期 DOM 遮罩（站点实际未维护）：goto 直达滚球 URL
-                # 强制全新 SPA 加载即清除，普通 reload 会再次停在遮罩上
+                # 维护横幅 = 过期 DOM 遮罩（站点实际未维护）：整页刷新即恢复
+                # （实测；reload 失败退回 goto 直达滚球 URL 强制全新 SPA 加载）
                 if ("正在维护" in (full_t or "")) or ("维护中" in (full_t or "")):
                     try:
-                        from urllib.parse import urlparse
-
                         from app.services.bookmakers.plugins.pinnacle.venue import (
-                            pinnacle_live_sport_urls,
+                            clear_pinnacle_maintenance,
                         )
 
-                        raw_u = page.url or ""
-                        pu = urlparse(raw_u if "://" in raw_u else f"https://{raw_u}")
-                        origin = f"{pu.scheme}://{pu.netloc}" if pu.netloc else ""
-                        for dest in pinnacle_live_sport_urls(origin=origin)[:2]:
-                            try:
-                                await page.goto(dest, wait_until="domcontentloaded", timeout=45000)
-                                await page.wait_for_timeout(2500)
-                                break
-                            except Exception:
-                                continue
+                        await clear_pinnacle_maintenance(page)
                         full_t = await page.evaluate(
                             "() => ((document.body && document.body.innerText) || '')"
                         )
                         logger.warning(
-                            "pinnacle place: maintenance banner cleared via goto url=%s still_banner=%s",
+                            "pinnacle place: maintenance banner cleared url=%s still_banner=%s",
                             (page.url or "")[:120],
                             ("维护" in (full_t or "")),
                         )
                     except Exception as e:
-                        logger.warning("pinnacle banner goto failed: %s", e)
+                        logger.warning("pinnacle banner clear failed: %s", e)
                 team_visible = bool(
                     (home and home[:4] and home[:4] in (full_t or ""))
                     or (away and away[:4] and away[:4] in (full_t or ""))
@@ -504,11 +498,6 @@ async def place_site_bet(
             "total",
             "totals",
             "ou",
-            "moneyline",
-            "ml",
-            "1x2",
-            "spread",
-            "handicap",
         ):
             ui_ok, ui_detail = await _ui_place_pinnacle_total(
                 page,
@@ -625,9 +614,15 @@ async def place_site_bet(
                 ),
                 balance_after=bal_before,
             )
+        # 携带 ui_detail（row_not_found / row_team_mismatch / slip_not_open 等），
+        # 否则用户/日志永远看不到真实失败原因，无法针对性修复
+        detail_hint = str(ui_detail or "ui_miss")[:160]
         return PlaceBetResult(
             ok=False,
-            message=f"{name} 自动下单未命中可用接口，请稍后重试或在站点内手动确认（已同步会话）",
+            message=(
+                f"{name} 自动下单未命中可用接口（{detail_hint}），"
+                "请稍后重试或在站点内手动确认（已同步会话）"
+            ),
             balance_after=bal_before,
         )
     except Exception as e:

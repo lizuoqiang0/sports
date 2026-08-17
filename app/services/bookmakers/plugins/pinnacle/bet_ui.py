@@ -8,6 +8,15 @@ from decimal import Decimal
 
 logger = logging.getLogger(__name__)
 
+
+def _to_f(v) -> float:
+    """安全转 float（金额读回校验用）。"""
+    try:
+        return float(str(v).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return -1.0
+
+
 async def ui_place_pinnacle_total(
     page,
     *,
@@ -20,23 +29,16 @@ async def ui_place_pinnacle_total(
     sport: str = "",
 ) -> tuple[bool, str]:
     """
-    平博 DOM 兜底：定位赛事行/盘口线 → 点大小球赔率 → 填金额并确认。
+    平博 DOM 兜底：定位赛事行/盘口线 → 点小球赔率 → 填金额并确认。
     返回 (clicked_confirm, detail)。
     """
     sel = (selection or "").lower()
-    # 大小球 / 独赢（主客和）共用同一套 DOM 点选
+    # 仅支持小球 DOM 点选。
+    # 注意：不含单字母 o/u —— ctx.includes("o") 会命中任意英文文本，side 校验失效
     if sel in ("under", "u"):
-        side_words = ["小", "under", "u", "低于"]
-    elif sel in ("over", "o"):
-        side_words = ["大", "over", "o", "高于"]
-    elif sel == "home":
-        side_words = [home, "主", "home", "1"] if home else ["主", "home"]
-    elif sel == "away":
-        side_words = [away, "客", "away", "2"] if away else ["客", "away"]
-    elif sel == "draw":
-        side_words = ["和", "平局", "draw", "x", "X"]
+        side_words = ["小", "under", "低于"]
     else:
-        side_words = ["大", "over", "o", "高于"]
+        return {"ok": False, "message": "仅支持小球"}
     sport_l = (sport or "").lower()
     if not sport_l:
         # 从当前 URL 猜
@@ -62,6 +64,40 @@ async def ui_place_pinnacle_total(
                 tokens.append(t[-n:])
     seen: set[str] = set()
     tokens = [x for x in tokens if not (x in seen or seen.add(x))]
+
+    # 进场先清残留结果弹窗：上次下单的「当前选项不适用于投注/成功」等弹窗
+    # 若未关闭，会拦截本单点赔率的点击 → slip_not_open / 点不响应
+    try:
+        _pre_dismiss_js = """() => {
+          for (const el of document.querySelectorAll('[role="alert"], [class*="modal" i], [class*="dialog" i], [class*="toast" i], [class*="notice" i]')) {
+            const t = String(el.innerText || '').replace(/\\s+/g, ' ').trim();
+            const st = window.getComputedStyle(el);
+            if (!t || t.length < 4 || t.length > 500) continue;
+            if (st && (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0')) continue;
+            if (!/(当前选项不适用|余额不足|不能低于|已取消|无法|失败|成功|投注已|已接受|限额|拒绝|暂不)/.test(t)) continue;
+            let scope = el.closest('[class*="modal" i], [class*="dialog" i], [class*="popup" i], [role="dialog"]') || document;
+            for (const btn of Array.from(scope.querySelectorAll('button, a, div[role="button"], span'))) {
+              const bt = String(btn.innerText || btn.textContent || '').replace(/\\s+/g, ' ').trim();
+              if (/^(OK|Ok|ok|确定|好|好的|关闭|close|Close|暂不)$/.test(bt)) {
+                try { btn.click(); return 'cleared:' + bt; } catch (e) {}
+              }
+            }
+          }
+          return '';
+        }"""
+        for fr in ([page] + list(getattr(page, "frames", []) or [])):
+            try:
+                cleared = await asyncio.wait_for(
+                    fr.evaluate(_pre_dismiss_js), timeout=2.5
+                )
+            except Exception:
+                continue
+            if cleared:
+                logger.info("pinnacle pre-dismiss leftover modal: %s", cleared)
+                await page.wait_for_timeout(600)
+                break
+    except Exception:
+        pass
 
     # 球种定向：篮球赛需要篮球滚球列表（soccer 页无该行 → row_not_found）。
     # basketball/live 直达 URL 常渲染空（SPA 惰性），优先 URL 直达+侧栏点击双保险。
@@ -104,7 +140,7 @@ async def ui_place_pinnacle_total(
         logger.warning("pinnacle ui: basketball nav failed: %s", e)
 
     click_js = """(args) => {
-              const { tokens, odds, sideWords, line } = args;
+              const { tokens, odds, sideWords, line, homeN, awayN, selDir } = args;
               const norm = (s) => String(s || '').replace(/\\s+/g, '').toLowerCase();
               const oddsTextOk = (t) => {
                 const n = Number(String(t || '').replace(/[^0-9.]/g, ''));
@@ -112,6 +148,19 @@ async def ui_place_pinnacle_total(
                 return Math.abs(n - Number(odds)) <= 0.06;
               };
               const lineTxt = (line == null || line === '') ? '' : String(line);
+              // 四分之一线区间别名：DB 记 1.25/2.75，平博页面显示 1-1.5 / 2.5-3。
+              // 仅按 lineTxt 精确匹配会找不到盘口（实测 odds_not_found 根因）
+              const lineAliases = (() => {
+                if (!lineTxt) return [];
+                const n = Number(lineTxt);
+                if (!n || n !== n || n <= 0) return [lineTxt];
+                const lo = Math.floor(n);
+                const frac = n - lo;
+                if (Math.abs(frac - 0.25) < 1e-9) return [lineTxt, `${lo}-${lo + 0.5}`];
+                if (Math.abs(frac - 0.75) < 1e-9) return [lineTxt, `${lo + 0.5}-${lo + 1}`];
+                return [lineTxt];
+              })();
+              const hitLineTxt = (ctx) => !lineTxt || lineAliases.some((a) => String(ctx || '').includes(a));
               const nodes = Array.from(document.querySelectorAll('div, tr, li, section, article, a'));
               let row = null;
               let how = '';
@@ -128,8 +177,11 @@ async def ui_place_pinnacle_total(
                     // 必须像「赛事行」：含赔率数字；避免点到纯队名短节点
                     const oddsHits = (raw.match(/(?:^|\\s)(\\d\\.\\d{2,3})(?:\\s|$)/g) || []).length;
                     if (oddsHits < 1) continue;
-                    // 偏好含赔率、长度适中的行
-                    const score = oddsHits * 100 - Math.abs(raw.length - 160);
+                    // 偏好含赔率、长度适中的行；赔率格数 >10 视为联赛区块（含多场
+                    // 比赛），重罚 —— 否则 odds21 的区块会压过真正的单场行
+                    const effHits = Math.min(oddsHits, 10);
+                    const excessPenalty = oddsHits > 10 ? (oddsHits - 10) * 80 : 0;
+                    const score = effHits * 100 - excessPenalty - Math.abs(raw.length - 160);
                     if (score > bestScore) {
                       bestScore = score;
                       row = el; how = 'token:' + tok + ':odds' + oddsHits;
@@ -142,7 +194,7 @@ async def ui_place_pinnacle_total(
                 for (const el of nodes) {
                   try {
                     const raw = String(el.innerText || '');
-                    if (!raw.includes(lineTxt)) continue;
+                    if (!hitLineTxt(raw)) continue;
                     if (raw.length < 4 || raw.length > 900) continue;
                     // line 兜底也必须含队名：盘口线数字（如2.5）全站大量重复，禁止点错行
                     const rawN = norm(raw);
@@ -162,13 +214,22 @@ async def ui_place_pinnacle_total(
               let pureOdds = null;
               // 滚球赔率漂移兜底：快照 odds ±0.06 找不到时，行内按 side+line 的任意赔率节点
               let sideLoose = null;
-              // 行级队名校验：目标行必须真正包含目标队名（长 token），否则禁止任何点击
-              // （防「陶朗加市」2字片段误中「普雷斯顿」等无关行的赔率）
+              // 行级队名校验：目标行必须真正包含目标队名，否则禁止任何点击
+              // （防「陶朗加市」2字片段误中「普雷斯顿」等无关行的赔率）。
+              // 完整队名任意长度均可命中（2字队名如「坎昆」此前永远过不了≥3校验），
+              // 片段仍要求 ≥3 字防误中。
               let rowHasTeam = false;
               if (row) {
-                for (const tok of (tokens || [])) {
-                  const tn2 = norm(tok);
-                  if (tn2 && tn2.length >= 3 && norm(row.innerText || '').includes(tn2)) { rowHasTeam = true; break; }
+                const rowN = norm(row.innerText || '');
+                const hN = norm(homeN), aN = norm(awayN);
+                if ((hN && hN.length >= 2 && rowN.includes(hN)) || (aN && aN.length >= 2 && rowN.includes(aN))) {
+                  rowHasTeam = true;
+                }
+                if (!rowHasTeam) {
+                  for (const tok of (tokens || [])) {
+                    const tn2 = norm(tok);
+                    if (tn2 && tn2.length >= 3 && rowN.includes(tn2)) { rowHasTeam = true; break; }
+                  }
                 }
               }
               if (row && !rowHasTeam) {
@@ -187,7 +248,7 @@ async def ui_place_pinnacle_total(
                 return {
                   ok: false, why: 'row_not_found',
                   tokHit: tokHit.slice(0, 6),
-                  pageTeams: bt.replace(/\s+/g, ' ').slice(200, 700),
+                  pageTeams: bt.replace(/\\s+/g, ' ').slice(200, 700),
                   how,
                 };
               }
@@ -196,20 +257,53 @@ async def ui_place_pinnacle_total(
                 try { row.scrollIntoView({ block: 'center' }); } catch (e) {}
               }
               const clickables = Array.from((scope || document).querySelectorAll('button, a, span, div, td, label'));
+              // 行内须含目标盘口线，sideLoose 兜底才允许（防点到相邻盘口同方向的赔率）
+              const rowTextN = row ? norm(row.innerText || '') : '';
+              const rowHasLineTxt = !lineTxt || lineAliases.some((a) => rowTextN.includes(norm(a)));
+              // side 精确判定：赔率格的「紧邻上下文」须含目标方向词。粗父容器同时含
+              // 同一格内可能混有多个方向标签，需检查紧邻上下文。
+              // 用相邻兄弟/文本左右字窗口判定，且要求不含反方向词。
+              // 小球赔率格必须有紧邻的小球方向词，避免误点相邻盘口。
+              const sideNear = (el) => {
+                let near = '';
+                try {
+                  let sib = el.previousElementSibling;
+                  for (let i = 0; i < 2 && sib; i++) { near += ' ' + String(sib.innerText || ''); sib = sib.previousElementSibling; }
+                } catch (e) {}
+                try {
+                  const parentTxt = String((el.parentElement && el.parentElement.innerText) || '');
+                  const idx = parentTxt.indexOf(txt);
+                  if (idx >= 0) {
+                    near = parentTxt.slice(Math.max(0, idx - 14), idx) + ' ' + (parentTxt.slice(idx + txt.length, idx + txt.length + 6) || '') + near;
+                  }
+                } catch (e) {}
+                const nl = near.toLowerCase();
+                const anti = ['大'];
+                const hit = sideWords.some((w) => nl.includes(String(w).toLowerCase()));
+                const hitAnti = anti.some((w) => nl.includes(String(w).toLowerCase()));
+                if (hit && !hitAnti) return true;
+                return false;
+              };
               for (const el of clickables) {
                 const txt = String(el.innerText || el.textContent || '').trim();
-                // 宽松赔率判定：1.01-50 的纯数字节点（不校验 ±0.06，用于漂移兜底）
-                const looseOddsOk = /^\\d{1,2}\\.\\d{2,3}$/.test(txt.replace(/\\s/g, ''));
-                if (!oddsTextOk(txt) && !looseOddsOk) continue;
-                // 纯赔率数字节点优先（避免点到「小\\n2.21」整块导致投注单不开）
-                if (/^\\d{1,2}\\.\\d{2,3}$/.test(txt.replace(/\\s/g, ''))) {
-                  const p = el.closest('div, tr, li, section') || el.parentElement;
-                  const ctx = String((p && p.innerText) || txt);
-                  const hitSide = sideWords.some((w) => ctx.toLowerCase().includes(String(w).toLowerCase()));
-                  const hitLine = lineTxt ? ctx.includes(lineTxt) : true;
-                  if (hitSide && hitLine) { pureOdds = el; }
-                  // 漂移兜底：side 匹配即可（大小球行内该 side 只有一个赔率）
-                  if (hitSide && !sideLoose) { sideLoose = el; }
+                const pureNum = txt.replace(/\\s/g, '');
+                const isPureOdds = /^\\d{1,2}\\.\\d{2,3}$/.test(pureNum);
+                if (!oddsTextOk(txt) && !isPureOdds) continue;
+                // 纯赔率数字节点（叶子）优先：容器块（\\xa0/换行包裹）点了投注单不开。
+                // 漂移护栏 ≤0.25：目标 2.00 点到 1.50 属错行/市场大动，禁止盲点
+                if (isPureOdds) {
+                  const n = Number(pureNum.replace(/[^0-9.]/g, ''));
+                  if (n && Math.abs(n - Number(odds)) <= 0.25) {
+                    const p = el.closest('div, tr, li, section') || el.parentElement;
+                    const ctx = String((p && p.innerText) || txt);
+                                        const hitSide = sideNear(el);
+                    const hitLine = lineTxt ? hitLineTxt(ctx) : true;
+                    const isLeaf = !(el.children && el.children.length);
+                    const leafBetter = !pureOdds || (pureOdds.children && pureOdds.children.length && isLeaf);
+                    if (hitSide && hitLine && leafBetter) { pureOdds = el; }
+                    // 漂移兜底：side 命中且线属于本场（行内含线）才收首个
+                    if (hitSide && rowHasLineTxt && !sideLoose) { sideLoose = el; }
+                  }
                 }
                 if (!oddsTextOk(txt)) continue;
                 let ctx = '';
@@ -217,23 +311,24 @@ async def ui_place_pinnacle_total(
                   const p = el.closest('div, tr, li, section') || el.parentElement;
                   ctx = String((p && p.innerText) || txt);
                 } catch (e) { ctx = txt; }
-                const hitSide = sideWords.some((w) => ctx.toLowerCase().includes(String(w).toLowerCase()));
-                const hitLine = lineTxt ? ctx.includes(lineTxt) : false;
+                                const hitSide = sideNear(el);
+                const hitLine = lineTxt ? hitLineTxt(ctx) : false;
                 const inRow = !!(row && row.contains(el));
-                const ouCell = /(?:^|[\\s])(大|小|over|under)(?:$|[\\s])/i.test(ctx) && !hitSide;
                 if (!lineTxt) {
+                  const ouCell = /(?:^|[\\s])(小|under)(?:$|[\\s])/i.test(ctx) && !hitSide;
                   if (ouCell) continue;
                   if (hitSide) { target = el; how = (how || 'odds') + '+side'; break; }
                   if (inRow && !rowFallback) { rowFallback = el; }
                   continue;
                 }
+                // 小球：方向与盘口线双命中才精确点击。
+                // 删除 line-only / 裸 loose 兜底 —— 不校验方向，会点到反向/错盘
                 if (hitSide && hitLine) { target = el; how = (how || 'odds') + '+side+line'; break; }
-                if (hitLine && !target) { target = el; how = (how || 'odds') + '+line'; }
-                if (!target) { target = el; how = (how || 'odds') + '+loose'; }
               }
               if (pureOdds) { target = pureOdds; how = (how || 'odds') + '+pure'; }
               if (!target && sideLoose) { target = sideLoose; how = (how || 'odds') + '+sideloose'; }
-              if (!target && rowFallback) { target = rowFallback; how = (how || 'odds') + '+row'; }
+              // rowFallback 不校验方向：仅无盘口线信息（独赢）时可用
+              if (!target && !lineTxt && rowFallback) { target = rowFallback; how = (how || 'odds') + '+row'; }
               if (!target) {
                 const body = norm(document.body && document.body.innerText || '');
                 const idx = row ? norm(row.innerText || '').slice(0, 180) : body.slice(0, 180);
@@ -250,10 +345,14 @@ async def ui_place_pinnacle_total(
         "odds": float(odds),
         "sideWords": side_words,
         "line": float(line) if line is not None else None,
+        "homeN": (home or "").strip(),
+        "awayN": (away or "").strip(),
+        "selDir": sel,
     }
 
     # SPA 惰性激活：compact/sports 页可能只渲染头部导航（大厅壳），赛事区需
-    # 用户交互才加载。点击前若主 frame 无赔率数字特征，点「体育」标签激活再等列表。
+    # 用户交互才加载。但若已在 /live 或 /compact/sports/ 页，绝不点「体育」标签
+    # （会导航到大厅，打掉已渲染的滚球列表 -> len=0 -> ui_miss）。
     try:
         async def _body_has_odds() -> bool:
             try:
@@ -267,30 +366,85 @@ async def ui_place_pinnacle_total(
             return bool(_re.search(r"(?<![0-9])1\.\d{2,3}(?![0-9])", t or ""))
 
         if not await _body_has_odds():
-            logger.info("pinnacle ui: body no odds, activate sportsbook tab")
-            for txt in ("体育", "滚球盘", "滚球", "In-Play"):
-                try:
-                    loc = page.get_by_text(txt, exact=False).first
-                    if await loc.count() > 0 and await loc.is_visible():
-                        await loc.click(timeout=2500)
-                        await page.wait_for_timeout(2000)
+            cur_url_spa = ""
+            try:
+                cur_url_spa = (page.url or "").lower()
+            except Exception:
+                cur_url_spa = ""
+            on_sports_page = "/live" in cur_url_spa or "/compact/sports/" in cur_url_spa
+            logger.info(
+                "pinnacle ui: body no odds, on_sports_page=%s url=%s",
+                on_sports_page,
+                cur_url_spa[:100],
+            )
+
+            if on_sports_page:
+                # 已在滚球/体育页：不点「体育」标签（会导航到大厅）
+                # 但可以点「滚球盘」/「滚球」标签触发 SPA 加载赛事列表
+                for txt in ("滚球盘", "滚球", "In-Play", "Live"):
+                    try:
+                        loc = page.get_by_text(txt, exact=False).first
+                        if await loc.count() > 0 and await loc.is_visible():
+                            await loc.click(timeout=2000)
+                            await page.wait_for_timeout(2000)
+                            break
+                    except Exception:
+                        continue
+                # 轮询等 SPA 渲染（最多 18s）
+                for _ in range(12):
+                    if await _body_has_odds():
                         break
-                except Exception:
-                    continue
-            # 轮询等待 SPA 列表渲染（最多 15s，滚球列表加载有时较慢）
-            for _ in range(10):
-                if await _body_has_odds():
-                    break
-                await page.wait_for_timeout(1500)
-            # 激活后仍无赔率：滚一下触发懒加载再等 5s
-            if not await _body_has_odds():
-                try:
-                    await page.evaluate(
-                        "() => window.scrollTo(0, document.body.scrollHeight / 2)"
+                    await page.wait_for_timeout(1500)
+                # 仍无赔率：滚一下触发懒加载
+                if not await _body_has_odds():
+                    try:
+                        await page.evaluate(
+                            "() => window.scrollTo(0, document.body.scrollHeight / 2)"
+                        )
+                        await page.wait_for_timeout(2500)
+                    except Exception:
+                        pass
+                # 还是空：reload 重载 SPA（goto 会丢 session，reload 保留 cookie）
+                if not await _body_has_odds():
+                    logger.warning(
+                        "pinnacle ui: page empty after poll, reload url=%s",
+                        cur_url_spa[:100],
                     )
-                    await page.wait_for_timeout(2500)
-                except Exception:
-                    pass
+                    try:
+                        await page.reload(wait_until="domcontentloaded", timeout=45000)
+                        await page.wait_for_timeout(3000)
+                    except Exception as e:
+                        logger.warning("pinnacle ui: reload failed: %s", e)
+                    # reload 后再轮询 10s
+                    for _ in range(7):
+                        if await _body_has_odds():
+                            break
+                        await page.wait_for_timeout(1500)
+            else:
+                # 不在体育页：点「滚球」标签激活（不点「体育」，避免进大厅）
+                for txt in ("滚球盘", "滚球", "In-Play"):
+                    try:
+                        loc = page.get_by_text(txt, exact=False).first
+                        if await loc.count() > 0 and await loc.is_visible():
+                            await loc.click(timeout=2500)
+                            await page.wait_for_timeout(2000)
+                            break
+                    except Exception:
+                        continue
+                # 轮询等待 SPA 列表渲染（最多 15s）
+                for _ in range(10):
+                    if await _body_has_odds():
+                        break
+                    await page.wait_for_timeout(1500)
+                # 激活后仍无赔率：滚一下触发懒加载再等 5s
+                if not await _body_has_odds():
+                    try:
+                        await page.evaluate(
+                            "() => window.scrollTo(0, document.body.scrollHeight / 2)"
+                        )
+                        await page.wait_for_timeout(2500)
+                    except Exception:
+                        pass
     except Exception as e:
         logger.warning("pinnacle ui: sportsbook activate failed: %s", e)
 
@@ -336,10 +490,13 @@ async def ui_place_pinnacle_total(
             except Exception:
                 meta = {"len": 0, "hello": True, "slip": False, "live": False}
             blen = int((meta or {}).get("len") or 0)
-            if (meta or {}).get("hello") or blen < 40:
+            is_main = fr == getattr(page, "main_frame", None)
+            if (meta or {}).get("hello") or (blen < 40 and not is_main):
                 score -= 20
             else:
                 score += min(4, blen // 200)
+            if is_main:
+                score = max(score, 0)  # 主帧不因空内容被跳过（SPA 可能还在渲染）
             if (meta or {}).get("slip"):
                 score += 8
             if (meta or {}).get("live"):
@@ -355,13 +512,15 @@ async def ui_place_pinnacle_total(
         # 滚球列表渲染等待：按「内容特征」判定而非字符数
         # （实测 len=1632 骨架半渲染态：有导航/页脚但赛事行未出，字符数阈值会漏）
         # 判定标准：页面含 ≥2 个滚球行特征（比分 X-X + 分钟 ' / 节次 Q1-Q4/1H2H）
+        # 或含 ≥3 个赔率数字（1.xx-9.xx），赔率存在即可点
         async def _wait_board_ready() -> None:
             try:
                 probe = """() => {
                   const t = ((document.body && document.body.innerText) || '');
                   const scores = (t.match(/\\b\\d{1,2}-\\d{1,2}\\b/g) || []).length;
                   const clocks = (t.match(/(?:^|\\s)(?:\\d{1,3}'|1H|2H|HT|Q[1-4]|P[1-4])(?:$|\\s)/gm) || []).length;
-                  return scores + clocks;
+                  const odds = (t.match(/(?<![0-9])[1-9]\\.\\d{2,3}(?![0-9])/g) || []).length;
+                  return scores + clocks + (odds >= 3 ? 10 : 0);
                 }"""
                 for _ in range(15):
                     try:
@@ -380,14 +539,25 @@ async def ui_place_pinnacle_total(
             if score < -10:
                 continue
             try:
-                data = await asyncio.wait_for(fr.evaluate(click_js, args), timeout=6.0)
+                data = await asyncio.wait_for(fr.evaluate(click_js, args), timeout=8.0)
             except Exception as e:
                 miss = f"evaluate_fail:{e}"
                 continue
             if isinstance(data, dict) and data.get("ok"):
                 return data, "ok"
             if isinstance(data, dict):
-                miss = f"{data.get('why')}:{(data.get('sample') or '')[:100]}"
+                why = data.get("why", "")
+                if why == "row_not_found":
+                    tok_hit = data.get("tokHit") or []
+                    page_teams = str(data.get("pageTeams") or "")[:200]
+                    logger.warning(
+                        "pinnacle ui row_not_found tokHit=%s pageTeams=%s",
+                        tok_hit,
+                        page_teams,
+                    )
+                    miss = f"row_not_found:tokHit={tok_hit}"
+                else:
+                    miss = f"{why}:{(data.get('sample') or '')[:100]}"
         return None, miss
 
     # 若上一次已停在「确认投注」弹窗：直接点 OK（截图流程第 2 步）
@@ -587,6 +757,9 @@ async def ui_place_pinnacle_total(
                     pass
                 odds_txt = f"{float(odds):.3f}".rstrip("0").rstrip(".")
                 variants = {odds_txt, f"{float(odds):.2f}", f"{float(odds):.3f}".rstrip("0").rstrip(".")}
+                # 跳过纯短数字变体（odds=2.00 → "2"）：全页 get_by_text 会误中任意
+                # 独立"2"（时间/比分/页码），点到错误赔率开错注单
+                variants = {v for v in variants if len(v) >= 4}
                 clicked = False
                 for vt in variants:
                     if not vt:
@@ -613,7 +786,7 @@ async def ui_place_pinnacle_total(
         # 投注单打开：投下N注 / 总注金 / 最低投注额 / 可赢 + 金额输入
         check = """() => {
           const t = String((document.body && document.body.innerText) || '');
-          if (/投下\\s*\\d+\\s*注/.test(t) || /总注金\\s*[0-9.]+\s*CNY/i.test(t)) return true;
+          if (/投下\\s*\\d+\\s*注/.test(t) || /总注金\\s*[0-9.]+\\s*CNY/i.test(t)) return true;
           if (/投注单/.test(t) && (/最低投注|最高投注|可赢|潜在返还|Place Bet|Stake/i.test(t))) return true;
           const inputs = Array.from(document.querySelectorAll('input'));
           for (const inp of inputs) {
@@ -859,6 +1032,53 @@ async def ui_place_pinnacle_total(
         scored.append((score, fr))
     scored.sort(key=lambda x: -x[0])
     targets = [fr for _, fr in scored] or raw_targets
+    # 读回校验：fill_js 写入后读输入框真实值（React 受控组件可能回弹/清空；
+    # number 输入框不支持文本选择，盲用键盘会把 10 追加成 1010 —— 实测教训）
+    read_stake_js = """() => {
+      const inputs = Array.from(document.querySelectorAll('input, [contenteditable="true"]'));
+      for (const inp of inputs) {
+        try {
+          const st = window.getComputedStyle(inp);
+          if (!st || st.display === 'none' || st.visibility === 'hidden') continue;
+          const r = inp.getBoundingClientRect();
+          if (r.width < 20 || r.height < 10) continue;
+          const meta = ((inp.getAttribute('placeholder') || '') + ' ' + (inp.name || '') + ' ' + (inp.type || '')).toLowerCase();
+          if (inp.type === 'number' || /金额|风险|stake|注金|risk/.test(meta)) {
+            const v = inp.value != null ? String(inp.value) : String(inp.textContent || '');
+            if (v) return v;
+          }
+        } catch (e) {}
+      }
+      return '';
+    }"""
+
+    # evaluate 清空输入框（number 框唯一可靠的清空方式）
+    clear_stake_js = """() => {
+      const inputs = Array.from(document.querySelectorAll('input, [contenteditable="true"]'));
+      let hit = null;
+      for (const inp of inputs) {
+        try {
+          const st = window.getComputedStyle(inp);
+          if (!st || st.display === 'none' || st.visibility === 'hidden') continue;
+          const r = inp.getBoundingClientRect();
+          if (r.width < 20 || r.height < 10) continue;
+          const meta = ((inp.getAttribute('placeholder') || '') + ' ' + (inp.name || '') + ' ' + (inp.type || '')).toLowerCase();
+          if (inp.type === 'number' || /金额|风险|stake|注金|risk/.test(meta)) { hit = inp; break; }
+        } catch (e) {}
+      }
+      if (!hit) return false;
+      try { hit.focus(); } catch (e) {}
+      const proto = window.HTMLInputElement && window.HTMLInputElement.prototype;
+      const desc = proto && Object.getOwnPropertyDescriptor(proto, 'value');
+      if (hit.isContentEditable) hit.textContent = '';
+      else if (desc && desc.set) desc.set.call(hit, '');
+      else hit.value = '';
+      for (const ev of ['input', 'change']) {
+        try { hit.dispatchEvent(new Event(ev, { bubbles: true })); } catch (e) {}
+      }
+      return true;
+    }"""
+
     for fr in targets:
         try:
             data = await asyncio.wait_for(fr.evaluate(fill_js, float(stake)), timeout=5.0)
@@ -868,12 +1088,29 @@ async def ui_place_pinnacle_total(
         if isinstance(data, dict) and data.get("ok"):
             filled = True
             fill_detail = f"filled:{data.get('value')}"
-            # 再用键盘兜底（React 受控）
+            # 读回真实值：一致即完成，绝不追加键盘输入（number 框全选无效）
+            got_v = ""
             try:
-                await page.keyboard.press("Meta+a")
-                await page.keyboard.press("Control+a")
+                got_v = str(await asyncio.wait_for(fr.evaluate(read_stake_js), timeout=2.5) or "")
+            except Exception:
+                got_v = ""
+            if got_v and abs(_to_f(got_v) - float(stake)) < 0.005:
+                fill_detail = f"filled:{got_v}:verified"
+                break
+            # 不一致（回弹/清空/残留）：evaluate 清空后再键盘输入（此时框已空，
+            # 追加无风险）
+            try:
+                await asyncio.wait_for(fr.evaluate(clear_stake_js), timeout=2.5)
                 await page.keyboard.type(str(stake), delay=50)
-                fill_detail = f"filled:{stake}:typed"
+                got2 = ""
+                try:
+                    got2 = str(await asyncio.wait_for(fr.evaluate(read_stake_js), timeout=2.5) or "")
+                except Exception:
+                    got2 = ""
+                if got2 and abs(_to_f(got2) - float(stake)) < 0.005:
+                    fill_detail = f"filled:{got2}:typed_verified"
+                else:
+                    fill_detail = f"filled:{got2 or '?'}:typed_unverified"
             except Exception:
                 try:
                     loc = fr.locator(
@@ -881,8 +1118,7 @@ async def ui_place_pinnacle_total(
                     ).first
                     if await loc.count() > 0 and await loc.is_visible():
                         await loc.click(timeout=1500)
-                        await loc.fill("")
-                        await loc.type(str(stake), delay=40)
+                        await loc.fill(str(stake))
                         fill_detail = f"filled:{stake}:loc"
                 except Exception:
                     pass
@@ -931,9 +1167,7 @@ async def ui_place_pinnacle_total(
                 try:
                     data = await asyncio.wait_for(fr.evaluate(fill_js, new_stake), timeout=5.0)
                     if isinstance(data, dict) and data.get("ok"):
-                        await page.keyboard.press("Meta+a")
-                        await page.keyboard.press("Control+a")
-                        await page.keyboard.type(str(new_stake), delay=50)
+                        # 纯 evaluate 重填：不再键盘输入（number 框追加风险）
                         stake = new_stake
                         fill_detail = f"filled:{new_stake}:raised_from_min"
                 except Exception:
@@ -943,9 +1177,7 @@ async def ui_place_pinnacle_total(
                 try:
                     data = await asyncio.wait_for(fr.evaluate(fill_js, float(stake)), timeout=5.0)
                     if isinstance(data, dict) and data.get("ok"):
-                        await page.keyboard.press("Meta+a")
-                        await page.keyboard.press("Control+a")
-                        await page.keyboard.type(str(stake), delay=50)
+                        # 纯 evaluate 重填：不再键盘输入（number 框追加风险）
                         fill_detail = f"refilled:{stake}:was:{got}"
                 except Exception:
                     pass
@@ -953,12 +1185,43 @@ async def ui_place_pinnacle_total(
     except Exception:
         pass
 
+    # 残留「清空注单」确认弹窗：点「取消」保留已填注单（点「好的」会清掉
+    # 刚填的金额，导致重试时反复看到此弹窗）
+    try:
+        for fr in ([page] + list(getattr(page, "frames", []) or [])):
+            try:
+                dismissed = await asyncio.wait_for(
+                    fr.evaluate(
+                        """() => {
+                          const body = String((document.body && document.body.innerText) || '');
+                          if (!body.includes('清空注单')) return false;
+                          const nodes = Array.from(document.querySelectorAll('button, a, div[role="button"], span'));
+                          for (const el of nodes) {
+                            const t = String(el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+                            if (t === '取消') {
+                              try { el.click(); return true; } catch (e) {}
+                            }
+                          }
+                          return false;
+                        }"""
+                    ),
+                    timeout=2.5,
+                )
+                if dismissed:
+                    logger.info("pinnacle dismissed leftover clear-slip modal")
+                    await page.wait_for_timeout(500)
+                    break
+            except Exception:
+                continue
+    except Exception:
+        pass
+
     # 平博真实确认流程（截图）：
     # 1) 投注单底部橙色「投下N注」
     # 2) 弹窗「确认投注」→ 点橙色「OK」（勿点标题/取消）
     step1_js = """() => {
-      const nodes = Array.from(document.querySelectorAll('button, a, div[role="button"], span, div'));
-      const labelOf = (el) => String(el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+      const nodes = Array.from(document.querySelectorAll('button, a, div[role="button"], span, div, input[type="button"], input[type="submit"]'));
+      const labelOf = (el) => String(el.innerText || el.textContent || el.value || '').replace(/\\s+/g, ' ').trim();
       const visible = (el) => {
         try {
           const st = window.getComputedStyle(el);
@@ -969,19 +1232,31 @@ async def ui_place_pinnacle_total(
       };
       const slip = String((document.body && document.body.innerText) || '').replace(/\\s+/g, ' ').slice(0, 240);
       const samples = [];
+      // 按钮白名单：必须是可点击控件且文案精确匹配投注动作。
+      // 说明文字（如「最低投注额 5」）会被旧的 /投注.*\\d+/ 宽正则误点 ——
+      // span/div 需限制为短标签或明确按钮角色，禁止夹带数字的说明句
+      const isClickable = (el) => {
+        const tag = (el.tagName || '').toLowerCase();
+        return tag === 'button' || tag === 'a' || el.getAttribute('role') === 'button'
+          || (el.getAttribute('type') || '') === 'button' || (el.getAttribute('type') || '') === 'submit';
+      };
       for (const el of nodes) {
         if (!visible(el)) continue;
         const t = labelOf(el);
-        if (!t || t.length > 24) continue;
-        if (samples.length < 16) samples.push(t);
+        if (!t || t.length > 30) continue;
+        if (samples.length < 24) samples.push(t);
         if (
           /^投下\\s*\\d+\\s*注$/.test(t)
-          || /投下\\s*\\d+\\s*注/.test(t)
           || /^place\\s*\\d+\\s*bet$/i.test(t)
           || t === 'Place Bet'
           || t === '确认投注'
           || /^立即投注$/.test(t)
+          || /^投注$/.test(t)
+          || /^下注$/.test(t)
+          || /^bet$/i.test(t)
+          || /^submit$/i.test(t)
         ) {
+          if (!isClickable(el)) continue;
           try { el.scrollIntoView({ block: 'center' }); } catch (e) {}
           try { el.click(); } catch (e) {
             try { el.dispatchEvent(new MouseEvent('click', { bubbles: true })); } catch (e2) {}
@@ -1059,7 +1334,30 @@ async def ui_place_pinnacle_total(
         except Exception:
             pass
     if not step1_ok:
+        # 最后兜底：在投注单区域找任意可点击按钮
+        try:
+            for sel in (
+                'button:has-text("投注")',
+                'button:has-text("下注")',
+                'button:has-text("Bet")',
+                '[role="button"]:has-text("投注")',
+                '[role="button"]:has-text("下注")',
+                'button[type="submit"]',
+            ):
+                try:
+                    loc = page.locator(sel).last
+                    if await loc.count() > 0 and await loc.is_visible():
+                        await loc.click(timeout=3000)
+                        step1_ok = True
+                        confirm_detail = f"step1:fallback:{sel}"
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            pass
+    if not step1_ok:
         slip_hint = ""
+        btn_samples = ""
         try:
             for fr in targets:
                 try:
@@ -1067,11 +1365,16 @@ async def ui_place_pinnacle_total(
                 except Exception:
                     continue
                 if isinstance(data, dict):
-                    slip_hint = str(data.get("slip") or data.get("samples") or "")[:180]
+                    slip_hint = str(data.get("slip") or "")[:120]
+                    btn_samples = str(data.get("samples") or "")[:200]
                     break
         except Exception:
             pass
-        return False, f"place_btn_missing|{fill_detail}|{slip_hint}"
+        logger.warning(
+            "pinnacle place_btn_missing samples=%s slip=%s",
+            btn_samples, slip_hint[:80],
+        )
+        return False, f"place_btn_missing|{fill_detail}|btns=[{btn_samples}]|slip={slip_hint[:80]}"
 
     await page.wait_for_timeout(800)
     step2_ok = False
@@ -1176,6 +1479,47 @@ async def ui_place_pinnacle_total(
         logger.warning("pinnacle place rejected by site: %s", reject_msg)
         confirm_detail = f"{confirm_detail}|reject:{reject_msg}"
 
+    # 站点结果弹窗自动关闭：拒绝（当前选项不适用于投注/余额不足等）或
+    # 成功提示都会弹框，残留会挡住后续下单（实测「当前选项不适用于投注」
+    # 弹窗不关，下一单点赔率无响应）。读到消息就点 OK/确定/关闭
+    dismiss_js = """(keywords) => {
+      const close = (el) => {
+        try {
+          // 弹窗内的按钮优先（避免点到页面其它 OK）
+          let scope = el.closest('[class*="modal" i], [class*="dialog" i], [class*="popup" i], [role="dialog"]') || document;
+          for (const btn of Array.from(scope.querySelectorAll('button, a, div[role="button"], span'))) {
+            const t = String(btn.innerText || btn.textContent || '').replace(/\\s+/g, ' ').trim();
+            if (/^(OK|Ok|ok|确定|好|好的|关闭|close|Close|暂不)$/.test(t)) {
+              try { btn.click(); return 'clicked:' + t; } catch (e) {}
+            }
+          }
+          el.click();
+          return 'el-clicked';
+        } catch (e) { return ''; }
+      };
+      for (const el of document.querySelectorAll('[role="alert"], [class*="modal" i], [class*="dialog" i], [class*="toast" i], [class*="message" i], [class*="notice" i]')) {
+        const t = String(el.innerText || '').replace(/\\s+/g, ' ').trim();
+        const st = window.getComputedStyle(el);
+        if (!t || t.length < 4 || t.length > 500) continue;
+        if (st && (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0')) continue;
+        if (!keywords.some((k) => t.includes(k))) continue;
+        const r = close(el);
+        if (r) return r + '|' + t.slice(0, 60);
+      }
+      return '';
+    }"""
+    dismiss_kws = ["当前选项不适用", "余额不足", "不能低于", "已取消", "无法", "失败", "成功", "投注已", "已接受", "限额", "拒绝", "暂不"]
+    for fr in targets:
+        try:
+            done = await asyncio.wait_for(
+                fr.evaluate(dismiss_js, dismiss_kws), timeout=3.0
+            )
+        except Exception:
+            continue
+        if done:
+            logger.info("pinnacle result modal dismissed: %s", str(done)[:120])
+            confirm_detail = f"{confirm_detail}|dismissed:{str(done)[:60]}"
+            break
+    await page.wait_for_timeout(600)
+
     return True, f"{result.get('sample')}|{fill_detail}|{confirm_detail}|odds:{odds}"
-
-

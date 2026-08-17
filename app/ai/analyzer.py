@@ -1,7 +1,7 @@
 """
 AI 赛事分析引擎 - GPT 单模型分析
 
-仅做大小球(total)分析。
+仅做小球(total/under)分析。
 """
 from __future__ import annotations
 
@@ -21,16 +21,12 @@ from app.core.cache import cache
 
 logger = logging.getLogger(__name__)
 
-VALID_PREDICTIONS = {"over", "under", "skip"}
+VALID_PREDICTIONS = {"under", "skip"}
 
 _PRED_ALIASES = {
-    "over": "over",
     "under": "under",
-    "o": "over",
     "u": "under",
-    "大": "over",
     "小": "under",
-    "大球": "over",
     "小球": "under",
 }
 
@@ -39,7 +35,6 @@ _BT_ALIASES = {
     "ou": "total",
     "totals": "total",
     "大小": "total",
-    "大小球": "total",
 }
 
 
@@ -56,8 +51,6 @@ def normalize_prediction(raw, *, bet_type: str = "") -> str:
     s = str(raw or "").strip().lower()
     if s in _PRED_ALIASES:
         pred = _PRED_ALIASES[s]
-    elif "大球" in s or s == "大" or "over" in s:
-        pred = "over"
     elif "小球" in s or s == "小" or "under" in s:
         pred = "under"
     elif s == "skip":
@@ -66,7 +59,7 @@ def normalize_prediction(raw, *, bet_type: str = "") -> str:
         pred = ""
 
     bt = normalize_bet_type(bet_type)
-    if bt == "total" and pred not in ("over", "under", "skip"):
+    if bt == "total" and pred not in ("under", "skip"):
         return ""
     if pred not in VALID_PREDICTIONS:
         return ""
@@ -77,7 +70,7 @@ def _flatten_market_odds(market_odds: Optional[dict]) -> dict[str, float]:
     """把嵌套 markets 或扁平 odds 合成 selection->odds 映射。"""
     if not market_odds:
         return {}
-    if any(k in market_odds for k in ("over", "under", "home", "away", "draw")):
+    if "under" in market_odds:
         out = {}
         for k, v in market_odds.items():
             if str(k).startswith("_") or k in ("markets", "line", "total", "spread"):
@@ -269,11 +262,11 @@ class MatchAnalyzer:
             content = raw.get("content", "")
             parsed = self._parse_analysis_result(content)
 
-            # 单市场模式：仅大小球，bet_type 恒 total
+            # 单市场模式：仅小球，bet_type 恒 total。
             pred = normalize_prediction(parsed.get("prediction"), bet_type="total")
             bt = "total"
 
-            if pred not in ("over", "under", "skip"):
+            if pred not in ("under", "skip"):
                 logger.warning(
                     "[AI分析] GPT 返回无效结果 match=%s | bt=%s pred=%s",
                     match_info.get("id"), parsed.get("bet_type"), parsed.get("prediction"),
@@ -327,8 +320,8 @@ class MatchAnalyzer:
 
             latency_ms = float((raw.get("_meta") or {}).get("latency_ms") or 0)
 
-            # 单模型模式：GPT 返回 over/under 即视为共识达成
-            consensus_reached = pred in ("over", "under")
+            # 单模型模式：GPT 返回小球即视为共识达成。
+            consensus_reached = pred == "under"
 
             analysis = {
                 "prediction": pred,
@@ -360,7 +353,7 @@ class MatchAnalyzer:
                 historical_data=historical_data,
                 market_odds=market_odds,
             )
-            # 单模型模式：GPT 返回 over/under 即为最终共识（consensus_reached 已在上方恒 True）
+            # 单模型模式：GPT 返回小球即为最终共识。
 
             # 维度分析日志：核心维度逐项 + 盘口解读
             _hd = historical_data if isinstance(historical_data, dict) else {}
@@ -431,7 +424,7 @@ class MatchAnalyzer:
             return self._fallback_result(f"AI分析暂不可用: {e}", error=str(e))
 
     async def _call_gpt(self, prompt: str) -> dict:
-        """调用 GPT 模型，返回 content 和 _meta 信息。"""
+        """调用 GPT 模型，返回 content 和 _meta 信息。429 指数退避，超时不重试。"""
         if not self.client or not self.model:
             raise RuntimeError("GPT 模型未配置")
         messages = [
@@ -439,25 +432,35 @@ class MatchAnalyzer:
             {"role": "user", "content": prompt},
         ]
         started = time.perf_counter()
-        try:
-            response = await self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=settings.LLM_TEMPERATURE,
-                max_tokens=settings.LLM_MAX_TOKENS,
-            )
-        except Exception as e:
-            err_str = str(e).lower()
-            if "timeout" in err_str or "timed out" in err_str:
+        max_retries = 3
+        for attempt in range(max_retries + 1):
+            try:
+                response = await self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    temperature=settings.LLM_TEMPERATURE,
+                    max_tokens=settings.LLM_MAX_TOKENS,
+                )
+                break
+            except Exception as e:
+                err_str = str(e).lower()
+                # 超时：不重试（GPT 已耗时长，重试只会更长）
+                if "timeout" in err_str or "timed out" in err_str:
+                    raise
+                # 429/限流：指数退避（1s -> 2s -> 4s）
+                if "429" in err_str or "rate" in err_str:
+                    if attempt < max_retries:
+                        backoff = 2 ** attempt  # 1, 2, 4
+                        logger.warning("[GPT] 429 限流，%ds 后重试 (attempt %d/%d)", backoff, attempt + 1, max_retries)
+                        await asyncio.sleep(backoff)
+                        continue
+                    raise
+                # 其他错误：最多重试 1 次
+                if attempt == 0:
+                    logger.debug("GPT first call failed (%s), retry", e)
+                    await asyncio.sleep(0.5)
+                    continue
                 raise
-            logger.debug("GPT first call failed (%s), retry", e)
-            await asyncio.sleep(0.5)
-            response = await self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=settings.LLM_TEMPERATURE,
-                max_tokens=settings.LLM_MAX_TOKENS,
-            )
         content = response.choices[0].message.content or ""
         elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
         logger.info("[GPT] 调用完成 latency=%dms content_len=%d", int(elapsed_ms), len(content))
@@ -631,25 +634,13 @@ class MatchAnalyzer:
             return {"supportive": False, "conflict": False, "points": 0, "reason": ""}
 
         line_delta = cur_line - open_line
-        over_odds = _to_float(current_odds.get("over"), 0.0)
         under_odds = _to_float(current_odds.get("under"), 0.0)
-        favored_sel = ""
-        if over_odds > 1.0 and under_odds > 1.0:
-            favored_sel = "over" if over_odds < under_odds else "under" if under_odds < over_odds else ""
 
         supportive = False
         conflict = False
         points = 0
         reasons: list[str] = []
-        if selection == "over":
-            if line_delta >= 0.25:
-                supportive = True
-                points += 2
-                reasons.append(f"初指{open_line:.2f}升至即时{cur_line:.2f}")
-            elif line_delta <= -0.25:
-                conflict = True
-                reasons.append(f"盘口从{open_line:.2f}降到{cur_line:.2f}")
-        elif selection == "under":
+        if selection == "under":
             if line_delta <= -0.25:
                 supportive = True
                 points += 2
@@ -658,14 +649,9 @@ class MatchAnalyzer:
                 conflict = True
                 reasons.append(f"盘口从{open_line:.2f}升到{cur_line:.2f}")
 
-        if favored_sel:
-            if favored_sel == selection:
-                supportive = True
-                points += 1
-                reasons.append(f"即时赔率更偏向{selection}")
-            else:
-                conflict = True
-                reasons.append(f"即时赔率更偏向{favored_sel}")
+        if selection == "under" and under_odds <= 1.0:
+            conflict = True
+            reasons.append("小球赔率无效")
 
         return {
             "supportive": supportive,
@@ -699,13 +685,15 @@ class MatchAnalyzer:
         full_minutes = 48.0 if sport == "basketball" else 90.0
         expected_total = float(line) * min(mins, full_minutes) / full_minutes
         delta = current_total - expected_total
-        if selection == "over" and delta >= 0.45:
-            return {"supportive": True, "conflict": False, "points": 2, "reason": f"实时节奏高于盘口预期 {delta:.2f} 球"}
-        if selection == "under" and delta <= -0.45:
+        if sport == "basketball":
+            support_delta = max(6.0, float(line) * 0.04)
+            conflict_delta = max(8.0, float(line) * 0.05)
+        else:
+            support_delta = 0.45
+            conflict_delta = 0.55
+        if selection == "under" and delta <= -support_delta:
             return {"supportive": True, "conflict": False, "points": 2, "reason": f"实时节奏低于盘口预期 {abs(delta):.2f} 球"}
-        if selection == "over" and delta <= -0.55:
-            return {"supportive": False, "conflict": True, "points": 0, "reason": f"实时节奏落后盘口预期 {abs(delta):.2f} 球"}
-        if selection == "under" and delta >= 0.55:
+        if selection == "under" and delta >= conflict_delta:
             return {"supportive": False, "conflict": True, "points": 0, "reason": f"实时节奏快于盘口预期 {delta:.2f} 球"}
         return {"supportive": False, "conflict": False, "points": 0, "reason": ""}
 
@@ -753,14 +741,6 @@ class MatchAnalyzer:
                     "points": 0,
                     "reason": f"盘口已从{open_line:.2f}大幅降到{cur_line:.2f}，不追低位小球",
                 }
-        if selection == "over" and delta >= 0.5:
-            if (mins is not None and mins >= 45) or completeness < 0.75:
-                return {
-                    "supportive": False,
-                    "conflict": True,
-                    "points": 0,
-                    "reason": f"盘口已从{open_line:.2f}大幅升到{cur_line:.2f}，不追高位大球",
-                }
         return {"supportive": False, "conflict": False, "points": 0, "reason": ""}
 
     def _build_signal_review(
@@ -776,6 +756,7 @@ class MatchAnalyzer:
         ana = analysis if isinstance(analysis, dict) else {}
         bet_type = str(ana.get("bet_type") or info.get("bet_type") or "total").strip().lower()
         selection = str(ana.get("prediction") or "").strip().lower()
+        sport = str(info.get("sport") or "").strip().lower()
         confidence = _to_float(ana.get("confidence"), 0.0)
         line = _line_for_pick(market_odds, info, bet_type)
         quality = ana.get("context_quality") if isinstance(ana.get("context_quality"), dict) else {}
@@ -840,7 +821,7 @@ class MatchAnalyzer:
             elif completeness >= 0.30:
                 fundamental_points += 1
 
-        form_signal = self._recent_form_signal(ctx, selection=selection, bet_type=bet_type, line=line)
+        form_signal = self._recent_form_signal(ctx, sport=sport, selection=selection, bet_type=bet_type, line=line)
         if form_signal["supportive"]:
             fundamental_points += 2
             support_reasons.append(form_signal["reason"])
@@ -848,7 +829,7 @@ class MatchAnalyzer:
             conflict_points += 1
             conflict_reasons.append(form_signal["reason"])
 
-        h2h_signal = self._h2h_signal(ctx.get("h2h"), selection=selection, bet_type=bet_type, line=line)
+        h2h_signal = self._h2h_signal(ctx.get("h2h"), sport=sport, selection=selection, bet_type=bet_type, line=line)
         if h2h_signal["supportive"]:
             fundamental_points += 1
             support_reasons.append(h2h_signal["reason"])
@@ -856,7 +837,7 @@ class MatchAnalyzer:
             conflict_points += 1
             conflict_reasons.append(h2h_signal["reason"])
 
-        standings_signal = self._standings_signal(ctx.get("standings"), selection=selection, bet_type=bet_type)
+        standings_signal = self._standings_signal(ctx.get("standings"), sport=sport, selection=selection, bet_type=bet_type, line=line)
         if standings_signal["supportive"]:
             fundamental_points += 1
             support_reasons.append(standings_signal["reason"])
@@ -905,7 +886,29 @@ class MatchAnalyzer:
         confidence_floor = None
         triad_ready = bool(triad_status.get("triad_ready"))
         edge_score = market_points + fundamental_points - conflict_points
-        if not triad_ready:
+        if sport == "basketball" and selection == "under":
+            if not triad_ready:
+                confidence_delta -= 0.22
+                confidence_cap = 0.44
+                missing_bits = []
+                if not triad_status.get("has_opening"):
+                    missing_bits.append("初指")
+                if not triad_status.get("has_live_market"):
+                    missing_bits.append("实时盘口")
+                if not triad_status.get("has_fundamentals"):
+                    missing_bits.append("基本面")
+                if missing_bits:
+                    conflict_reasons.append("篮球三重门禁缺失:" + "/".join(missing_bits))
+            elif conflict_points >= 2:
+                confidence_delta -= 0.14
+                confidence_cap = 0.50
+            elif market_points < 3 or fundamental_points < 3:
+                confidence_delta -= 0.08
+                confidence_cap = 0.56
+            elif market_points >= 5 and fundamental_points >= 4 and conflict_points == 0 and edge_score >= 8:
+                confidence_delta += 0.03
+                confidence_floor = max(confidence, 0.60)
+        elif not triad_ready:
             confidence_delta -= 0.18
             confidence_cap = 0.49
             missing_bits = []
@@ -935,7 +938,8 @@ class MatchAnalyzer:
         if completeness < 0.40 and confidence_cap is None:
             confidence_cap = 0.62
         if source in ("", "none"):
-            confidence_cap = min(0.58, confidence_cap) if confidence_cap is not None else 0.58
+            no_source_cap = 0.54 if sport == "basketball" and selection == "under" else 0.58
+            confidence_cap = min(no_source_cap, confidence_cap) if confidence_cap is not None else no_source_cap
 
         verdict = "supportive"
         if not triad_ready:
@@ -978,17 +982,11 @@ class MatchAnalyzer:
         signals: list[str] = []
         direction = str(movement.get("direction") or "").strip().lower()
         odds_delta = movement.get("odds_delta") if isinstance(movement.get("odds_delta"), dict) else {}
-        if bet_type == "total":
-            if selection == "over":
-                if direction == "line_up":
-                    signals.append("supportive")
-                elif direction == "line_down":
-                    signals.append("adverse")
-            elif selection == "under":
-                if direction == "line_down":
-                    signals.append("supportive")
-                elif direction == "line_up":
-                    signals.append("adverse")
+        if bet_type == "total" and selection == "under":
+            if direction == "line_down":
+                signals.append("supportive")
+            elif direction == "line_up":
+                signals.append("adverse")
         try:
             sel_delta = float(odds_delta.get(selection)) if selection in odds_delta else None
         except (TypeError, ValueError):
@@ -1010,6 +1008,7 @@ class MatchAnalyzer:
     def _recent_form_signal(
         ctx: dict[str, Any],
         *,
+        sport: str,
         selection: str,
         bet_type: str,
         line: Optional[float],
@@ -1036,16 +1035,17 @@ class MatchAnalyzer:
         conflict = False
         reason = ""
         if bet_type == "total" and line is not None and avg_total > 0:
-            if selection == "over" and avg_total >= float(line) + 0.35:
-                supportive = True
-                reason = f"近况总进球均值 {avg_total:.2f} 高于盘口 {float(line):.2f}"
-            elif selection == "under" and avg_total <= float(line) - 0.35:
+            sport_l = str(sport or "").strip().lower()
+            if sport_l == "basketball":
+                support_gap = 6.0
+                conflict_gap = 4.5
+            else:
+                support_gap = 0.35
+                conflict_gap = 0.25
+            if selection == "under" and avg_total <= float(line) - support_gap:
                 supportive = True
                 reason = f"近况总进球均值 {avg_total:.2f} 低于盘口 {float(line):.2f}"
-            elif selection == "over" and avg_total <= float(line) - 0.25:
-                conflict = True
-                reason = f"近况总进球均值 {avg_total:.2f} 偏低"
-            elif selection == "under" and avg_total >= float(line) + 0.25:
+            elif selection == "under" and avg_total >= float(line) + conflict_gap:
                 conflict = True
                 reason = f"近况总进球均值 {avg_total:.2f} 偏高"
         return {"supportive": supportive, "conflict": conflict, "reason": reason}
@@ -1054,6 +1054,7 @@ class MatchAnalyzer:
     def _h2h_signal(
         h2h: Any,
         *,
+        sport: str,
         selection: str,
         bet_type: str,
         line: Optional[float],
@@ -1070,10 +1071,8 @@ class MatchAnalyzer:
         if bet_type == "total" and line is not None:
             avg_total = _to_float(summary.get("avg_total_goals"), 0.0)
             if avg_total > 0:
-                if selection == "over" and avg_total >= float(line) + 0.25:
-                    supportive = True
-                    reason = f"交锋总进球均值 {avg_total:.2f} 偏大"
-                elif selection == "under" and avg_total <= float(line) - 0.25:
+                margin = 5.0 if str(sport or "").strip().lower() == "basketball" else 0.25
+                if selection == "under" and avg_total <= float(line) - margin:
                     supportive = True
                     reason = f"交锋总进球均值 {avg_total:.2f} 偏小"
         return {"supportive": supportive, "conflict": conflict, "reason": reason}
@@ -1082,8 +1081,10 @@ class MatchAnalyzer:
     def _standings_signal(
         standings: Any,
         *,
+        sport: str,
         selection: str,
         bet_type: str,
+        line: Optional[float],
     ) -> dict[str, Any]:
         if not isinstance(standings, dict):
             return {"supportive": False, "conflict": False, "reason": ""}
@@ -1093,18 +1094,18 @@ class MatchAnalyzer:
         conflict = False
         reason = ""
         if bet_type == "total":
-            home_gf = _to_float(home.get("goals_for"), 0.0)
-            away_gf = _to_float(away.get("goals_for"), 0.0)
-            home_ga = _to_float(home.get("goals_against"), 0.0)
-            away_ga = _to_float(away.get("goals_against"), 0.0)
-            attack_sum = home_gf + away_gf
-            concede_sum = home_ga + away_ga
-            if selection == "over" and attack_sum > 0 and concede_sum > 0 and (attack_sum + concede_sum) >= 4.2:
-                supportive = True
-                reason = "双方联赛攻防数据偏大球"
-            elif selection == "under" and attack_sum > 0 and concede_sum > 0 and (attack_sum + concede_sum) <= 3.0:
-                supportive = True
-                reason = "双方联赛攻防数据偏小球"
+            home_played = max(_to_float(home.get("played"), 0.0), 1.0)
+            away_played = max(_to_float(away.get("played"), 0.0), 1.0)
+            home_gf = _to_float(home.get("goals_for"), 0.0) / home_played
+            away_gf = _to_float(away.get("goals_for"), 0.0) / away_played
+            home_ga = _to_float(home.get("goals_against"), 0.0) / home_played
+            away_ga = _to_float(away.get("goals_against"), 0.0) / away_played
+            expected_total = (home_gf + away_ga + away_gf + home_ga) / 2.0
+            if line is not None and expected_total > 0:
+                margin = 5.0 if str(sport or "").strip().lower() == "basketball" else 0.25
+                if selection == "under" and expected_total <= float(line) - margin:
+                    supportive = True
+                    reason = f"联赛攻防推导总分 {expected_total:.2f} 偏小"
         return {"supportive": supportive, "conflict": conflict, "reason": reason}
 
     @staticmethod
@@ -1127,16 +1128,13 @@ class MatchAnalyzer:
         if mins is None:
             return {"supportive": False, "conflict": False, "reason": ""}
         if sport in ("football", "soccer"):
-            if selection == "over" and 60 <= mins <= 75:
-                supportive = True
-                reason = "足球 60-75 分钟通常更适合追大球"
-            elif selection == "under" and mins < 25:
+            if selection == "under" and mins < 25:
                 supportive = True
                 reason = "比赛早段节奏通常更谨慎"
         elif sport == "basketball":
-            if selection == "over" and mins >= 36:
-                supportive = True
-                reason = "篮球末节通常更适合大分"
+            if selection == "under" and mins >= 44:
+                conflict = True
+                reason = "篮球最后4分钟犯规与罚球波动大，不利于小分"
         return {"supportive": supportive, "conflict": conflict, "reason": reason}
 
     def _compact_historical_data(self, data: Optional[dict]) -> Optional[dict]:
@@ -1380,16 +1378,16 @@ class MatchAnalyzer:
 
         total_line = match_info.get("total_line") or match_info.get("line")
         prompt += (
-            "\n## 投注市场（亚洲大小：仅分析全场大小球）\n"
+            "\n## 投注市场（全场小球）\n"
             f"- 盘口线 total_line: {total_line if total_line is not None else '未知'}"
             f"{score_hint}\n"
         )
         flat = _flatten_market_odds(market_odds)
         if markets_block and "total" in markets_block:
             # markets_block['total'] 已含 opening 初指与变盘明细，不再重复展开独立摘要
-            prompt += f"- 当前大小球（含 opening/变盘）: {json.dumps(markets_block['total'], ensure_ascii=False, separators=(',', ':'))}\n"
+            prompt += f"- 当前小球盘口（含 opening/变盘）: {json.dumps(markets_block['total'], ensure_ascii=False, separators=(',', ':'))}\n"
         elif flat:
-            prompt += f"- 当前大小球赔率: {json.dumps(flat, ensure_ascii=False, separators=(',', ':'))}\n"
+            prompt += f"- 当前小球赔率: {json.dumps(flat, ensure_ascii=False, separators=(',', ':'))}\n"
         # 实时比分分析：计算进球节奏和剩余需求
         score_analysis = ""
         if match_info.get("home_score") is not None and match_info.get("away_score") is not None:
@@ -1397,11 +1395,9 @@ class MatchAnalyzer:
             aws = int(match_info.get("away_score") or 0)
             current_goals = hs + aws
             if total_line:
-                goals_needed_over = max(0, total_line - current_goals + 0.5)
-                goals_needed_under = max(0, current_goals - total_line + 0.5)
+                remaining_small_margin = max(0, total_line - current_goals + 0.5)
                 score_analysis = f"""当前总得分 {current_goals}，盘口线 {total_line}。
-- 大分需要再得 {goals_needed_over} 分才能赢
-- 小分最多还能再得 {goals_needed_under} 分（含当前已得{current_goals}分）
+- 小球剩余容错 {remaining_small_margin} 分
 
 """
             clock_str = str(match_info.get("clock") or "")
@@ -1420,24 +1416,25 @@ class MatchAnalyzer:
                 mode_guide = f"""### 完整上下文分析模式（{dim_available}/{dim_total} 维度有数据）- 篮球
 
 #### 信号评估
-1. **交锋数据**：计算场均总分。场均>190->over, <160->under
-2. **近期状态**：两队近5场场均得分和>190->over, <160->under
+1. **交锋数据**：场均总分显著低于盘口才支持小球
+2. **近期状态**：两队近5场得分偏低才支持小球
 3. **排名差距**：实力悬殊->可能刷分，势均力敌->谨慎
 4. **伤停/阵容**：核心后卫缺阵降分，中锋缺阵影响篮板和二次进攻
-5. **盘路走势**：大球率>60%->over倾向，<40%->under倾向
-6. **盘口变化**：初盘->即时盘变化反映市场预期，升盘->大分信号
+5. **盘路走势**：低分走势占优才支持小球
+6. **盘口变化**：初盘下调才是小球支持信号
 7. **水位变化**：变化<3%视为噪音（篮球水位波动天然小，阈值低于足球）
 
 #### 置信度
-- 5-6/6维度+信号一致->0.62-0.78
-- 3-4/6维度+信号一致->0.50-0.66
-- 盘口与基本面矛盾->≤0.42或skip"""
+- 5-6/6维度+强一致->0.60-0.72
+- 3-4/6维度+中等一致->0.52-0.62
+- 任一核心维度明显冲突/末节高波动->≤0.40或skip
+- 篮球小分必须更保守，禁止把弱信号抬成高置信度"""
             else:
                 mode_guide = f"""### 完整上下文分析模式（{dim_available}/{dim_total} 维度有数据）- 足球
 
 #### 信号评估
-1. **交锋数据**：计算场均进球。场均>3.0->over, <1.5->under
-2. **近期状态**：两队近5场场均进球和>3.5->over, <2.0->under
+1. **交锋数据**：场均进球显著低于盘口才支持小球
+2. **近期状态**：两队近5场进球偏低才支持小球
 3. **排名差距**：实力悬殊->可能刷分，势均力敌->谨慎
 4. **伤停/阵容**：前锋缺阵降进球，后卫缺阵可能更保守
 5. **走势页**：初指与即时盘一致时增强信号；大幅背离时谨慎
@@ -1461,9 +1458,9 @@ class MatchAnalyzer:
 
 #### 分析规则
 1. **盘口变化幅度**：初盘→即时盘变化>0.5球→市场共识信号强。变化≤0.25球→信号弱，应skip
-2. **赔率方向**：大球赔率↓→市场看好大球；大球赔率↑→市场看淡大球。但赔率变化<8%视为噪音
+2. **赔率方向**：小球赔率下降才是市场支持；变化<8%视为噪音
 3. **实时比分节奏**（仅滚球）：计算当前进球节奏vs盘口线隐含节奏。节奏偏差>30%→有预测价值
-   - 当前节奏明显快于盘口预期(>30%偏差)→over；明显慢于预期(>30%偏差)→under
+   - 当前节奏明显慢于盘口预期(>30%偏差)才支持小球
    - 节奏偏差15-30%→弱信号；节奏偏差<15%→噪音，应skip
 4. **比赛阶段**：75分钟+进球概率↑；上半场进球率较低
 5. **反向思维**：盘口已大幅变化(>0.75球)后，市场可能过度反应，reverse方向反而有价值
@@ -1478,8 +1475,7 @@ class MatchAnalyzer:
 - 盘口变化≤0.25球且无实时节奏信号→skip
 - 赔率变化<8%且无节奏信号→skip
 - 节奏偏差<15%且盘口信号弱→skip
-- 无基本面数据时选over→必须skip
-- 无基本面数据时under需盘口+节奏双信号一致→否则skip
+- 无基本面数据时：小球需盘口与节奏双信号一致，否则 skip
 - skip时confidence=0.0, key_factors=["数据不足，无法判断"]"""
 
         prompt += f"""
@@ -1491,57 +1487,43 @@ class MatchAnalyzer:
 ## 输出格式（严格JSON）
 {{
     "bet_type": "total",
-    "prediction": "over 或 under 或 skip",
+    "prediction": "under 或 skip",
     "line": null,
     "confidence": 0.0-1.0,
     "reasoning": "1.盘口:初盘X→即时X,水位变化X% 2.实时比分:当前X球,节奏X球/分钟,盘口预期X球/分钟 3.综合:量化信号+置信度理由",
     "key_factors": ["因素1", "因素2", "因素3"],
     "risk_level": "low/medium/high",
     "value_bets": [
-        {{"selection": "over/under", "bet_type": "total", "reason": "为什么有价值"}}
+        {{"selection": "under", "bet_type": "total", "reason": "为什么有价值"}}
     ]
 }}
 
-注意：prediction只能是over/under/skip；skip时confidence=0.0；reasoning必须包含具体数字；只输出JSON。
+注意：prediction只能是under/skip；skip时confidence=0.0；reasoning必须包含具体数字；只输出JSON。
 """
-        # 双向严格分析规则（按运动类型分离）
+        # 小球严格分析规则（按运动类型分离）
         if sport == "basketball":
             prompt += (
-                "\n## 双向严格分析规则 - 篮球\n"
-                "### Over 方向（大分，高风险）\n"
-                "选 over 必须同时满足：\n"
-                "1) 有基本面数据（交锋/近况/排名至少2项）\n"
-                "2) 实时得分节奏显著快于盘口预期（偏差>40%）\n"
-                "3) 盘口方向支持 over，满足其一即算支持：\n"
-                "   - 升盘≥5分（强烈大分信号，无需水位确认）\n"
-                "   - 升盘2-5分 且 大分水位下降>3%\n"
-                "4) 交锋场均或近况场均>190分\n"
-                "不满足以上任一条件 -> skip\n\n"
-                "### Under 方向（小分）\n"
-                "选 under 必须满足以下至少2项：\n"
+                "\n## 小球严格分析规则 - 篮球\n"
+                "### 小球方向\n"
+                "选 under 必须满足以下至少3项，且其中必须包含 盘口方向 或 基本面 支持：\n"
                 "1) 盘口方向支持 under，满足其一即算支持：\n"
                 "   - 降盘≥5分（强烈小分信号，无需水位确认）\n"
                 "   - 降盘2-5分 且 小分水位下降>3%\n"
                 "2) 实时得分节奏慢于盘口预期（偏差>25%）\n"
                 "3) 基本面支持 under（交锋场均<160/近况得分低/防守型球队）\n"
-                "4) 盘路走势大球率<40%\n"
-                "仅满足1项或0项 -> skip\n"
-                "5) 注意：Q4后段犯规战术+罚球易刷分，under 需更谨慎\n\n"
+                "4) 低分走势占优\n"
+                "仅满足2项且缺少盘口/基本面核心支持 -> skip\n"
+                "5) 注意：Q4后段犯规战术+罚球易刷分，44分钟后 under 默认更谨慎，弱信号必须 skip\n\n"
                 "### 通用规则\n"
-                "- 无基本面数据时，over 必须 skip，under 需 conf>=0.40 且双信号一致\n"
+                "- 无基本面数据时，篮球小球不能给高置信度；弱信号直接 skip\n"
+                "- 若初指、实时盘口、基本面三者未形成同向支持，under 优先 skip\n"
                 "- 三类信号全矛盾 -> 必须 skip\n"
                 "- confidence 必须与信号强度匹配，不得虚高\n"
             )
         else:
             prompt += (
-                "\n## 双向严格分析规则 - 足球\n"
-                "### Over 方向（大球，历史胜率<20%，极高风险）\n"
-                "选 over 必须同时满足：\n"
-                "1) 有基本面数据（交锋/近况/排名至少2项）\n"
-                "2) 实时进球节奏显著快于盘口预期（偏差>40%）\n"
-                "3) 盘口方向支持 over（升盘或大球水位下降>5%）\n"
-                "不满足以上任一条件 -> skip\n\n"
-                "### Under 方向（小球，历史胜率75%）\n"
+                "\n## 小球严格分析规则 - 足球\n"
+                "### 小球方向\n"
                 "选 under 必须满足以下至少2项：\n"
                 "1) 盘口方向支持 under（降盘或小球水位下降>5%）\n"
                 "2) 实时进球节奏慢于盘口预期（偏差>25%）\n"
@@ -1549,7 +1531,7 @@ class MatchAnalyzer:
                 "仅满足1项或0项 -> skip\n"
                 "4) 注意：75分钟后进球概率上升，under 需更谨慎\n\n"
                 "### 通用规则\n"
-                "- 无基本面数据时，over 必须 skip，under 需 conf>=0.40 且双信号一致\n"
+                "- 无基本面数据时，小球需 conf>=0.40 且双信号一致\n"
                 "- 三类信号（初指/实时盘口/基本面）全矛盾 -> 必须 skip\n"
                 "- confidence 必须与信号强度匹配，不得虚高\n"
             )
@@ -1635,23 +1617,6 @@ class MatchAnalyzer:
         5. 比赛阶段权重
         """
         signals: dict[str, Any] = {}
-        sport = str(match_info.get("sport") or "football").lower()
-        is_basketball = sport == "basketball"
-
-        # 阈值按运动类型分离
-        if is_basketball:
-            OVER_THRESHOLD = 190.0
-            UNDER_THRESHOLD = 160.0
-            HIGH_OVER_RATE = 0.60
-            LOW_OVER_RATE = 0.40
-            UNIT = "分"
-        else:
-            OVER_THRESHOLD = 3.0
-            UNDER_THRESHOLD = 1.5
-            HIGH_OVER_RATE = 0.60
-            LOW_OVER_RATE = 0.40
-            UNIT = "球"
-
         # --- 1. 积分榜期望进球差 ---
         if isinstance(historical_data, dict):
             standings = historical_data.get("standings") or {}
@@ -1690,7 +1655,7 @@ class MatchAnalyzer:
                     "draw_rate": round(d / played, 3),
                     "away_win_rate": round(aw / played, 3),
                     "avg_total_goals": summary.get("avg_total_goals", 0),
-                    "over_2_5_rate": summary.get("over_2_5_rate", 0),
+                    "under_2_5_rate": summary.get("under_2_5_rate", 0),
                 }
 
         # --- 2b. 近期状态进球统计 ---
@@ -1704,7 +1669,7 @@ class MatchAnalyzer:
                             "played": fs.get("played", 0),
                             "win_rate": fs.get("win_rate", 0),
                             "avg_total_goals": fs.get("avg_total_goals", 0),
-                            "over_2_5_rate": fs.get("over_2_5_rate", 0),
+                            "under_2_5_rate": fs.get("under_2_5_rate", 0),
                         }
             # 综合两队近期进球预期
             hf = (signals.get("home_form_stats") or {}).get("avg_total_goals", 0)
@@ -1750,7 +1715,7 @@ class MatchAnalyzer:
                             market_support = "under"
                             signal_strength = "strong" if abs(ld) >= 0.5 else "medium"
                         elif ld >= 0.25:
-                            market_support = "over"
+                            market_support = "against_under"
                             signal_strength = "strong" if abs(ld) >= 0.5 else "medium"
                     except (TypeError, ValueError):
                         pass
@@ -1760,7 +1725,7 @@ class MatchAnalyzer:
                     try:
                         od = float(odds_delta)
                         if market_support == "neutral" and abs(od) >= 0.08:
-                            market_support = "under" if od > 0 else "over"
+                            market_support = "under" if od < 0 else "against_under"
                             signal_strength = "medium"
                     except (TypeError, ValueError):
                         pass
@@ -1797,7 +1762,7 @@ class MatchAnalyzer:
                         if m >= 60 and m <= 75:
                             stage_weight = "60-75分钟(足球进球高发期)"
                         elif m >= 75:
-                            stage_weight = "75分钟+(冲刺期,大小球突变)"
+                            stage_weight = "75分钟+(冲刺期，盘口突变)"
                 except Exception:
                     pass
             signals["match_stage"] = {
@@ -1837,13 +1802,13 @@ class MatchAnalyzer:
                 if line_delta is not None:
                     try:
                         ld = float(line_delta)
-                        market_support = "under" if ld <= -0.25 else "over" if ld >= 0.25 else "neutral"
+                        market_support = "under" if ld <= -0.25 else "against_under" if ld >= 0.25 else "neutral"
                         signals["line_change"] = {
                             "initial": open_line,
                             "current": total_line,
                             "delta": ld,
                             "magnitude": abs(ld),
-                            "direction": "line_up(市场看好大球)" if ld > 0 else "line_down(市场看淡大球)" if ld < 0 else "stable",
+                            "direction": "line_up(不利小球)" if ld > 0 else "line_down(支持小球)" if ld < 0 else "stable",
                             "market_support": market_support,
                             "signal_strength": "strong" if abs(ld) >= 0.5 else "medium" if abs(ld) >= 0.25 else "weak",
                         }
@@ -1856,7 +1821,7 @@ class MatchAnalyzer:
                         if abs(od) >= 0.05:
                             signals["odds_change"] = {
                                 "odds_delta": od,
-                                "signal": "大球赔率下降(市场看好大球)" if od < -0.05 else "大球赔率上升(市场看淡大球)" if od > 0.05 else "赔率变化不大(弱信号)",
+                                "signal": "小球赔率下降(市场支持小球)" if od < -0.05 else "小球赔率上升(不利小球)" if od > 0.05 else "赔率变化不大(弱信号)",
                             }
                     except (TypeError, ValueError):
                         pass
@@ -1887,9 +1852,9 @@ class MatchAnalyzer:
                             "actual_pace": actual_pace,
                             "expected_pace": expected_pace,
                             "pace_deviation_pct": pace_deviation,
-                            "goals_needed_for_over": goals_needed,
-                            "needed_pace_for_over": needed_pace,
-                            "signal": "节奏明显快于预期(>30%偏差)→over" if pace_deviation > 30 else "节奏明显慢于预期(>30%偏差)→under" if pace_deviation < -30 else "节奏偏差15-30%(弱信号)" if abs(pace_deviation) > 15 else "节奏接近预期(偏差<15%，噪音)",
+                            "points_remaining_to_exceed_line": goals_needed,
+                            "pace_needed_to_exceed_line": needed_pace,
+                            "signal": "节奏明显慢于预期(>30%偏差)→小球" if pace_deviation < -30 else "节奏偏快，不支持小球" if pace_deviation > 30 else "节奏偏差15-30%(弱信号)" if abs(pace_deviation) > 15 else "节奏接近预期(偏差<15%，噪音)",
                         }
             except Exception:
                 pass

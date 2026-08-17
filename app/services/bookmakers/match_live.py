@@ -245,6 +245,42 @@ def match_elapsed_seconds(
     sport_l = (sport or "").lower().strip()
     period_l = (period or "").strip()
     mins = parse_match_clock_minutes(clock)
+    pl = period_l.lower()
+
+    # 篮球：时钟是节内倒计时（如 Q4 剩 8:30），必须在足球粗分档之前处理，
+    # 否则「第4节」会落入足球下半场分档（70min）超出篮球48min常规时间。
+    if sport_l == "basketball":
+        mins_cd = parse_match_clock_minutes(clock, allow_countdown=True)
+        if mins_cd is not None:
+            quarter_len = 12.0
+            if any(x in period_l for x in ("第4节", "Q4")) or re.search(r"\bq4\b", pl):
+                return int((36 + max(0.0, quarter_len - mins_cd)) * 60)
+            if any(x in period_l for x in ("加时", "OT")) or re.search(r"\bot\b", pl):
+                return int((48 + max(0.0, 5.0 - mins_cd)) * 60)
+            if any(x in period_l for x in ("第3节", "Q3")) or re.search(r"\bq3\b", pl):
+                return int((24 + max(0.0, quarter_len - mins_cd)) * 60)
+            if any(x in period_l for x in ("第2节", "Q2")) or re.search(r"\bq2\b", pl):
+                return int((12 + max(0.0, quarter_len - mins_cd)) * 60)
+            if any(x in period_l for x in ("第1节", "Q1")) or re.search(r"\bq1\b", pl):
+                return int(max(0.0, quarter_len - mins_cd) * 60)
+            return int(mins_cd * 60)
+        # 无时钟：按节次中点粗估（12 分钟一节）
+        if any(x in pl for x in ("完场", "finished", "ft")):
+            return 10**9
+        if any(x in period_l for x in ("加时", "OT")) or re.search(r"\bot\b", pl):
+            return 50 * 60
+        if any(x in period_l for x in ("第4节", "Q4")) or re.search(r"\bq4\b", pl):
+            return 42 * 60
+        if any(x in period_l for x in ("第3节", "Q3")) or re.search(r"\bq3\b", pl):
+            return 36 * 60
+        if any(x in period_l for x in ("中场", "HT", "节间")):
+            return 12 * 60
+        if any(x in period_l for x in ("第2节", "Q2")) or re.search(r"\bq2\b", pl):
+            return 18 * 60
+        if any(x in period_l for x in ("第1节", "Q1")) or re.search(r"\bq1\b", pl):
+            return 6 * 60
+        return None
+
     if mins is None:
         # 无时钟：用节次粗分档，便于排序（刚开赛优先）
         pl = period_l.lower()
@@ -278,30 +314,6 @@ def match_elapsed_seconds(
         if "加时" in period_l or re.search(r"\b(?:OT|ET)\b", period_l, re.I):
             return 90 * 60 + secs
         return secs
-
-    # 篮球：时钟多为节内倒计时，用节次估算已进行
-    if sport_l == "basketball":
-        pl = period_l.lower()
-        mins_cd = parse_match_clock_minutes(clock, allow_countdown=True)
-        if mins_cd is None:
-            mins_cd = mins
-        if mins_cd is None:
-            return None
-        # Q4/加时倒计时：已进行 ≈ 节长 - 剩余；按 12 分钟一节粗算
-        quarter_len = 12.0
-        if any(x in period_l for x in ("第4节", "Q4")) or re.search(r"\bq4\b", pl):
-            played_in_q = max(0.0, quarter_len - mins_cd)
-            return int((36 + played_in_q) * 60)
-        if any(x in period_l for x in ("加时", "OT")) or re.search(r"\bot\b", pl):
-            played_in_ot = max(0.0, 5.0 - mins_cd)
-            return int((48 + played_in_ot) * 60)
-        if any(x in period_l for x in ("第3节", "Q3")) or re.search(r"\bq3\b", pl):
-            return int((24 + max(0.0, quarter_len - mins_cd)) * 60)
-        if any(x in period_l for x in ("第2节", "Q2")) or re.search(r"\bq2\b", pl):
-            return int((12 + max(0.0, quarter_len - mins_cd)) * 60)
-        if any(x in period_l for x in ("第1节", "Q1")) or re.search(r"\bq1\b", pl):
-            return int(max(0.0, quarter_len - mins_cd) * 60)
-        return int(mins_cd * 60)
 
     return secs
 
@@ -387,7 +399,7 @@ def total_goals_exceed_line(
     away_score: Any,
     total_line: Any,
 ) -> bool:
-    """当前总比分是否已超过大小球盘口（大球已成 / 小球已死）。"""
+    """当前总比分是否已超过小球盘口。"""
     if total_line is None or total_line == "":
         return False
     try:
@@ -416,7 +428,7 @@ def match_analysis_skip_reason(
 ) -> Optional[str]:
     """返回跳过分析原因；可分析则 None。"""
     if total_goals_exceed_line(home_score, away_score, total_line):
-        return "score_over_line"
+        return "score_exceeds_line"
     if is_ending_within_minutes(
         sport=sport, period=period, clock=clock, minutes=ending_minutes
     ):

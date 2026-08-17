@@ -89,11 +89,6 @@ class Settings(BaseSettings):
         "http://localhost:3000",
     ]
 
-    # === AI/LLM 配置（六模型各自独立 Key + Base URL + Model）===
-    # 可选兜底：某模型未单独配置 Key/URL 时回退到这两项
-    NEWAPI_API_KEY: Optional[str] = None
-    NEWAPI_BASE_URL: str = "https://www.juaiapi.com/v1"
-
     # --- GPT API（唯一模型） ---
     GPT_API_KEY: Optional[str] = None
     GPT_BASE_URL: str = "https://xfastapi.ai/v1"
@@ -105,13 +100,9 @@ class Settings(BaseSettings):
     LLM_MAX_TOKENS: int = 2048              # GPT 最大输出 tokens（确保 JSON 不被截断）
     LLM_DEFAULT_CONFIDENCE: float = 0.33    # GPT 未返回置信度时的默认值
     LLM_TEMPERATURE: float = 0.2            # GPT 温度
-    LLM_NO_DATA_CONFIDENCE_CAP: float = 0.55  # 无数据时置信度上限
-    LLM_UNAVAILABLE_CONF_CAP: float = 0.49   # LLM不可用时置信度上限
     LLM_CACHE_TTL: int = 600               # 10分钟
     AI_SKIP_CACHE_TTL: int = 180           # GPT 判 skip 的负缓存（略超 120s 轮询间隔，跨轮生效）
     LLM_NEG_CACHE_TTL: int = 150           # 无共识结果负缓存（略超轮询间隔）
-    # Prompt 压缩：截断冗余数据，控制 prompt 在 8KB 以内
-    PROMPT_MAX_CHARS: int = 8000           # prompt 最大字符数
     H2H_MAX_MATCHES: int = 3               # 历史交锋最多保留场次
     FORM_MAX_MATCHES: int = 3               # 近况最多保留场次
     # 下单门槛（从 settings 读取，不写死）
@@ -135,7 +126,6 @@ class Settings(BaseSettings):
     MAX_BET_AMOUNT: float = 100000.0
     # 数据保留时间（小时）：超过此时间的投注记录和赛事记录自动删除
     DATA_RETENTION_HOURS: int = 24
-    MAX_BETS_PER_MATCH: int = 5
     MAX_DAILY_BETS: int = 50
 
     # === AI自动投注配置 ===
@@ -148,10 +138,6 @@ class Settings(BaseSettings):
     # 下单失败补单（重试）
     BET_RETRY_COUNT: int = 2              # 下单失败重试次数
     BET_RETRY_DELAY: float = 3.0          # 重试间隔（秒）
-    OB_BET_VERIFY_INITIAL_DELAY_SEC: float = 4.0  # OB 下单后首次验证等待
-    OB_BET_VERIFY_RETRIES: int = 8               # OB 下单后最多验证次数
-    OB_BET_VERIFY_INTERVAL_SEC: float = 2.0      # OB 下单后每次验证间隔
-    OB_BET_VERIFY_HISTORY_DAYS: int = 1          # OB 注单历史查询天数
     AI_RETRY_SLEEP_SEC: int = 60             # 引擎异常后重试休眠
     AI_MIN_BALANCE: float = 10.0             # 最低可用余额阈值
     # 捷报比分
@@ -175,11 +161,6 @@ class Settings(BaseSettings):
     AI_RISK_MID_ODDS_PENALTY: float = 0.15   # 中赔率风险增量
     AI_RISK_ACTIVE_PENALTY: float = 0.02     # 每笔持仓风险系数
     AI_RISK_ACTIVE_CAP: float = 0.1          # 持仓风险上限
-    AI_DIVERSIFY_MAX_PER_LEAGUE: int = 3     # 同一联赛最多注数
-
-    # === WebSocket ===
-    WS_HEARTBEAT_INTERVAL: int = 30
-    WS_MAX_CONNECTIONS_PER_USER: int = 5
 
     # === 日志 ===
     LOG_LEVEL: str = "INFO"
@@ -187,14 +168,6 @@ class Settings(BaseSettings):
 
     # === 赔率监控 / 机会扫描（规格对齐）===
     MONITORING_ENABLED: bool = True
-    MAX_QUOTE_AGE_SEC: int = 30
-    MIN_MATCH_CONFIDENCE: float = 0.90
-    MIN_NET_PROFIT_RATE: float = 0.005
-    MIN_WORST_CASE_PROFIT: float = 1.0
-    MAX_STAKE_PER_EVENT: float = 5000.0
-    MAX_EXPOSURE_PER_SOURCE: float = 10000.0
-    MAX_EXPOSURE_PER_ACCOUNT: float = 20000.0
-    MAX_DAILY_LOSS: float = 2000.0
     # 默认下单模式：manual=人工 / active=自动（可被用户开关覆盖）
     DEFAULT_BET_MODE: str = "manual"
     ALLOWED_HOSTS: Any = ["localhost", "127.0.0.1", "backend", "ob-backend"]
@@ -208,12 +181,6 @@ class Settings(BaseSettings):
 
     # === Browser Gate / 站点浏览器 ===
     BOOKMAKER_BROWSER_GATE_URL: str = ""
-    BOOKMAKER_BROWSER_HEADLESS: str = "0"
-    BOOKMAKER_MANUAL_VENUE: str = "0"
-    BOOKMAKER_DISABLE_SITES: str = ""           # 临时关闭站点（ob,pinnacle）
-    BROWSER_GATE_PORT: int = 9277
-    BOOKMAKER_BACKEND_URL: str = "http://127.0.0.1:8000"
-    GATE_HOST: str = "0.0.0.0"
 
     @field_validator("CORS_ORIGINS", "ALLOWED_HOSTS", mode="before")
     @classmethod

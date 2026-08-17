@@ -75,7 +75,7 @@ def _resolve_pending_context(
         order.get("selection")
         or pending.get("selection")
         or prediction.get("prediction")
-        or "over"
+        or "under"
     ).strip().lower()
     bet_type_raw = (
         order.get("bet_type")

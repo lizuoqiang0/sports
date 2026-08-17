@@ -1,5 +1,4 @@
 const SEL_LABEL = {
-  over: '大球',
   under: '小球',
   home: '主队',
   away: '客队',

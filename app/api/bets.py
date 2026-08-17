@@ -122,14 +122,14 @@ async def place_bet(
 
     sel = str(req.selection or "").lower()
     bt = str(req.bet_type or "").lower()
-    if bt == "moneyline" and sel not in ("home", "away", "draw"):
-        raise HTTPException(status_code=400, detail=f"无效选项: {req.selection}")
-    if bt == "spread" and sel not in ("home", "away"):
-        raise HTTPException(status_code=400, detail=f"让球/让分无效选项: {req.selection}")
-    if bt == "total" and sel not in ("over", "under"):
-        raise HTTPException(status_code=400, detail=f"大小球无效选项: {req.selection}")
-    if bt == "parlay":
-        raise HTTPException(status_code=400, detail="禁止串关，请使用单场投注")
+    # 只投全场小球：OB/平博下单链路仅对该方向做过可靠性验证。
+    if bt != "total":
+        raise HTTPException(
+            status_code=400,
+            detail="仅支持全场小球（bet_type=total），独赢/让球/串关已禁用",
+        )
+    if sel != "under":
+        raise HTTPException(status_code=400, detail="仅支持小球选项（selection=under）")
 
     # 2. 解析目标站点并获取赔率
     from app.core.crypto import decrypt_secret
@@ -156,9 +156,13 @@ async def place_bet(
                         provider_label = meta["name"]
                         break
 
+    # 查库用归一化后的小写值，避免客户端大小写不一致导致 PostgreSQL 查询落空。
+    # 校验通过但 PostgreSQL 区分大小写查询落空
+    from app.models.user import BetType as _BTEnum
+
     odds_query = select(Odds).where(
         Odds.match_id == req.match_id,
-        Odds.bet_type == req.bet_type,
+        Odds.bet_type == _BTEnum(bt),
         Odds.valid_to.is_(None),
     )
     if provider_label:
@@ -171,12 +175,20 @@ async def place_bet(
         all_res = await db.execute(
             select(Odds).where(
                 Odds.match_id == req.match_id,
-                Odds.bet_type == req.bet_type,
+                Odds.bet_type == _BTEnum(bt),
                 Odds.valid_to.is_(None),
             )
         )
         candidates = list(all_res.scalars().all())
+        # 下单站点自己的行优先（其 line 才是结算依据）——
+        # 跨站只比赔率不比线，两家 line 常差 0.25/0.5，接错行的线会错判输赢
+        if provider_label:
+            candidates.sort(key=lambda r: (r.provider or "") != provider_label)
         for row in candidates:
+            if provider_label and (row.provider or "") != provider_label:
+                # 有本站行时不再跨站接管（除非本站完全没有行）
+                if any((r.provider or "") == provider_label for r in candidates):
+                    continue
             try:
                 v = float((row.odds_data or {}).get(sel) or 0)
             except (TypeError, ValueError):
@@ -187,14 +199,19 @@ async def place_bet(
                 provider_code = provider_code or (_code_by_provider(provider_label) or "")
                 break
         if not odds_obj and candidates:
-            odds_obj = candidates[0]
+            # 兜底：优先本站行，避免 bet.line 记录成另一站的线
+            if provider_label:
+                own = [r for r in candidates if (r.provider or "") == provider_label]
+                odds_obj = own[0] if own else candidates[0]
+            else:
+                odds_obj = candidates[0]
             provider_label = odds_obj.provider or provider_label
             provider_code = provider_code or (_code_by_provider(provider_label) or "")
 
     if not odds_obj:
         raise HTTPException(status_code=404, detail="赔率不存在")
 
-    raw_odds = (odds_obj.odds_data or {}).get(req.selection)
+    raw_odds = (odds_obj.odds_data or {}).get(sel)
     if raw_odds is None or isinstance(raw_odds, (dict, list)):
         raise HTTPException(status_code=400, detail=f"无效选项: {req.selection}")
     current_odds = float(raw_odds)
@@ -313,6 +330,9 @@ async def place_bet(
         "bet_type": req.bet_type if isinstance(req.bet_type, str) else str(req.bet_type),
         "odds_data": dict(odds_obj.odds_data or {}),
     }
+    # 队名注入 odds_data：UI 下单依赖队名定位赛事行
+    place_payload["odds_data"]["_home_team"] = match.home_team or ""
+    place_payload["odds_data"]["_away_team"] = match.away_team or ""
     match_home = match.home_team
     match_away = match.away_team
     match_id_val = match.id
@@ -687,7 +707,9 @@ async def portfolio_summary(
         "confirmed_total_bets": int(monthly_bets or 0),
         "pending_bets": len(pending_items),
         "total_assets": pnl_info["total_assets"],
-        "daily_pnl": pnl_info["balance_delta"],
+        # 口径说明：daily_pnl = 当日基线差（risk_daily_pnl 同源）；
+        # balance_delta = 相对长期基准（工作台「网站盈亏」卡片）的累计增减。
+        "daily_pnl": risk_pnl,
         "balance_delta": pnl_info["balance_delta"],
         "balance_change": pnl_info["balance_change"],
         "baseline": pnl_info["reference_balance"],
@@ -698,4 +720,39 @@ async def portfolio_summary(
         "risk_daily_pnl": risk_pnl,
         "remote_fallback": False,
         "remote_status": "disabled",
+    })
+
+
+@router.post("/portfolio/reset-pnl", response_model=APIResponse)
+async def reset_pnl(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """手动清零复位盈亏基线。
+
+    以当前站点总余额重建基线快照与日基线：
+    - 工作台「网站盈亏」立即归零
+    - 风控日盈亏（risk_daily_pnl / 止损止盈）从当前余额重新起算
+    适用于：充值后基线漂移、历史测试数据污染、想从今天重新计盈亏。
+    """
+    try:
+        from app.services.balances import load_site_balances
+        from app.services.daily_pnl import reset_pnl_baseline
+
+        site_balances = await load_site_balances(db, current_user.id)
+        total_assets = sum(float(s.get("balance") or 0) for s in site_balances)
+        pnl_info = await reset_pnl_baseline(current_user.id, total_assets)
+    except Exception as e:
+        logger.exception("盈亏复位失败 user=%s", current_user.id)
+        raise HTTPException(status_code=500, detail=f"盈亏复位失败: {e}")
+
+    return APIResponse(data={
+        "total_assets": pnl_info["total_assets"],
+        "balance_delta": 0.0,
+        "daily_pnl": 0.0,
+        "balance_change": 0.0,
+        "reference_balance": pnl_info["reference_balance"],
+        "snapshot_updated_at": pnl_info["snapshot_updated_at"],
+        "pnl_mode": pnl_info["pnl_mode"],
+        "message": f"盈亏已清零复位（新基准 ¥{pnl_info['reference_balance']:.2f}）",
     })

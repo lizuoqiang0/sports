@@ -20,8 +20,14 @@ if [[ ! -f frontend/dist/index.html ]]; then
 fi
 
 echo "==> 同步最新代码到镜像（无需 Docker Hub 重建）"
+services=(backend frontend)
+# AI 引擎是独立进程；已启用时必须随 API 一起重启，才能加载最新策略代码。
+if docker inspect ob-ai-engine >/dev/null 2>&1; then
+  services+=(ai-engine)
+fi
+
 # 确保容器存在以便 docker cp；没有则先用现有镜像起一次
-docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --no-build postgres redis backend frontend 2>/dev/null || true
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --no-build postgres redis "${services[@]}" 2>/dev/null || true
 sleep 2
 
 if docker inspect ob-backend >/dev/null 2>&1; then
@@ -43,10 +49,10 @@ fi
 # 优先不拉远程；需要完整重建时再传 --build
 if [[ "${1:-}" == "--build" ]]; then
   shift
-  docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build "$@" || \
-    docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --no-build "$@"
+  docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build "${services[@]}" "$@" || \
+    docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --no-build "${services[@]}" "$@"
 else
-  docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --no-build --force-recreate backend frontend "$@"
+  docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --no-build --force-recreate "${services[@]}" "$@"
 fi
 
 echo "生产栈已启动。前端请经反向代理 HTTPS；API docs 默认关闭。"

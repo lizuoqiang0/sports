@@ -1,4 +1,4 @@
-"""盘口推荐：OB/平博单边 · 足球独赢/亚洲让球/亚洲大小 · 篮球亚洲大小。"""
+"""盘口推荐：OB/平博单边，仅生成全场小球推荐。"""
 from __future__ import annotations
 
 import logging
@@ -22,8 +22,7 @@ ALIAS = {
 }
 
 SEL_LABELS = {
-    "over": "大",
-    "under": "小",
+    "under": "小球",
     "home": "主",
     "away": "客",
     "draw": "平",
@@ -36,32 +35,21 @@ BET_TYPE_ENUM = {
 }
 
 SPORT_MARKETS: dict[str, list[dict[str, Any]]] = {
+    # 仅投全场小球（total/under）。
     "football": [
-        {
-            "key": "ft_1x2",
-            "bet_type": "moneyline",
-            "label": "独赢",
-            "selections": ("home", "draw", "away"),
-        },
-        {
-            "key": "ft_ah",
-            "bet_type": "spread",
-            "label": "亚洲让球",
-            "selections": ("home", "away"),
-        },
         {
             "key": "ft_ou",
             "bet_type": "total",
-            "label": "亚洲大小",
-            "selections": ("over", "under"),
+            "label": "全场小球",
+            "selections": ("under",),
         },
     ],
     "basketball": [
         {
             "key": "ft_ou",
             "bet_type": "total",
-            "label": "亚洲大小",
-            "selections": ("over", "under"),
+            "label": "全场小球",
+            "selections": ("under",),
         },
     ],
 }
@@ -94,13 +82,9 @@ def normalize_prediction(raw: Any, *, bet_type: str = "") -> str:
     s = str(raw or "").strip().lower()
     bt = _normalize_bet_type(bet_type)
     aliases = {
-        "over": "over",
         "under": "under",
-        "o": "over",
         "u": "under",
-        "大": "over",
         "小": "under",
-        "大球": "over",
         "小球": "under",
         "home": "home",
         "away": "away",
@@ -122,8 +106,6 @@ def normalize_prediction(raw: Any, *, bet_type: str = "") -> str:
     }
     if s in aliases:
         pred = aliases[s]
-    elif "大球" in s or s == "大" or "over" in s:
-        pred = "over"
     elif "小球" in s or s == "小" or "under" in s:
         pred = "under"
     elif "主胜" in s or s in ("主", "home"):
@@ -137,21 +119,15 @@ def normalize_prediction(raw: Any, *, bet_type: str = "") -> str:
 
     if not pred:
         return ""
-    if bt == "total" and pred not in ("over", "under"):
+    if bt == "total" and pred != "under":
         return ""
     if bt == "moneyline" and pred not in ("home", "away", "draw"):
         return ""
     if bt == "spread" and pred not in ("home", "away"):
         return ""
-    if not bt and pred not in ("over", "under", "home", "away", "draw"):
+    if not bt and pred not in ("under", "home", "away", "draw"):
         return ""
     return pred
-
-
-def _implied_edge(odds: float, win_prob: float) -> float:
-    if odds <= 1.0:
-        return -1.0
-    return win_prob * odds - 1.0
 
 
 def _side_probs(
@@ -235,7 +211,7 @@ async def load_market_matrix(
     spread_line = 0.0
     total_line = 0.0
     sel_allow = {
-        "total": ("over", "under"),
+        "total": ("under",),
         "moneyline": ("home", "away", "draw"),
         "spread": ("home", "away"),
     }.get(bt, ())
@@ -247,12 +223,15 @@ async def load_market_matrix(
             pname = provider_name(code) if code in BOOKMAKER_CATALOG else pname
         if pname not in allowed:
             continue
-        if row.total is not None:
+        # 线取「首个非空行」并锁定（查询已按 canonical 站优先 + 最新行排序）：
+        # 原先每行无条件覆盖（最后一行=兄弟站最旧行胜出），会使 AI 分析用的线
+        # 与最终下单行的线错配，半分之差即可翻转 won/push
+        if row.total is not None and total_line == 0.0:
             try:
                 total_line = float(row.total)
             except (TypeError, ValueError):
                 pass
-        if row.spread is not None:
+        if row.spread is not None and spread_line == 0.0:
             try:
                 spread_line = float(row.spread)
             except (TypeError, ValueError):

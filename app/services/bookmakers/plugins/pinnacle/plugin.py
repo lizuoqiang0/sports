@@ -124,8 +124,7 @@ class PinnaclePlugin(BasePlugin):
                     prev[fld] = r.get(fld)
             if len(r.get("odds") or []) >= len(prev.get("odds") or []):
                 prev["odds"] = r.get("odds")
-            if r.get("over") and r.get("under"):
-                prev["over"] = r.get("over")
+            if r.get("under"):
                 prev["under"] = r.get("under")
                 prev["total_line"] = r.get("total_line")
             by_key[k] = prev

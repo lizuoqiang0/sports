@@ -40,10 +40,9 @@ def usable_total_odds(odds_map: Any) -> list[float]:
     if not isinstance(odds_map, dict):
         return []
     out: list[float] = []
-    for k in ("over", "under"):
-        x = _as_eu_odds(odds_map.get(k))
-        if x is not None:
-            out.append(x)
+    x = _as_eu_odds(odds_map.get("under"))
+    if x is not None:
+        out.append(x)
     return out
 
 
@@ -70,7 +69,7 @@ def total_odds_meet_min(
     floor: float = DEFAULT_MIN_ODDS,
     ceiling: float | None = DEFAULT_MAX_ODDS,
 ) -> bool:
-    """至少一侧大小球赔率落在配置区间内才值得分析。"""
+    """小球赔率落在配置区间内才值得分析。"""
     return any(
         odds_in_configured_range(v, min_odds=floor, max_odds=ceiling)
         for v in usable_total_odds(odds_map)
@@ -96,7 +95,7 @@ def any_market_odds_meet_min(
                 if odds_in_configured_range(v, min_odds=floor, max_odds=ceiling):
                     return True
         return False
-    # 扁平：home/away/draw/over/under
+    # 扁平：home/away/draw/under
     vals = []
     for k, v in odds_map.items():
         if str(k).startswith("_") or k in ("markets", "line", "total", "spread"):
@@ -107,15 +106,6 @@ def any_market_odds_meet_min(
     if not vals:
         return total_odds_meet_min(odds_map, floor=floor, ceiling=ceiling)
     return any(odds_in_configured_range(v, min_odds=floor, max_odds=ceiling) for v in vals)
-
-
-def selection_odds_below_min(
-    odds: Any, *, floor: float = DEFAULT_MIN_ODDS
-) -> bool:
-    x = _as_eu_odds(odds)
-    if x is None:
-        return True
-    return x + 1e-9 < float(floor)
 
 
 def skip_reason_for_match(
@@ -237,7 +227,7 @@ def rec_skip_reason(
     if line is None:
         line = (rec.get("recommendation") or {}).get("line")
     if total_goals_exceed_line(hs, aws, line):
-        return "score_over_line"
+        return "score_exceeds_line"
     if is_ending_within_minutes(
         sport=sport, period=period, clock=clock, minutes=ENDING_SOON_MINUTES
     ):
@@ -297,7 +287,7 @@ async def enrich_recs_skip_from_db(
             if isinstance(odata, dict):
                 prev = odds_by.get(mid_i) or {}
                 merged = dict(prev)
-                for k in ("over", "under"):
+                for k in ("under",):
                     if odata.get(k) is not None:
                         merged[k] = odata.get(k)
                 odds_by[mid_i] = merged

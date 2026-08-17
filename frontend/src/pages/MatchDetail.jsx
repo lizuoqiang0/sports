@@ -210,8 +210,7 @@ export default function MatchDetailPage() {
               }`}>
                 {aiAnalysis.recommendation?.selection === 'home' ? match.home_team :
                  aiAnalysis.recommendation?.selection === 'away' ? match.away_team :
-                 aiAnalysis.recommendation?.selection === 'over' ? '大球' :
-                 aiAnalysis.recommendation?.selection === 'under' ? '小球' : '平局'}
+                 aiAnalysis.recommendation?.selection === 'under' ? '小球' : '无推荐'}
               </span>
               <span className="text-sm text-gray-500">
                 置信度 {((aiAnalysis.recommendation?.confidence || 0) * 100).toFixed(0)}%
@@ -341,7 +340,7 @@ export default function MatchDetailPage() {
 
         {totalRows.length > 0 && (
           <div>
-            <div className="text-sm text-gray-400 mb-2">亚洲大小</div>
+            <div className="text-sm text-gray-400 mb-2">全场小球</div>
             <div className="space-y-3">
               {totalRows.map((row) => (
                 <div key={`tot-${row.provider || row.id || 'x'}`}>
@@ -349,9 +348,8 @@ export default function MatchDetailPage() {
                     {row.provider || '未知站点'}
                     {row.total != null ? ` · ${row.total}` : ''}
                   </div>
-                  <div className="grid grid-cols-2 gap-3">
-                    <OddsCell label={`大 ${row.total ?? ''}`} value={row.odds_data?.over} />
-                    <OddsCell label={`小 ${row.total ?? ''}`} value={row.odds_data?.under} />
+                  <div className="grid grid-cols-1 gap-3">
+                    <OddsCell label={`小球 ${row.total ?? ''}`} value={row.odds_data?.under} />
                   </div>
                 </div>
               ))}

@@ -210,18 +210,16 @@ def _odds_from_period0(p0: list, *, mid: str, sport_id: int) -> list[RemoteOdds]
     # 大小
     tot_row = _pick_main_total(p0[1] if isinstance(p0[1], list) else [])
     if tot_row:
-        over = _as_float(tot_row[2])
         under = _as_float(tot_row[3])
         # points 优先数值位，其次展示串
         line = _as_float(tot_row[1]) if len(tot_row) > 1 else None
         if line is None:
             line = _as_float(tot_row[0])
-        if over and under and line is not None:
+        if under and line is not None:
             sel_id = str(tot_row[4] if len(tot_row) > 4 else "")
             od = RemoteOdds(
                 bet_type="total",
                 odds_data={
-                    "over": over,
                     "under": under,
                     "_site": {
                         "bet_type": "total",
@@ -230,7 +228,6 @@ def _odds_from_period0(p0: list, *, mid: str, sport_id: int) -> list[RemoteOdds]
                         "sport_id": str(sport_id),
                         "site_code": "pinnacle",
                         "selections": {
-                            "over": {"id": sel_id, "oid": sel_id, "price": over, "name": "over"},
                             "under": {"id": sel_id, "oid": sel_id, "price": under, "name": "under"},
                         },
                     },

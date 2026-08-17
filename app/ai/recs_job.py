@@ -349,12 +349,12 @@ async def list_live_match_ids(
 
         from app.ai.analysis_filters import any_market_odds_meet_min
 
-        # 足球：胜负/让球/大小；篮球：大小
+        # 业务仅支持小球：候选过滤只看 total/under，避免无效调用 LLM。
         odds_res = await db.execute(
             select(Odds.match_id, Odds.bet_type, Odds.total, Odds.spread, Odds.odds_data)
             .where(
                 Odds.match_id.in_(list(by_id.keys())),
-                Odds.bet_type.in_([BetType.TOTAL, BetType.MONEYLINE, BetType.SPREAD]),
+                Odds.bet_type == BetType.TOTAL,
                 Odds.valid_to.is_(None),
             )
         )
@@ -374,7 +374,7 @@ async def list_live_match_ids(
             if isinstance(odata, dict):
                 entry_odds = {}
                 keys = {
-                    "total": ("over", "under"),
+                    "total": ("under",),
                     "moneyline": ("home", "away", "draw"),
                     "spread": ("home", "away"),
                 }.get(bt, ())
@@ -403,7 +403,7 @@ async def list_live_match_ids(
 
         kept: list[Any] = []
         skipped = {
-            "score_over_line": 0,
+            "score_exceeds_line": 0,
             "ending_soon": 0,
             "no_total": 0,
             "odds_out_of_range": 0,
@@ -476,10 +476,14 @@ async def ensure_recs_job(
     except Exception:
         ok = False
 
-    if not ok and not force:
-        return await get_job_snapshot(user_id, sport_norm, "")
-
-    if force:
+    if not ok:
+        # 锁被他人持有。绝不无条件覆盖（否则多 worker 双跑、LLM 重复消耗）。
+        # 仅当快照显示任务僵死（running 超过 30 分钟）时才强制接管。
+        cur = await get_job_snapshot(user_id, sport_norm, "")
+        started = float(cur.get("started_at") or 0)
+        stale = bool(started) and (time.time() - started) > 1800
+        if not stale:
+            return cur
         try:
             await cache.client.set(lock_key, token, ex=30)
         except Exception:
@@ -644,7 +648,7 @@ async def _run_recs_job(
                 "status": "ready",
                 "progress": 0,
                 "total": 0,
-                "hint": "暂无滚球大小球（请先在赛事页同步 OB / 平博滚球）",
+                "hint": "暂无滚球小球（请先在赛事页同步 OB / 平博滚球）",
                 "analyzed_at": datetime.now(timezone.utc).isoformat(),
                 "source": "matches_live",
                 "fixture_dedup": True,

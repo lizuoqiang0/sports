@@ -35,7 +35,6 @@ _IN_VENUE_MARKERS = (
     "In-Play",
     "Money Line",
     "Handicap",
-    "大小球",
     "足球",
     "篮球",
     "棒球",
@@ -86,7 +85,6 @@ _STRONG_VENUE_MARKERS = (
     "赛果比分",
     "滚球",
     "独赢",
-    "大小球",
     "半全场",
     "进球数",
     "角球",
@@ -97,7 +95,8 @@ _STRONG_VENUE_MARKERS = (
     "波胆",
     "双重机会",
     "Team",
-    "Over/Under",
+    "小球",
+    "Under",
     "Asian Handicap",
     "1X2",
     "Double Chance",
@@ -308,6 +307,61 @@ async def capture_live_venue_url(page) -> str:
             except Exception:
                 pass
             return u
+        # OB/开云 常停在壳页，真实 token/h5 地址挂在 iframe storage 里
+        try:
+            found = await p.evaluate(
+                """() => {
+                  const out = [];
+                  const push = (u) => {
+                    if (!u) return;
+                    const s = String(u).trim();
+                    if (s && s.includes('token=') && out.indexOf(s) < 0) out.push(s);
+                  };
+                  const scan = (v, depth = 0) => {
+                    if (v == null || depth > 5) return;
+                    if (typeof v === 'string') {
+                      const s = v.trim();
+                      if (!s) return;
+                      if (s.includes('token=')) push(s);
+                      try {
+                        const j = JSON.parse(s);
+                        if (j && typeof j === 'object') scan(j, depth + 1);
+                      } catch (e) {}
+                      return;
+                    }
+                    if (Array.isArray(v)) {
+                      for (const item of v) scan(item, depth + 1);
+                      return;
+                    }
+                    if (typeof v !== 'object') return;
+                    for (const val of Object.values(v)) scan(val, depth + 1);
+                  };
+                  try { push(location.href); } catch (e) {}
+                  try {
+                    for (const store of [localStorage, sessionStorage]) {
+                      if (!store) continue;
+                      for (let i = 0; i < store.length; i++) {
+                        const key = store.key(i) || '';
+                        const val = store.getItem(key) || '';
+                        if (val) scan(val, 0);
+                      }
+                    }
+                  } catch (e) {}
+                  try {
+                    document.querySelectorAll('iframe').forEach((f) => {
+                      try { push(f.src || ''); } catch (e) {}
+                    });
+                  } catch (e) {}
+                  return out.slice(0, 10);
+                }"""
+            )
+            if isinstance(found, list):
+                for item in found:
+                    cand = str(item or "").strip()
+                    if cand and _is_venue_url(cand):
+                        return cand
+        except Exception:
+            pass
     return ""
 
 
@@ -526,7 +580,7 @@ async def dismiss_blocking_modals(page) -> None:
         return /交易密码|支付密码|资金密码|提款密码|fund\\s*password|pay\\s*password|fundPassword/i.test(t)
           && t.length < 600;
       };
-      const safeClose = ['关闭','取消','稍后','暂不','知道了','我知道了','跳过','忽略','×','X','Close','Cancel'];
+      const safeClose = ['关闭','取消','稍后','暂不','知道了','我知道了','跳过','忽略','×','X','Close','Cancel','好的'];
       const confirmTxt = ['确定','确认','提交','完成','下一步','OK','Confirm','Verify'];
 
       const clickSafeClose = (root) => {
@@ -578,7 +632,16 @@ async def dismiss_blocking_modals(page) -> None:
         }
         const body = String(m.innerText || '').slice(0, 160);
         // 只处理明显公告/活动弹层；普通业务弹层不动
-        if (!/公告|活动|优惠|欢迎|提示|消息|更新|维护|领取/.test(body)) return;
+        // OB 遮盖弹窗：含「好的」按钮同样处理
+        const hasHaoDe = (() => {
+          const btns = m.querySelectorAll('button, a, span');
+          for (const b of btns) {
+            const t = String(b.innerText || b.textContent || '').trim();
+            if (t === '好的') return true;
+          }
+          return false;
+        })();
+        if (!/公告|活动|优惠|欢迎|提示|消息|更新|维护|领取/.test(body) && !hasHaoDe) return;
         clickSafeClose(m);
         const nodes = m.querySelectorAll('button, a, span');
         for (const el of nodes) {
