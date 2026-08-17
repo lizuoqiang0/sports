@@ -2236,6 +2236,15 @@ async def stop_user_engine(user_id: int) -> dict:
     return {"status": "stopped", "user_id": user_id}
 
 
+async def stop_local_user_engines() -> None:
+    """停止当前 worker 持有的引擎，供优雅退出时释放 Redis 状态。"""
+    for user_id in list(_active_engines):
+        try:
+            await stop_user_engine(user_id)
+        except Exception:
+            logger.exception("AI 引擎退出清理失败: user=%s", user_id)
+
+
 async def get_engine_status(user_id: int) -> dict:
     """获取引擎状态（跨 worker：内存优先，Redis 兜底）"""
     engine = _active_engines.get(user_id)

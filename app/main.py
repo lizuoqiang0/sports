@@ -230,6 +230,11 @@ async def lifespan(app: FastAPI):
     except Exception:
         pass
     try:
+        from app.ai.auto_better import stop_local_user_engines
+        await stop_local_user_engines()
+    except Exception:
+        logger.exception("AI 引擎优雅退出清理失败")
+    try:
         await manager.stop_fanout()
     except Exception:
         pass

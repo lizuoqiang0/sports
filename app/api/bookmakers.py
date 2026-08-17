@@ -643,8 +643,33 @@ async def sync_live_bookmakers(
     user: User = Depends(get_current_user),
 ):
     """轻量滚球同步：仅足球/篮球比分/时钟/赔率。"""
+    import uuid
+
+    from app.core.cache import cache
+    from app.services.bookmakers.live_poller import _MANUAL_SYNC_LOCK_KEY
+
+    lock_token = f"manual:{user.id}:{uuid.uuid4().hex}"
+    cache_available = True
+    try:
+        acquired = bool(
+            await cache.client.set(_MANUAL_SYNC_LOCK_KEY, lock_token, nx=True, ex=240)
+        )
+    except Exception as e:
+        logger.warning("manual live sync lock unavailable, continuing without distributed lock: %s", e)
+        cache_available = False
+        acquired = True
+    if not acquired:
+        raise HTTPException(status_code=409, detail="滚球同步正在进行，请等待当前任务完成")
+
     # 余额由后台轮询维护；手动刷新只占用盘口车道，避免两站串行余额抓取超时。
-    result = await sync_live_scores_odds(db, user.id, refresh_balance=False)
+    try:
+        result = await sync_live_scores_odds(db, user.id, refresh_balance=False)
+    finally:
+        if cache_available:
+            try:
+                await cache.release_lock(_MANUAL_SYNC_LOCK_KEY, lock_token)
+            except Exception:
+                logger.debug("manual live sync lock release failed", exc_info=True)
     return APIResponse(message="滚球已刷新", data=result)
 
 

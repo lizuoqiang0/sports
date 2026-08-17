@@ -1617,6 +1617,7 @@ class MatchAnalyzer:
         5. 比赛阶段权重
         """
         signals: dict[str, Any] = {}
+        sport = str(match_info.get("sport") or "football").strip().lower()
         # --- 1. 积分榜期望进球差 ---
         if isinstance(historical_data, dict):
             standings = historical_data.get("standings") or {}
@@ -1739,7 +1740,7 @@ class MatchAnalyzer:
         clock = str(match_info.get("clock") or "")
         if period or clock:
             stage_weight = "unknown"
-            if is_basketball:
+            if sport == "basketball":
                 # 篮球：Q1 节奏偏慢, Q2-Q3 中段, Q4 得分爆发期
                 if "q1" in period or "1q" in period:
                     stage_weight = "Q1(节奏偏慢,得分率低)"

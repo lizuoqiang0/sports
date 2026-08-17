@@ -5,6 +5,8 @@ from unittest.mock import AsyncMock, patch
 
 from app.api.ai_bets import ai_status
 from app.ai import auto_better
+from app.ai.analyzer import MatchAnalyzer
+from app.services.bookmakers import live_poller
 
 
 class _Db:
@@ -51,3 +53,26 @@ class TestAIStatus(IsolatedAsyncioTestCase):
 
         self.assertTrue(cleared)
         cache.client.eval.assert_awaited_once()
+
+    async def test_live_poller_reads_distributed_manual_sync_lock(self):
+        class _Cache:
+            async def exists(self, key):
+                self.key = key
+                return True
+
+        cache = _Cache()
+        with patch("app.core.cache.cache", cache):
+            active = await live_poller._manual_sync_in_progress()
+
+        self.assertTrue(active)
+        self.assertEqual(cache.key, live_poller._MANUAL_SYNC_LOCK_KEY)
+
+    def test_statistical_signals_define_sport_for_live_stage(self):
+        signals = MatchAnalyzer._build_statistical_signals(
+            None,
+            None,
+            {"sport": "football", "clock": "70'"},
+            None,
+        )
+
+        self.assertEqual(signals["match_stage"]["stage_weight"], "60-75分钟(足球进球高发期)")

@@ -16,6 +16,7 @@ _lock = asyncio.Lock()
 _paused = False
 _pause_depth = 0
 _tick_n = 0
+_MANUAL_SYNC_LOCK_KEY = "bookmakers:live:manual-sync"
 
 
 def pause_live_poller() -> None:
@@ -29,6 +30,16 @@ def resume_live_poller() -> None:
     global _paused, _pause_depth
     _pause_depth = max(0, _pause_depth - 1)
     _paused = _pause_depth > 0
+
+
+async def _manual_sync_in_progress() -> bool:
+    """读取 Redis 手动同步锁，让所有 worker 都能为用户操作让路。"""
+    try:
+        from app.core.cache import cache
+
+        return await cache.exists(_MANUAL_SYNC_LOCK_KEY)
+    except Exception:
+        return False
 
 
 async def _list_connected_account_ids() -> list[int]:
@@ -93,6 +104,9 @@ async def _tick_once() -> None:
 
     if _paused:
         logger.debug("live poller skip: paused for verify/login")
+        return
+    if await _manual_sync_in_progress():
+        logger.info("live poller skip: manual live sync in progress")
         return
     if _lock.locked():
         logger.debug("live poller skip: previous tick still running")
