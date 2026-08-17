@@ -342,45 +342,7 @@ cmd_fix() {
   cmd_stop
   ensure_deps || return 1
   PY="$(pick_python)" || return 1
-  # fix 必须强制重启，避免沿用旧进程（错误 Python / sandbox 浏览器路径）
-  kill_port
-  sleep 1
-  if is_up; then
-    echo "端口 ${PORT} 仍被占用，强制清理..." >&2
-    kill_port
-    sleep 1
-  fi
-  # 直接启动（跳过“已在运行”短路）
-  echo "启动 Browser Gate → ${LOG}"
-  echo "Python: $PY"
-  echo "PLAYWRIGHT_BROWSERS_PATH=$PLAYWRIGHT_BROWSERS_PATH"
-  : >"$LOG"
-  nohup env -u PNPM_STORE_PATH -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy \
-    NO_PROXY='*' \
-    no_proxy='*' \
-    HOME="$HOME_DIR" \
-    PLAYWRIGHT_BROWSERS_PATH="$PLAYWRIGHT_BROWSERS_PATH" \
-    BREAKPAD_DUMP_LOCATION="$BREAKPAD_DUMP_LOCATION" \
-    BOOKMAKER_BROWSER_HEADLESS="${BOOKMAKER_BROWSER_HEADLESS:-0}" \
-    BOOKMAKER_MANUAL_VENUE="${BOOKMAKER_MANUAL_VENUE:-0}" \
-    INTERNAL_API_TOKEN="${INTERNAL_API_TOKEN:-}" \
-    GATE_HOST="${GATE_HOST:-0.0.0.0}" \
-    GATE_PORT="${PORT}" \
-    PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
-    "$PY" "$ROOT/scripts/browser_gate.py" >>"$LOG" 2>&1 &
-  echo $! >"$GATE_PID_FILE"
-  local ok=0
-  local i
-  for i in $(seq 1 30); do
-    sleep 0.4
-    if is_up; then ok=1; break; fi
-  done
-  if [[ "$ok" != "1" ]]; then
-    echo "启动失败，请查看日志: $LOG" >&2
-    tail -40 "$LOG" >&2 || true
-    return 1
-  fi
-  echo "Browser Gate 就绪: http://127.0.0.1:${PORT}"
+  start_once || return 1
   # 默认不启 watch：旧版 watch 在登录占事件循环时会误杀长连接。
   # 需要守护时显式: bash scripts/ensure_browser_gate.sh watch
   if [[ "${BROWSER_GATE_ENABLE_WATCH:-0}" == "1" ]]; then

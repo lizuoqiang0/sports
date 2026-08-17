@@ -121,8 +121,8 @@ if [[ -f .env ]]; then
   fi
 fi
 
-echo "==> 启动宿主机 Browser Gate（可见 Chromium）"
-BOOKMAKER_BROWSER_HEADLESS=0 bash scripts/ensure_browser_gate.sh fix
+echo "==> 启动宿主机 Browser Gate（可见 Chromium + 守护）"
+BOOKMAKER_BROWSER_HEADLESS=0 bash scripts/ensure_browser_gate.sh watch
 echo "==> 等待 Browser Gate 健康..."
 for i in $(seq 1 90); do
   if curl -fsS --noproxy '*' "http://127.0.0.1:${BROWSER_GATE_PORT:-9277}/health" 2>/dev/null | grep -q '"runtime":"host"'; then
