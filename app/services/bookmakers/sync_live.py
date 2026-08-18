@@ -149,6 +149,8 @@ async def sync_live_scores_odds(
                 continue
             # 无 DB 会话占用期间调用 Gate
             remote_matches = await fetch_live()
+            new_token = getattr(connector, "session_token", None)
+            profile = getattr(connector, "_profile", None)
             bal_val = None
             if refresh_balance:
                 try:
@@ -180,6 +182,12 @@ async def sync_live_scores_odds(
                 acc = await wdb.get(BookmakerAccount, acc_id)
                 if acc is None:
                     continue
+                if new_token and new_token != job["session_token"]:
+                    from app.core.crypto import encrypt_secret
+
+                    acc.session_token_encrypted = encrypt_secret(new_token)
+                if isinstance(profile, dict) and profile:
+                    acc.profile_json = profile
                 if bal_val is not None:
                     acc.balance = bal_val
 

@@ -508,11 +508,18 @@ async def interactive_site_login(
         existing = site_sessions.find(base_url=base_url, site_code=site_code)
         if existing and existing.page and not existing.page.is_closed():
             reuse_ok = True
+            if site_code == "pinnacle":
+                try:
+                    from app.services.bookmakers.plugins.pinnacle.venue import pinnacle_session_expired
+
+                    reuse_ok = not await pinnacle_session_expired(existing.page)
+                except Exception:
+                    reuse_ok = False
             if _needs_manual(site_code):
                 try:
                     from app.services.bookmakers.venue_entry import is_in_sportsbook
 
-                    reuse_ok = await is_in_sportsbook(existing.page)
+                    reuse_ok = reuse_ok and await is_in_sportsbook(existing.page)
                 except Exception:
                     reuse_ok = False
             if reuse_ok:

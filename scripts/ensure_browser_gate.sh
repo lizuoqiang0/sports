@@ -147,6 +147,7 @@ start_once() {
   echo "Python: $PY"
   kill_port
   : >"$LOG"
+  # 独立 session：终端/编排脚本退出时不能连带杀掉常驻 Gate。
   nohup env -u PNPM_STORE_PATH -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy \
     NO_PROXY='*' \
     no_proxy='*' \
@@ -159,7 +160,8 @@ start_once() {
     GATE_HOST="${GATE_HOST:-0.0.0.0}" \
     GATE_PORT="${PORT}" \
     PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
-    "$PY" "$ROOT/scripts/browser_gate.py" >>"$LOG" 2>&1 &
+    "$PY" -c 'import os, runpy, sys; os.setsid(); runpy.run_path(sys.argv[1], run_name="__main__")' \
+    "$ROOT/scripts/browser_gate.py" >>"$LOG" 2>&1 &
   echo $! >"$GATE_PID_FILE"
   local i
   for i in $(seq 1 30); do

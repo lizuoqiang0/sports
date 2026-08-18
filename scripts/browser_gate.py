@@ -260,6 +260,10 @@ async def _lifespan(_app: FastAPI):
     finally:
         if _refresh_task and not _refresh_task.done():
             _refresh_task.cancel()
+        try:
+            await site_sessions.close_all()
+        except Exception:
+            logger.debug("browser gate session cleanup skipped", exc_info=True)
         _refresh_task = None
 
 
@@ -473,11 +477,20 @@ async def login(req: LoginRequest):
         existing = site_sessions.find(base_url=req.base_url, site_code=site_code)
         if existing and existing.page and not existing.page.is_closed():
             can_reuse = True
+            if site_code == "pinnacle":
+                try:
+                    from app.services.bookmakers.plugins.pinnacle.venue import pinnacle_session_expired
+
+                    can_reuse = not await pinnacle_session_expired(existing.page)
+                    if not can_reuse:
+                        logger.warning("pinnacle session expired; reuse disabled and login will continue")
+                except Exception:
+                    can_reuse = False
             if site_code in ("ob", "pinnacle"):
                 try:
                     from app.services.bookmakers.venue_entry import is_in_sportsbook
 
-                    can_reuse = await is_in_sportsbook(existing.page)
+                    can_reuse = can_reuse and await is_in_sportsbook(existing.page)
                 except Exception:
                     can_reuse = False
             if can_reuse:
@@ -676,6 +689,23 @@ async def _run_odds_sync(req: OddsSyncRequest):
         return await asyncio.wait_for(factory(), timeout=remaining)
 
     try:
+        if site_code == "pinnacle":
+            try:
+                from app.services.bookmakers.plugins.pinnacle.venue import pinnacle_session_expired
+
+                current = site_sessions.find(base_url=req.base_url, site_code=site_code)
+                if current and await pinnacle_session_expired(current.page):
+                    logger.warning("pinnacle session expired during odds sync; requesting automatic re-login")
+                    return {
+                        "ok": False,
+                        "auth_expired": True,
+                        "message": "平博登录已失效，正在自动重新登录",
+                        "matches": [],
+                        "lane": lane.key,
+                    }
+            except Exception:
+                logger.debug("pinnacle session state check skipped", exc_info=True)
+
         async def _fetch_with_session(page):
             if lane.want_login() or lane.want_bet():
                 return []

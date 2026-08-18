@@ -4,6 +4,7 @@ from app.services.bookmakers.plugins.pinnacle.venue import (
     clear_pinnacle_maintenance,
     page_shows_maintenance,
     pinnacle_page_is_blank,
+    pinnacle_session_expired,
     recover_pinnacle_blank_page,
 )
 
@@ -38,6 +39,22 @@ def test_login_page_is_not_treated_as_blank():
     page = FakePage([{"ready": "complete", "textLength": 0, "hasVisibleControl": False}])
     page.url = "https://example.test/zh-cn/login"
     assert asyncio.run(pinnacle_page_is_blank(page)) is False
+
+
+def test_login_page_is_treated_as_expired_session():
+    page = FakePage([{"password": False, "loginSurface": False}])
+    page.url = "https://example.test/zh-cn/login"
+    assert asyncio.run(pinnacle_session_expired(page)) is True
+
+
+def test_visible_login_form_is_treated_as_expired_session():
+    page = FakePage([{"password": True, "loginSurface": True}])
+    assert asyncio.run(pinnacle_session_expired(page)) is True
+
+
+def test_live_page_is_not_treated_as_expired_session():
+    page = FakePage([{"password": False, "loginSurface": False}])
+    assert asyncio.run(pinnacle_session_expired(page)) is False
 
 
 def test_blank_page_reloads_until_recovered():

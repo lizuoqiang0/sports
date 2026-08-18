@@ -6,6 +6,44 @@ from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
+
+async def pinnacle_session_expired(page) -> bool:
+    """判断平博是否已回到登录态，避免把失效 cookie 当作有效长连接。"""
+    try:
+        if page is None or page.is_closed():
+            return False
+        page_url = (page.url or "").lower()
+    except Exception:
+        return False
+
+    if any(marker in page_url for marker in ("/login", "/signin", "/sign-in", "/verify", "/captcha")):
+        return True
+
+    try:
+        state = await page.evaluate(
+            """() => {
+              const visible = (el) => {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style.display !== 'none' && style.visibility !== 'hidden'
+                  && Number(style.opacity || 1) > 0 && rect.width > 1 && rect.height > 1;
+              };
+              const body = (document.body && document.body.innerText || '').replace(/\\s+/g, ' ').trim();
+              const password = [...document.querySelectorAll(
+                'input[type="password"], input[name*="password" i], input[autocomplete="current-password"]'
+              )].some(visible);
+              const loginText = /登录|登入|sign\\s*in|log\\s*in/i.test(body);
+              const credentialText = /密码|password|账号|帳號|用户名|用戶名|username|account/i.test(body);
+              const loggedOut = /退出|登出|logout|sign\\s*out/i.test(body);
+              return {password, loginSurface: password || (loginText && credentialText && !loggedOut)};
+            }"""
+        )
+    except Exception:
+        return False
+    return bool(isinstance(state, dict) and (state.get("password") or state.get("loginSurface")))
+
+
 def pinnacle_live_sport_urls(page_url: str = "", *, origin: str = "") -> list[str]:
     """平博足球/篮球滚球直达 URL（优先 /live，避免早盘 sports 列表）。"""
     base = (origin or "").rstrip("/")

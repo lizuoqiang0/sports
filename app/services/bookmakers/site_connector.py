@@ -330,6 +330,7 @@ class BrowserSiteConnector(BookmakerConnector):
         import asyncio
 
         data = None
+        recovered_login = False
         # 滚球：Gate 已会等车道；客户端少重试、短退避，避免空等堆叠
         max_attempts = 4 if live_only else 3
         for attempt in range(max_attempts):
@@ -344,6 +345,18 @@ class BrowserSiteConnector(BookmakerConnector):
             )
             if data is None:
                 return None
+            if data.get("auth_expired") and self.code == "pinnacle" and not recovered_login:
+                recovered_login = True
+                logger.warning("pinnacle session expired; starting automatic re-login before live sync")
+                login = await self._login_via_gate(force_new=False)
+                if not login or not login.ok:
+                    logger.warning(
+                        "pinnacle automatic re-login failed: %s",
+                        getattr(login, "message", "unknown error"),
+                    )
+                    return None
+                # _login_via_gate 已更新 session_token；下一轮会用新 cookie 快照重拉滚球。
+                continue
             if data.get("busy"):
                 logger.info(
                     "gate odds %s busy (attempt %s/%s): %s",
