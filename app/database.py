@@ -40,9 +40,13 @@ async def get_db() -> AsyncSession:
     async with AsyncSessionLocal() as session:
         try:
             yield session
-            await session.commit()
+            # 路由可在长时间浏览器/AI 操作前自行提交并释放事务。
+            # 此处仅提交仍在进行的事务，避免对已被连接池回收的连接重复 commit。
+            if session.in_transaction():
+                await session.commit()
         except Exception:
-            await session.rollback()
+            if session.in_transaction():
+                await session.rollback()
             raise
         finally:
             await session.close()

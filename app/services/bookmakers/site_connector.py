@@ -142,14 +142,12 @@ class BrowserSiteConnector(BookmakerConnector):
 
         manual = bool(self.extra.get("manual_venue")) or needs_manual_venue(self.code)
 
-        # 站点不可达但已有会话：自动模式下可软通过；手动进馆时仍要求可达
-        if self.session_token and not await self._probe_site(timeout=3.0) and not manual:
-            return VerifyResult(
-                ok=True,
-                message="已保存会话；站点暂时不可达，跳过浏览器登录（可稍后同步）",
-                balance=self._balance,
-                profile=self._profile or {"name": self.username},
-                session_token=self.session_token,
+        # HTTP 探测受站点风控、地区线路影响，不能据此把旧 token 判成登录成功。
+        # 后续 Browser Gate 会在真实浏览器上下文中校验会话并执行必要的登录恢复。
+        if self.session_token and not await self._probe_site(timeout=3.0):
+            logger.warning(
+                "site probe unavailable for %s; continue with Browser Gate session validation",
+                self.code,
             )
 
         if not self.username or not self.password:

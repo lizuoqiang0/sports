@@ -11,6 +11,7 @@ import gzip
 import json
 import logging
 import re
+import time
 from typing import Any, Optional
 from urllib.parse import parse_qs, urlparse
 
@@ -761,6 +762,7 @@ async def fetch_ybty_matches_odds(
             currentUrl: '',
             urls: [],
             tokens: [],
+            sportTokens: [],
             sessionIds: [],
             apiHosts: [],
           };
@@ -774,6 +776,12 @@ async def fetch_ybty_matches_odds(
               const u = new URL(String(val), location.href);
               if (u.origin && data.apiHosts.indexOf(u.origin) < 0) data.apiHosts.push(u.origin);
             } catch (e) {}
+          };
+          const pushSportToken = (val) => {
+            const s = String(val || '').trim();
+            if (s && !s.includes('http') && data.sportTokens.indexOf(s) < 0) {
+              data.sportTokens.push(s);
+            }
           };
           const scanValue = (val, depth = 0) => {
             if (val == null || depth > 5) return;
@@ -801,6 +809,9 @@ async def fetch_ybty_matches_odds(
                 if ((key.includes('token') || key === 'requestid' || key === 'requestId') && !String(v).includes('http')) {
                   push(data.tokens, v);
                 }
+                if (key.includes('requestid') || key.includes('sporttoken')) {
+                  pushSportToken(v);
+                }
                 if (key === 'sessionid' || key === 'sid') push(data.sessionIds, v);
                 if (key.includes('url') || key.includes('venue') || key.includes('launch') || key.includes('sport')) {
                   if (String(v).includes('token=')) push(data.urls, v);
@@ -825,6 +836,9 @@ async def fetch_ybty_matches_odds(
                 const low = key.toLowerCase();
                 if ((low.includes('token') || low === 'requestid') && val && !val.includes('http')) {
                   push(data.tokens, val);
+                }
+                if (low.includes('requestid') || low.includes('sporttoken')) {
+                  pushSportToken(val);
                 }
                 if (low === 'sessionid' && val) push(data.sessionIds, val);
                 scanValue(val, 0);
@@ -856,6 +870,7 @@ async def fetch_ybty_matches_odds(
         }"""
         urls: list[str] = []
         tokens: list[str] = []
+        sport_tokens: list[str] = []
         session_ids: list[str] = []
         api_hosts: list[str] = []
         targets: list[Any] = []
@@ -881,6 +896,8 @@ async def fetch_ybty_matches_odds(
                 _push_uniq(urls, u)
             for t in probe.get("tokens") or []:
                 _push_uniq(tokens, sanitize_token(str(t or "")))
+            for t in probe.get("sportTokens") or []:
+                _push_uniq(sport_tokens, sanitize_token(str(t or "")))
             for sid in probe.get("sessionIds") or []:
                 _push_uniq(session_ids, sid)
             for host in probe.get("apiHosts") or []:
@@ -910,12 +927,18 @@ async def fetch_ybty_matches_odds(
                 h5 = hu
             if st and not sport_token:
                 sport_token = st
+            if st:
+                _push_uniq(sport_tokens, st)
             if cu and not cuid:
                 cuid = cu
             if h5 and sport_token and cuid:
                 break
-        if not sport_token and tokens:
-            sport_token = tokens[0]
+        # requestId / sportToken 属于场馆 API；X-API-TOKEN 则通常只是综合站
+        # 登录令牌。优先前者，最后才以普通 token 兜底。
+        for token_candidate in tokens:
+            _push_uniq(sport_tokens, token_candidate)
+        if sport_tokens:
+            sport_token = sport_tokens[0]
         if not cuid:
             for sid in session_ids:
                 m = re.match(r"^(\d{15,22})", str(sid or ""))
@@ -935,6 +958,7 @@ async def fetch_ybty_matches_odds(
         return {
             "h5_url": h5,
             "sport_token": sport_token,
+            "sport_tokens": sport_tokens[:4],
             "cuid": cuid,
             "api_hosts": api_hosts,
             "targets": targets,
@@ -1031,6 +1055,28 @@ async def fetch_ybty_matches_odds(
             rows = _decode_matches_payloads(payloads)
             if rows:
                 return rows
+            # 仅记录接口状态和响应形状，帮助区分令牌失效、CORS 与无赛事；
+            # 不输出 requestId、cookie 或响应正文。
+            diagnostics: list[dict[str, Any]] = []
+            for payload in payloads or []:
+                if not isinstance(payload, dict):
+                    continue
+                entry = {
+                    "host": str(payload.get("host") or "")[:80],
+                    "path": str(payload.get("path") or "")[:48],
+                    "error": bool(payload.get("error")),
+                    "code": str(payload.get("code") or payload.get("status") or "")[:24],
+                    "has_data": payload.get("data") is not None,
+                }
+                if entry not in diagnostics:
+                    diagnostics.append(entry)
+                if len(diagnostics) >= 6:
+                    break
+            if diagnostics:
+                last = float(getattr(page, "_ob_matchespb_diag_at", 0.0) or 0.0)
+                if time.monotonic() - last >= 30.0:
+                    page._ob_matchespb_diag_at = time.monotonic()
+                    logger.info("OB matchesPB empty response diagnostics=%s", diagnostics)
         return []
 
     async def _run_on_page(page) -> list:
@@ -1040,10 +1086,52 @@ async def fetch_ybty_matches_odds(
             dismiss_h5_orient_tip,
         )
 
+        # 中心钱包壳页无法可靠跨域重放 matchesPB；当 H5 自己发出请求时，
+        # 直接捕获同源响应可避免 CORS/风控对接口重放的影响。
+        captured_match_payloads = getattr(page, "_ob_matchespb_captures", None)
+        if not isinstance(captured_match_payloads, list):
+            captured_match_payloads = []
+            page._ob_matchespb_captures = captured_match_payloads
+
+            async def _capture_matches_response(resp) -> None:
+                try:
+                    if "matchespb" not in (resp.url or "").lower():
+                        return
+                    payload = await resp.json()
+                    if isinstance(payload, dict):
+                        captured_match_payloads.append(payload)
+                        del captured_match_payloads[:-20]
+                except Exception:
+                    return
+
+            try:
+                page.on("response", _capture_matches_response)
+            except Exception:
+                pass
+        else:
+            captured_match_payloads.clear()
+
+        async def _activate_gateway_and_capture() -> list:
+            try:
+                from app.services.bookmakers.venue_entry import activate_ob_gateway_live
+
+                if not await activate_ob_gateway_live(page):
+                    return []
+                await page.wait_for_timeout(1600)
+                return _decode_matches_payloads(captured_match_payloads)
+            except Exception as e:
+                logger.debug("OB gateway live activation skipped: %s", e)
+                return []
+
         async def _try_fetch_current_ctx(*, log_label: str = "") -> list:
             nonlocal h5_url
             ctx = await _discover_runtime_ctx(page)
             st = str(ctx.get("sport_token") or "")
+            token_candidates = [
+                sanitize_token(str(item or ""))
+                for item in (ctx.get("sport_tokens") or [st])
+            ]
+            token_candidates = [item for item in token_candidates if item]
             cu = str(ctx.get("cuid") or "")
             hu = str(ctx.get("h5_url") or "")
             if hu:
@@ -1056,7 +1144,7 @@ async def fetch_ybty_matches_odds(
                         sess.venue_url = hu
                 except Exception:
                     pass
-            if not st:
+            if not token_candidates:
                 return []
             if log_label:
                 logger.info(
@@ -1069,13 +1157,25 @@ async def fetch_ybty_matches_odds(
                 await dismiss_h5_orient_tip(page)
             except Exception:
                 pass
-            return await _fetch_matches_pb(
-                page,
-                st,
-                cu,
-                api_hosts=list(ctx.get("api_hosts") or []),
-                eval_targets=list(ctx.get("targets") or [page]),
-            )
+            for candidate in token_candidates:
+                rows = await _fetch_matches_pb(
+                    page,
+                    candidate,
+                    cu,
+                    api_hosts=list(ctx.get("api_hosts") or []),
+                    eval_targets=list(ctx.get("targets") or [page]),
+                )
+                if rows:
+                    return rows
+            last = float(getattr(page, "_ob_matchespb_empty_at", 0.0) or 0.0)
+            if time.monotonic() - last >= 30.0:
+                page._ob_matchespb_empty_at = time.monotonic()
+                logger.info(
+                    "OB matchesPB returned no rows token_candidates=%d has_cuid=%s",
+                    len(token_candidates),
+                    bool(cu),
+                )
+            return []
 
         # 主站必须桌面视口，否则会落到 APP 下载页
         await apply_desktop_viewport(page)
@@ -1087,6 +1187,11 @@ async def fetch_ybty_matches_odds(
                 return rows
         except Exception as e:
             logger.debug("OB reuse current venue failed: %s", e)
+
+        rows = await _activate_gateway_and_capture()
+        if rows:
+            logger.info("OB odds captured %d rows after H5 live activation", len(rows))
+            return rows
 
         # 已有会话页：禁止 reload/乱跳；已在场馆则直接采数
         if not own_browser:

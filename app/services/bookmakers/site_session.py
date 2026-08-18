@@ -378,20 +378,28 @@ class SiteSessionManager:
             logger.debug("recover_after_page_close ignored", exc_info=True)
 
     async def _on_browser_disconnected(self, sess: KeptSiteSession) -> None:
-        """用户关闭浏览器：断开该站全部连接（会话 + Playwright）。"""
+        """浏览器关闭时只清理所属实例，绝不误伤刚替换的新会话。"""
         logger.warning(
-            "browser disconnected: key=%s site=%s — disconnect all for this site",
+            "browser disconnected: key=%s site=%s",
             sess.key,
             sess.site_code or "?",
         )
-        code = (sess.site_code or "").lower()
         async with self._lock:
-            # 同站所有会话一并摘除
+            current = self._sessions.get(sess.key)
+            # 旧 Chromium 的 disconnected 事件可能晚于新浏览器 adopt。此时
+            # key 已指向替代会话，旧回调必须完全忽略，不能清 token/通知后端。
+            if current is not None and current is not sess and current.browser is not sess.browser:
+                logger.info(
+                    "ignore stale browser disconnect key=%s old_site=%s new_site=%s",
+                    sess.key,
+                    sess.site_code or "?",
+                    current.site_code or "?",
+                )
+                return
+
             doomed: list[KeptSiteSession] = []
             for k, s in list(self._sessions.items()):
-                same = s is sess or s.browser is sess.browser
-                same_code = code and (s.site_code or "").lower() == code
-                if same or same_code:
+                if s is sess or s.browser is sess.browser:
                     doomed.append(self._sessions.pop(k))
         for s in doomed:
             # browser 已断：只 stop playwright，勿再 browser.close

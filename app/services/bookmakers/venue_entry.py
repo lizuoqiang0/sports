@@ -154,6 +154,10 @@ def _is_venue_url(url: str) -> bool:
         return False
     if re.search(r"[?&]enname=ybty\b", u) and "token=" not in u and "app-h5" not in u and "yewu" not in u:
         return False
+    # zlshelves 的 /#/home 只是 OB 场馆的导航壳；真正的盘口地址会带
+    # token 或进入具体业务路由。若把它当成 H5，后续会一直在分类页采空。
+    if "zlshelves" in u and re.search(r"/#/?(?:home)?/?(?:[?#].*)?$", u) and "token=" not in u:
+        return False
 
     # === 强特征 URL（命中即判定为场馆页）===
     # 真实 H5 / 业务域；禁止用 query 里的 enName=YBTY 冒充盘口
@@ -246,6 +250,29 @@ def _is_venue_url(url: str) -> bool:
     if re.search(r'[?&](?:sport|sports|game|inplay|live|venue|match|odds|fixture|event)=', u):
         return True
 
+    return False
+
+
+def is_ob_entry_shell_url(url: str) -> bool:
+    """OB 中心钱包入口壳，不是可拉取 matchesPB 的体育场馆页。"""
+    u = (url or "").lower()
+    path = urlparse(u).path.rstrip("/")
+    return (
+        path in ("/game/sport", "/game/sport/ob")
+        and not any(marker in u for marker in ("token=", "app-h5", "yewu", "zlshelves"))
+    )
+
+
+async def _ob_shell_has_real_venue_frame(page) -> bool:
+    """入口壳仅接受实际 H5 frame，不能依据分类导航文字放行。"""
+    try:
+        for frame in page.frames:
+            if frame == page.main_frame:
+                continue
+            if _is_venue_url(frame.url or ""):
+                return True
+    except Exception:
+        pass
     return False
 
 
@@ -398,6 +425,10 @@ async def page_looks_like_sportsbook(page) -> bool:
         url = page.url or ""
     except Exception:
         url = ""
+    # OB 入口页本身会渲染滚球分类和数量，通用文本规则会把它误认为盘口。
+    # 只有其 iframe 已打开真实 H5 时，才能判为可用场馆。
+    if is_ob_entry_shell_url(url):
+        return await _ob_shell_has_real_venue_frame(page)
     if _is_venue_url(url):
         return True
 
@@ -512,6 +543,47 @@ async def _click_first_text(page, texts: tuple[str, ...] | list[str], *, exact: 
             return True
         except Exception:
             continue
+    return False
+
+
+async def activate_ob_gateway_live(page) -> bool:
+    """在 OB 中心钱包嵌入的 H5 内激活滚球列表，不触碰盘口或下注控件。"""
+    try:
+        if page is None or page.is_closed() or not is_ob_entry_shell_url(page.url or ""):
+            return False
+    except Exception:
+        return False
+
+    # 入口壳页可能每轮同步都会出现；限制点击频率，避免反复刷新 H5 路由。
+    now = time.monotonic()
+    last = float(getattr(page, "_ob_gateway_live_click_at", 0.0) or 0.0)
+    if now - last < 20.0:
+        return False
+
+    for frame in getattr(page, "frames", []) or []:
+        if frame == getattr(page, "main_frame", None):
+            continue
+        try:
+            frame_url = (frame.url or "").lower()
+        except Exception:
+            frame_url = ""
+        if not any(marker in frame_url for marker in ("zlshelves", "app-h5", "yewu")):
+            continue
+        # 只选赛事导航入口。滚球优先，足球用于滚球入口藏在球类页的 H5 版本。
+        for label in ("滚球盘", "滚球", "Live", "足球"):
+            try:
+                loc = frame.get_by_text(label, exact=True).first
+                if await loc.count() == 0:
+                    loc = frame.get_by_text(label, exact=False).first
+                if await loc.count() == 0:
+                    continue
+                await loc.click(timeout=3000)
+                page._ob_gateway_live_click_at = now
+                await page.wait_for_timeout(1200)
+                logger.info("OB gateway H5 activated live entry label=%s", label)
+                return True
+            except Exception:
+                continue
     return False
 
 
@@ -793,6 +865,14 @@ async def page_already_on_live_board(page) -> bool:
         url = ""
     # 搜索/账户页绝不是滚球盘（下注后常停在 compact/search）
     if page_url_off_match_list(url):
+        return False
+    # OB 的 enName=YBTY 是赛事分类壳页，包含“滚球盘”等导航文字和数量，
+    # 但尚未展开任何实际比赛；不能因此跳过足球滚球入口。
+    if (
+        "/game/sport/ob" in url
+        and "enname=ybty" in url
+        and not any(marker in url for marker in ("token=", "app-h5", "yewu", "zlshelves"))
+    ):
         return False
     # 平博：侧栏也有「滚球盘」文案，早盘 /sports/soccer 会被误判；必须 URL 带 /live
     if "rowilong" in url or "pinnacle" in url or "/compact/sports/" in url:
@@ -1086,14 +1166,28 @@ async def _auto_click_into_venue(page, *, site_code: str, context=None) -> Any:
             await _click_first_text(active, entries, exact=False)
             await active.wait_for_timeout(1200)
 
-        # 新开页
+        # 新开页：只接管同源门户页或已识别的体育场馆页。某些门户点击时会
+        # 同时弹出推广/视频标签，不能因为它排在最后就把采盘会话切过去。
         ctx = context or getattr(active, "context", None)
         if ctx is not None:
             try:
                 pages = list(ctx.pages)
-                if pages:
-                    active = pages[-1]
-                    # 禁止 bring_to_front：平博/OB 可见窗会被抢到系统前台
+                current_url = active.url or ""
+                current_origin = urlparse(current_url).netloc.lower()
+                for candidate in reversed(pages):
+                    try:
+                        if candidate.is_closed():
+                            continue
+                        candidate_url = candidate.url or ""
+                    except Exception:
+                        continue
+                    candidate_origin = urlparse(candidate_url).netloc.lower()
+                    if _is_venue_url(candidate_url) or (
+                        current_origin and candidate_origin == current_origin
+                    ):
+                        active = candidate
+                        break
+                # 禁止 bring_to_front：平博/OB 可见窗会被抢到系统前台
             except Exception:
                 pass
 
@@ -1136,6 +1230,10 @@ async def enter_portal_venue(
 
     try:
         already = await page_looks_like_sportsbook(page) and not await page_looks_like_venue_lobby(page)
+        # 综合站首页会展示赛事、直播等营销文案，但并非可下注的 OB H5。
+        # OB 只有真实 H5/业务域或带 token 的场馆 URL 才可跳过进馆流程。
+        if code == "ob" and not _is_venue_url(cur):
+            already = False
         if not already and _is_venue_url(cur):
             already = True
     except Exception:
@@ -1219,6 +1317,11 @@ async def is_in_sportsbook(page) -> bool:
         url = ""
     if _is_dead_page_url(url):
         return False
+
+    # 中心钱包的 OB 入口页只有分类导航，必须确认 iframe 已加载真实 H5；
+    # 不能再让「足球 LIVE 125」之类的数量文案误导恢复和同步流程。
+    if is_ob_entry_shell_url(url):
+        return await _ob_shell_has_real_venue_frame(page)
 
     # 1) URL 强匹配（已增强的 _is_venue_url）
     if _is_venue_url(url):

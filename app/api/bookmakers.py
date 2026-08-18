@@ -414,6 +414,10 @@ async def verify_bookmakers_batch(
     if not codes:
         raise HTTPException(status_code=400, detail="没有可验证的站点（请先填写网址与账号）")
 
+    # 后续每个站点都在独立会话中执行，验证可能持续数分钟；不能让请求级
+    # 只读事务一直占着连接，否则 PostgreSQL 会在最终提交前关闭它。
+    await db.commit()
+
     async def _one(code: str) -> dict:
         async with AsyncSessionLocal() as session:
             try:

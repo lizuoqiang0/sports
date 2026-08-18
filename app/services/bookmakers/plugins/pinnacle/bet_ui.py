@@ -1150,28 +1150,22 @@ async def ui_place_pinnacle_total(
             if not isinstance(v, dict):
                 continue
             got = v.get("got")
-            # 最低投注额处理：stake 低于站点最低额会被拒单
-            # （实测弹「您的投注不能低于最低投注金额」），自动上调到最低额
+            # 金额是调用方明确授权的上限。站点最低额高于请求金额时必须拒绝，
+            # 绝不能把 10 元测试单静默抬高到 30 元后继续提交。
             min_stake_site = v.get("minStake")
             if (
                 min_stake_site
                 and min_stake_site == min_stake_site
                 and float(min_stake_site) > float(stake)
-                and float(min_stake_site) <= 30.0  # 上调上限，防误读大数
             ):
-                new_stake = float(min_stake_site)
-                logger.info(
-                    "pinnacle stake below site minimum (%s < %s), raising to minimum",
-                    stake, new_stake,
+                reason = "site_minimum_exceeds_requested"
+                logger.warning(
+                    "pinnacle bet abort %s requested=%s minimum=%s",
+                    reason,
+                    stake,
+                    min_stake_site,
                 )
-                try:
-                    data = await asyncio.wait_for(fr.evaluate(fill_js, new_stake), timeout=5.0)
-                    if isinstance(data, dict) and data.get("ok"):
-                        # 纯 evaluate 重填：不再键盘输入（number 框追加风险）
-                        stake = new_stake
-                        fill_detail = f"filled:{new_stake}:raised_from_min"
-                except Exception:
-                    pass
+                return False, reason
             if got == got and abs(float(got) - float(stake)) > max(0.2, float(stake) * 0.3):
                 logger.warning("pinnacle stake mismatch want=%s got=%s, refill", stake, got)
                 try:
