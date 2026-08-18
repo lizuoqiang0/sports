@@ -71,6 +71,40 @@ def _is_junk_team_name(name: str) -> bool:
         "2H",
         "HT",
         "FT",
+        # OB/平博 市场类型标签（不是队名）
+        "全场独赢",
+        "全场让球",
+        "全场大小",
+        "半场独赢",
+        "半场让球",
+        "半场大小",
+        "让球&大小",
+        "让分&大小",
+        "角球",
+        "波胆",
+        "球队总得分",
+        "上半场",
+        "下半场",
+        "独赢/让球胜平负/双重机会",
+        "双重机会",
+        "让球盘",
+        "大小盘",
+        "输赢",
+        "冠军",
+        "罚牌",
+        "进球单/双",
+        "进球区间",
+        "下一/最后进球",
+        "15分钟",
+        "半/全场",
+        "净胜球",
+        # 电子竞技分类
+        "英雄联盟",
+        "Dota2",
+        "王者荣耀",
+        "CS2",
+        "无畏契约",
+        "电子足球",
     }:
         return True
     return False
@@ -286,6 +320,10 @@ async def scrape_dom_matches(page, *, site_code: str, live_only: bool = False, l
 
                 // 队名：平博紧凑盘优先「比分 节次 分钟' 主‎客‎」；其次「主 比分 客」/「A vs B」
                 const junkName = /投注|结算|联赛|赛事|滚球|今日|串关|登录|公告|网址|界面|耐心|禁用|输赢|偏好|连接到|感谢|亚洲|电子竞技|待结算|最受欢迎|最爱|上限|网球|排球|电竞|球队总得分|^今天$|^未开始$|^即将开始$|^vs$|^(?:挪威|瑞典|丹麦|芬兰)$|^(?:[12]H|HT|FT|OT|ET|Q[1-4]|PEN|AH)$/i;
+                // OB/平博 市场类型标签
+                const marketLabel = /让球&大小|让分&大小|角球|波胆|全场独赢|全场让球|全场大小|半场独赢|半场让球|半场大小|冠军|罚牌|进球单|进球区间|下一.*进球|15分钟|半\/全场|净胜球|英雄联盟|Dota2?|王者荣耀|CS2|无畏契约|电子足球|让球盘|大小盘|双重机会|上半场|下半场|中场|加时/i;
+                // H5 分类导航行（如 "足球 LIVE 297 让球&大小 220"）
+                const isNavRow = (raw) => /^(足球|篮球|电子竞技|电子足球|网球|排球)\s+LIVE\s+\d+/i.test(raw || '');
                 let home = '';
                 let away = '';
                 // 平博：0-0  2H  13'  主队‎ 客队‎
@@ -306,12 +344,13 @@ async def scrape_dom_matches(page, *, site_code: str, live_only: bool = False, l
                   home = (vsHit[1] || '').trim();
                   away = (vsHit[2] || '').trim();
                 }
-                if (!home || !away || junkName.test(home) || junkName.test(away)) {
+                if (!home || !away || junkName.test(home) || junkName.test(away) || marketLabel.test(home || '') || marketLabel.test(away || '')) {
                   const names = parts.filter((p) =>
                     p.length >= 2 && p.length <= 30
                     && !isOdds(p) && !scoreRe.test(p) && !periodTok.test(p)
                     && !/^(LIVE|滚球|独赢|让分|大小|主|客|大|小|平|今日|串关|体育|足球|篮球|比赛|感|今天|网球|排球|早盘|过关|未开始|即将开始|vs)$/i.test(p)
                     && !junkName.test(p)
+                    && !marketLabel.test(p)
                     && !/^第.+节$/.test(p) && !/^\\d+['′分]?$/.test(p)
                     && !/^\\d{1,2}:\\d{2}$/.test(p)
                     && !/^周日|^周[一二三四五六]/.test(p)
@@ -323,10 +362,19 @@ async def scrape_dom_matches(page, *, site_code: str, live_only: bool = False, l
                 }
                 if (home === away) continue;
                 if (junkName.test(home) || junkName.test(away)) continue;
+                // 丢弃市场标签和分类导航行
+                if (marketLabel.test(home) || marketLabel.test(away)) continue;
+                if (isNavRow(t)) continue;
 
                 const period = (parts.find((p) => /第.+[节半场]|上半场|下半场|中场|加时|HT|FT|Q[1-4]|进行中/i.test(p)) || '');
                 // 平博滚球常用 67' / 67′；也认 mm:ss
-                const clock = (parts.find((p) => /^\\d{1,3}:\\d{2}$/.test(p) || /^\\d{1,3}['′]$/.test(p)) || '');
+                // 排除比分（如 87:48 是比分不是时间）
+                const scoreStr = hs + ':' + as_;
+                const clock = (parts.find((p) =>
+                  p !== scoreStr
+                  && /^\\d{1,3}:\\d{2}$/.test(p)
+                  && !(Number(p.split(':')[0]) === hs && Number(p.split(':')[1]) === as_)
+                ) || parts.find((p) => /^\\d{1,3}['′]$/.test(p)) || '');
                 const onLiveUrl = /\\/live(?:\\/|$|\\?)|in-play|inplay/i.test(String(location.href || ''));
                 const clockLive = (() => {
                   const apostrophe = (clock || '').match(/^(\\d{1,3})['′]$/);
@@ -353,9 +401,11 @@ async def scrape_dom_matches(page, *, site_code: str, live_only: bool = False, l
                 const strongPeriod = /上半场|下半场|中场|加时|第.+[节半场]|Q[1-4]|1H|2H/i.test(period || '');
                 // 0-0 弱「进行中」+ mm:ss 易把开球墙钟当滚球；需强节次/角标/比分/撇号钟
                 const apostropheClock = /^\\d{1,3}['′]$/.test(clock || '');
+                // 有队名+赔率模式的行也视为滚球（滚球盘页面可能不显示 LIVE 标记）
+                const hasOddsPattern = /(?:小|Under|U)\\s*[0-9]/i.test(t) && home && away && !scheduledEarly;
                 const live = !scheduledEarly && (
                   strongPeriod || liveBadge || scoreLive || apostropheClock ||
-                  (clockLive && (hs > 0 || as_ > 0))
+                  (clockLive && (hs > 0 || as_ > 0)) || hasOddsPattern
                 );
 
                 // 全场小球：从行文本抽盘口线与小球赔率。
@@ -364,7 +414,7 @@ async def scrape_dom_matches(page, *, site_code: str, live_only: bool = False, l
                 if (ou) {
                   const ln = Number(ou[1]);
                   const a = Number(ou[2]);
-                  if (Number.isFinite(ln) && a > 1) {
+                  if (Number.isFinite(ln) && a >= 1.1 && a <= 10) {
                     total_line = ln;
                     under = a;
                   }
@@ -377,8 +427,11 @@ async def scrape_dom_matches(page, *, site_code: str, live_only: bool = False, l
                     )
                   );
                   if (lineHit != null && odds.length >= 1) {
-                    total_line = lineHit;
-                    under = odds[odds.length - 1];
+                    const lastOdd = odds[odds.length - 1];
+                    if (lastOdd >= 1.1 && lastOdd <= 10) {
+                      total_line = lineHit;
+                      under = lastOdd;
+                    }
                   }
                 }
 
@@ -500,6 +553,17 @@ async def scrape_dom_matches(page, *, site_code: str, live_only: bool = False, l
         hs = int(item.get("home_score") or 0)
         aws = int(item.get("away_score") or 0)
         raw_txt = str(item.get("raw") or "")
+        # clock 等于比分时清除（DOM 刮取误把比分当时间）
+        if clock and hs > 0 and clock == f"{hs}:{aws}":
+            clock = ""
+        elif clock and hs == 0 and aws == 0:
+            # 比分为 0:0 时也检查 clock 是否为 "0:0"
+            if clock == "0:0":
+                clock = ""
+        # 丢弃 H5 分类导航行（如 "足球 LIVE 297 让球&大小 220 角球 55"）
+        if re.match(r"^(足球|篮球|电子竞技|电子足球|网球|排球)\s+LIVE\s+\d+", raw_txt):
+            drop["junk"] += 1
+            continue
         from app.services.bookmakers.match_live import is_actually_started, looks_like_kickoff_score
 
         if looks_like_kickoff_score(hs, aws) and not period:
@@ -569,6 +633,11 @@ async def scrape_dom_matches(page, *, site_code: str, live_only: bool = False, l
         ):
             drop["mismatch"] += 1
             continue
+        # 滚球盘回退：低比分 + 无篮球指标 -> 默认足球（滚球盘中足球占多数）
+        if sport is None and live_only:
+            if not looks_like_basketball_score(hs, aws):
+                sport = "football"
+                logger.debug("dom classify fallback: %s vs %s score=%d:%d -> football", home[:15], away[:15], hs, aws)
         if sport not in ("football", "basketball"):
             drop["sport"] += 1
             continue
@@ -631,7 +700,7 @@ async def scrape_dom_matches(page, *, site_code: str, live_only: bool = False, l
                     total_line = tot.get("line")
         # 线缺失（None）时跳过该 total 盘：用 0 占位会一路写进 Odds.total，
         # 结算端只能退本金兜底 —— 源头不产毒
-        if under_v and under_v > 1 and total_line:
+        if under_v and under_v >= 1.1 and under_v <= 10 and total_line:
             odds_list.append(
                 RemoteOdds(
                     bet_type="total",
@@ -707,7 +776,7 @@ async def fetch_venue_live_odds(
     统一入口：进场馆 → 切盘口 Tab → XHR 解析 → DOM 兜底。
     """
     from app.services.bookmakers.site_session import site_sessions
-    from app.services.bookmakers.venue_entry import activate_sportsbook_tabs, enter_portal_venue
+    from app.services.bookmakers.venue_entry import activate_sportsbook_tabs
 
     profile = get_site_profile(site_code)
     hints = tuple(profile.get("odds_url_hints") or ())
@@ -756,15 +825,14 @@ async def fetch_venue_live_odds(
     base = (base_url or "").rstrip("/")
     dom_forced: list[RemoteMatch] = []
     try:
-        from app.services.bookmakers.site_profiles import needs_manual_venue
         from app.services.bookmakers.venue_entry import (
             is_in_sportsbook as _in_book_now,
             page_is_off_match_list,
-            recover_pinnacle_live_list,
         )
 
         code0 = (site_code or "").lower()
-        # 平博：搜索页 / 早盘 sports 列表都先拉回滚球盘，再采（live_only 必做）
+        # 平博后台采盘不得改变用户页面。登录流程只进入一次体育页；之后
+        # 即便处于搜索/详情/空盘，也只就地采集或本轮返回空结果。
         if code0 == "pinnacle":
             try:
                 from app.services.bookmakers.venue_entry import page_already_on_live_board as _on_live
@@ -773,14 +841,18 @@ async def fetch_venue_live_odds(
                 if not need_recover and live_only:
                     need_recover = not await _on_live(page)
                 if need_recover:
-                    await recover_pinnacle_live_list(page)
+                    logger.info(
+                        "pinnacle live scrape stays on current page url=%s",
+                        (getattr(page, "url", "") or "")[:120],
+                    )
             except Exception as e:
-                logger.warning("pinnacle pre-recover failed: %s", e)
+                logger.warning("pinnacle current-page check failed: %s", e)
 
         # OB 人工进馆站：禁止自动乱点（易点错回首页）；已在盘口则跳过
         already_in = False
         try:
             already_in = await _in_book_now(page)
+            logger.info("venue live %s: already_in=%s", site_code, already_in)
             # 网关入口页（/game/sport/ob）只是 iframe 壳，不是真正的场馆 H5，
             # 必须导航进 H5 才能采盘（否则 matchesPB API 无 token）。
             if already_in and code0 == "ob":
@@ -801,61 +873,57 @@ async def fetch_venue_live_odds(
                     pass
         except Exception:
             already_in = False
-        if not already_in and not needs_manual_venue(site_code):
-            active, _ = await enter_portal_venue(
-                page,
-                site_code=site_code,
-                base_url=base,
-                context=getattr(page, "context", None),
-                timeout_ms=8000,
-                force=False,
-                wait_manual=False,
+        if not already_in and code0 == "pinnacle":
+            logger.warning("venue live skip pinnacle: current page is not sportsbook")
+            return []
+        active = page
+        if not already_in:
+            logger.info(
+                "venue live %s: stay on current page (manual venue required)",
+                site_code,
             )
-        else:
-            active = page
-            if not already_in and needs_manual_venue(site_code):
-                logger.info(
-                    "venue live %s: skip auto-click (manual venue); stay on current page",
-                    site_code,
-                )
-        from app.services.bookmakers.venue_entry import is_in_sportsbook, _is_venue_url
+        from app.services.bookmakers.venue_entry import is_in_sportsbook
 
         if not await is_in_sportsbook(active):
-            # 手动场馆站禁止 goto 旧 venue_url（易触发系统错误/回首页）
-            if not needs_manual_venue(site_code):
-                dest = ""
+            # OB 网关壳页：H5 iframe 在 /#/home 时 is_in_sportsbook 返回 False，
+            # 但点击「滚球盘」后 DOM 可采到盘口。跳过拦截直接走 DOM 兜底。
+            if code0 == "ob":
+                # 页面偏离场馆时导航回 /game/sport/ob?enName=YBTY
                 try:
-                    sess = site_sessions.get(base)
-                    if sess:
-                        dest = str(sess.venue_url or "").strip()
+                    _cur = (active.url or "").lower()
+                    if "/game/sport/ob" not in _cur:
+                        _venue = f"{base}/game/sport/ob?enName=YBTY"
+                        logger.info("venue live ob: navigate to venue %s", _venue)
+                        await active.goto(_venue, wait_until="domcontentloaded", timeout=45000)
+                        await active.wait_for_timeout(3500)
+                except Exception as e:
+                    logger.warning("venue live ob navigate failed: %s", e)
+                # 关闭「您当前操作将会离开游戏，是否继续？」弹窗（点取消留在场馆）
+                try:
+                    from app.services.bookmakers.venue_entry import dismiss_blocking_modals
+                    await dismiss_blocking_modals(active)
+                    for fr in getattr(active, "frames", []) or []:
+                        if fr != getattr(active, "main_frame", None):
+                            await dismiss_blocking_modals(fr)
                 except Exception:
-                    dest = ""
-                if dest and _is_venue_url(dest):
-                    try:
-                        logger.info("venue live %s: restore venue_url for live data", site_code)
-                        await active.goto(dest, wait_until="domcontentloaded", timeout=45000)
-                        await active.wait_for_timeout(1200)
-                    except Exception as e:
-                        logger.warning("venue live restore failed: %s", e)
-            if not await is_in_sportsbook(active):
-                if code0 == "pinnacle":
-                    try:
-                        if await recover_pinnacle_live_list(active) and await is_in_sportsbook(active):
-                            logger.info("venue live pinnacle: recovered into sportsbook")
-                        else:
-                            logger.warning(
-                                "venue live skip pinnacle: not in sportsbook after recover"
-                            )
-                            return []
-                    except Exception as e:
-                        logger.warning("venue live pinnacle recover failed: %s", e)
-                        return []
-                else:
-                    logger.warning(
-                        "venue live skip %s: session not in sportsbook (manual entry required on verify)",
-                        site_code,
-                    )
-                    return []
+                    pass
+                # H5 iframe 默认在 /#/home，需点击「滚球盘」才能显示赔率
+                try:
+                    from app.services.bookmakers.venue_entry import activate_ob_gateway_live
+                    if await activate_ob_gateway_live(active):
+                        logger.info("venue live ob: activated 滚球盘 in H5 iframe")
+                        await active.wait_for_timeout(2000)
+                        # 点击滚球盘后可能再次弹出「离开游戏」，再次关闭
+                        try:
+                            await dismiss_blocking_modals(active)
+                            for fr in getattr(active, "frames", []) or []:
+                                if fr != getattr(active, "main_frame", None):
+                                    await dismiss_blocking_modals(fr)
+                        except Exception:
+                            pass
+                except Exception as e:
+                    logger.debug("venue live ob: activate gateway live skipped: %s", e)
+                logger.info("venue live ob: skip is_in_sportsbook gate, try DOM scrape on gateway shell")
         if active is not page:
             try:
                 await site_sessions.update_page(base, active)
@@ -900,14 +968,23 @@ async def fetch_venue_live_odds(
         except Exception:
             stay_put = False
         # OB 已在场馆 H5（非大厅）也可静默采，避免乱点回综合站
-        if not stay_put and code in ("ob", "ybty", "kaiyun"):
+        if not stay_put and code in ("ob", "pinnacle", "ybty", "kaiyun"):
             try:
                 stay_put = await is_in_sportsbook(active)
             except Exception:
                 stay_put = False
+        # 平博：/compact/sports/soccer（无 /live）是早盘列表，不是滚球盘；
+        # is_in_sportsbook 对它返回 True 会误判，必须 URL 含 /live 才 stay_put
+        if code == "pinnacle" and stay_put:
+            try:
+                _purl = (active.url or "").lower()
+                if "/live" not in _purl and "in-play" not in _purl and "inplay" not in _purl:
+                    stay_put = False
+                    logger.info("venue live pinnacle: not on /live page, will recover url=%s", _purl[:120])
+            except Exception:
+                pass
         gentle = (
             stay_put
-            or needs_manual_venue(site_code)
             or code in ("ob", "pinnacle", "ybty", "kaiyun")
         )
         try:
@@ -931,6 +1008,9 @@ async def fetch_venue_live_odds(
             await dismiss_blocking_modals(active)
         soft_capture = stay_put or gentle
         await capture_venue_payloads(active, captured, wait_ms=wait_ms, soft=soft_capture)
+
+        # OB: 滚球盘已显示所有运动滚球，不需要额外导航
+        # （点击"足球"会跳到今日页，"滚球盘"已包含所有运动的滚球）
 
         # 分球类再采。平博：已在 /live 只刮当前页（SPA 自更新比分），禁止 goto/reload 白屏。
         # 偏离滚球时最多恢复到一个 live URL，不再每轮轮询足球+篮球双跳。

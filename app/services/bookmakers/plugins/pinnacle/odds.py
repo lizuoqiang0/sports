@@ -41,10 +41,24 @@ async ({ liveOnly, sportIds, origins }) => {
   for (const o of (origins || [])) push(o);
 
   const discovered = [];
+  // 从 SPA 最近请求中提取动态版本参数 g/v/lv/cl/ec
+  let dynParams = {};
   try {
-    for (const e of performance.getEntriesByType('resource')) {
+    const entries = performance.getEntriesByType('resource')
+      .filter(e => /sports-service\/sv\/compact\/events/i.test(e.name || ''))
+      .sort((a, b) => (b.startTime || 0) - (a.startTime || 0));
+    for (const e of entries) {
       const n = e.name || '';
-      if (/sports-service\\/sv\\/compact\\/events/i.test(n)) discovered.push(n.split('#')[0]);
+      discovered.push(n.split('#')[0]);
+      if (Object.keys(dynParams).length === 0) {
+        try {
+          const qs = new URL(n).searchParams;
+          for (const k of ['g', 'v', 'lv', 'cl', 'ec', 'pv']) {
+            const val = qs.get(k);
+            if (val !== null) dynParams[k] = val;
+          }
+        } catch (er) {}
+      }
     }
   } catch (e) {}
 
@@ -96,30 +110,32 @@ async ({ liveOnly, sportIds, origins }) => {
         'd=',
         'o=0',
         'l=' + lFilter,
-        'v=',
-        'lv=',
+        'v=' + (dynParams.v || ''),
+        'lv=' + (dynParams.lv || ''),
         'me=0',
         'more=false',
         'tm=0',
         'pa=0',
         'c=Others',
         'pn=-1',
-        'cl=-1',
+        'cl=' + (dynParams.cl || '-1'),
         'hle=true',
         'inl=false',
-        'pv=1',
+        'pv=' + (dynParams.pv || '1'),
         'ic=false',
         'ice=false',
         'withCredentials=true',
         'lang=zh_CN',
-      ].join('&');
-      const url = origin + '/sports-service/sv/compact/events?' + qs;
+      ];
+      if (dynParams.g) qs.push('g=' + dynParams.g);
+      if (dynParams.ec) qs.push('ec=' + dynParams.ec);
+      const url = origin + '/sports-service/sv/compact/events?' + qs.join('&');
       const j = await fetchJson(url);
       if (j) pushPayload(j);
     }
     if (payloads.length >= sportIds.length) break;
   }
-  return { n: payloads.length, origins: originsTry.slice(0, 3), payloads, debug: debug.slice(0, 8) };
+  return { n: payloads.length, origins: originsTry.slice(0, 3), payloads, debug: debug.slice(0, 8), dynParams };
 }
 """
 
@@ -604,4 +620,94 @@ async def fetch_pinnacle_live_odds(
         sorted(sports),
         live_only,
     )
+
+    # compact API 只返回单一球类时，用 dual-live 补另一球类
+    if rows and live_only and len(sports) == 1:
+        try:
+            import asyncio
+            from app.services.bookmakers.plugins.pinnacle.dual_live import (
+                scrape_other_live_sport,
+            )
+            sibling = await asyncio.wait_for(
+                scrape_other_live_sport(page, limit=limit),
+                timeout=30.0,
+            )
+            seen_ids = {m.external_id for m in rows}
+            added = 0
+            for m in sibling or []:
+                if m.external_id not in seen_ids:
+                    rows.append(m)
+                    seen_ids.add(m.external_id)
+                    added += 1
+            if added:
+                logger.info("pinnacle compact dual-live merged +%d (total=%d)", added, len(rows))
+        except asyncio.TimeoutError:
+            logger.warning("pinnacle compact dual-live timeout")
+        except Exception as e:
+            logger.warning("pinnacle compact dual-live failed: %s", e)
+
+    # API 全部失败时，用页面文本正则刮取滚球对阵+赔率
+    if not rows:
+        try:
+            from app.services.bookmakers.plugins.pinnacle.live_text import (
+                scrape_pinnacle_live_text,
+            )
+
+            _url_sport = ""
+            try:
+                _u = (page.url or "").lower()
+                if "basket" in _u:
+                    _url_sport = "basketball"
+                elif "soccer" in _u or "football" in _u:
+                    _url_sport = "football"
+            except Exception:
+                pass
+            text_rows = await scrape_pinnacle_live_text(
+                page, url_sport=_url_sport, limit=limit
+            )
+            if text_rows:
+                for tr in text_rows:
+                    if not isinstance(tr, dict):
+                        continue
+                    home = str(tr.get("home") or "").strip()
+                    away = str(tr.get("away") or "").strip()
+                    if not home or not away:
+                        continue
+                    odds_vals = tr.get("odds") or []
+                    under_val = tr.get("under")
+                    total_line = tr.get("total_line")
+                    odds_list = []
+                    if under_val and total_line:
+                        from app.services.bookmakers.base import RemoteOdds
+                        odds_list.append(RemoteOdds(
+                            bet_type="total",
+                            odds_data={"under": float(under_val)},
+                            total=float(total_line),
+                        ))
+                    if odds_list:
+                        sport = "basketball" if tr.get("sport_hint") == "basketball" else "football"
+                        ext = f"pinnacle:text:{home}:{away}"
+                        rows.append(RemoteMatch(
+                            external_id=ext,
+                            sport=sport,
+                            league=str(tr.get("league") or "")[:100],
+                            home_team=home[:100],
+                            away_team=away[:100],
+                            start_time="",
+                            status="live",
+                            venue="Pinnacle",
+                            odds_list=odds_list,
+                            home_score=int(tr.get("home_score") or 0),
+                            away_score=int(tr.get("away_score") or 0),
+                            clock=str(tr.get("clock") or "")[:32],
+                            period=str(tr.get("period") or "")[:64],
+                        ))
+                logger.info(
+                    "pinnacle live text scrape: rows=%d sport=%s",
+                    len(rows),
+                    _url_sport,
+                )
+        except Exception as e:
+            logger.warning("pinnacle live text scrape failed: %s", e)
+
     return rows

@@ -555,9 +555,10 @@ async def activate_ob_gateway_live(page) -> bool:
         return False
 
     # 入口壳页可能每轮同步都会出现；限制点击频率，避免反复刷新 H5 路由。
+    # 冷却 5s（原 20s 太长，H5 会在 20s 内恢复为概览页，导致后续轮次无比赛数据）
     now = time.monotonic()
     last = float(getattr(page, "_ob_gateway_live_click_at", 0.0) or 0.0)
-    if now - last < 20.0:
+    if now - last < 5.0:
         return False
 
     for frame in getattr(page, "frames", []) or []:
@@ -569,8 +570,8 @@ async def activate_ob_gateway_live(page) -> bool:
             frame_url = ""
         if not any(marker in frame_url for marker in ("zlshelves", "app-h5", "yewu")):
             continue
-        # 只选赛事导航入口。滚球优先，足球用于滚球入口藏在球类页的 H5 版本。
-        for label in ("滚球盘", "滚球", "Live", "足球"):
+        # 点击「滚球盘」激活滚球列表
+        for label in ("滚球盘", "滚球", "Live"):
             try:
                 loc = frame.get_by_text(label, exact=True).first
                 if await loc.count() == 0:
@@ -579,12 +580,88 @@ async def activate_ob_gateway_live(page) -> bool:
                     continue
                 await loc.click(timeout=3000)
                 page._ob_gateway_live_click_at = now
-                await page.wait_for_timeout(1200)
+                await page.wait_for_timeout(2000)
                 logger.info("OB gateway H5 activated live entry label=%s", label)
                 return True
             except Exception:
                 continue
     return False
+
+
+async def ensure_ob_football_live(page) -> bool:
+    """每轮调用：确保 H5 在足球滚球页面。无冷却，每轮都执行。
+
+    1. 找到 zlshelves H5 iframe
+    2. 检查当前是否已在足球滚球页（有 LIVE 标记的比赛行）
+    3. 如果不在，点击「足球」菜单 + 「滚球」tab
+    """
+    try:
+        for frame in getattr(page, "frames", []) or []:
+            if frame == getattr(page, "main_frame", None):
+                continue
+            frame_url = frame.url or ""
+            if not any(marker in frame_url for marker in ("zlshelves", "app-h5")):
+                continue
+
+            # 检查是否已在足球滚球页：看 DOM 中是否有 football 比赛行（非"今日"非概览）
+            try:
+                on_football_live = await frame.evaluate("""() => {
+                  const t = document.body?.innerText || '';
+                  // 有"今日 (足球)"说明在今日页，需要切到滚球
+                  if (t.includes('今日') && t.includes('足球') && !t.includes('滚球')) return false;
+                  // 有"滚球"标记且有比赛行（含比分/时间）说明已在滚球页
+                  if (t.includes('滚球') && /\d+['′]/.test(t)) return true;
+                  // 有 LIVE 标记且有队名（非概览页的 X LIVE Y 格式）
+                  const liveMatch = t.match(/(\S+)\s+\d+\s*[:-]\s*\d+\s+(\S+)/);
+                  if (liveMatch && !t.includes('选择联赛')) return true;
+                  return false;
+                }""")
+                if on_football_live:
+                    return True  # 已在足球滚球页，不需要点击
+            except Exception:
+                pass
+
+            # 不在足球滚球页，点击「足球」菜单项
+            try:
+                fb_loc = frame.locator("div.menu-item.menu-fold1").filter(
+                    has_text="足球"
+                ).filter(has_text="LIVE").filter(has_not_text="电子")
+                if await fb_loc.count() > 0:
+                    await fb_loc.first.click(timeout=3000, force=True)
+                    await page.wait_for_timeout(2000)
+                    logger.info("OB H5 ensure_football: clicked football menu")
+
+                    # 在足球页找"滚球"tab并点击（用 dispatchEvent 触发 Vue 事件）
+                    clicked_live = await frame.evaluate("""() => {
+                      // 找精确文本为"滚球"的元素（排除"滚球盘"）
+                      const els = document.querySelectorAll('a, button, span, div, li, [role=tab]');
+                      for (const el of els) {
+                        const t = (el.innerText || '').trim();
+                        if (t === '滚球') {
+                          const r = el.getBoundingClientRect();
+                          if (r.width > 0 && r.height > 0) {
+                            // 用 MouseEvent 模拟真实点击（Vue @click 能捕获）
+                            const ev = new MouseEvent('click', {bubbles: true, cancelable: true, view: window});
+                            el.dispatchEvent(ev);
+                            return true;
+                          }
+                        }
+                      }
+                      return false;
+                    }""")
+                    if clicked_live:
+                        await page.wait_for_timeout(2000)
+                        logger.info("OB H5 ensure_football: clicked 滚球 tab via dispatchEvent")
+                    return True
+                else:
+                    # 没有"足球 LIVE"菜单项，可能当前无足球滚球
+                    return False
+            except Exception as e:
+                logger.debug("OB H5 ensure_football failed: %s", e)
+                return False
+        return False
+    except Exception:
+        return False
 
 
 async def ensure_european_odds_display(page) -> bool:
@@ -703,7 +780,6 @@ async def dismiss_blocking_modals(page) -> None:
           return;
         }
         const body = String(m.innerText || '').slice(0, 160);
-        // 只处理明显公告/活动弹层；普通业务弹层不动
         // OB 遮盖弹窗：含「好的」按钮同样处理
         const hasHaoDe = (() => {
           const btns = m.querySelectorAll('button, a, span');
@@ -713,6 +789,20 @@ async def dismiss_blocking_modals(page) -> None:
           }
           return false;
         })();
+        // 「您当前操作将会离开游戏，是否继续？」弹窗：点「取消」留在场馆
+        const isLeaveGame = /离开游戏|是否继续|离开.*游戏/.test(body);
+        if (isLeaveGame) {
+          const btns = m.querySelectorAll('button, a, span, input[type="button"], input[type="submit"]');
+          for (const el of btns) {
+            const t = String(el.innerText || el.textContent || el.value || '').trim();
+            if (safeClose.some((x) => t === x) || t === '取消') {
+              try { el.click(); } catch (e) {}
+              break;
+            }
+          }
+          touched += 1;
+          return;
+        }
         if (!/公告|活动|优惠|欢迎|提示|消息|更新|维护|领取/.test(body) && !hasHaoDe) return;
         clickSafeClose(m);
         const nodes = m.querySelectorAll('button, a, span');
@@ -734,6 +824,37 @@ async def dismiss_blocking_modals(page) -> None:
     }"""
     try:
         await page.evaluate(dismiss_js)
+    except Exception:
+        pass
+    # 彻底移除「离开游戏」弹窗：清除 beforeunload 守卫 + 隐藏弹窗 DOM
+    try:
+        await page.evaluate("""() => {
+          // 1. 移除 beforeunload 守卫，防止导航时弹窗
+          window.onbeforeunload = null;
+          window.onpagehide = null;
+          // 2. 拦截后续的 beforeunload 注册
+          window.addEventListener = (function(orig) {
+            return function(type, listener, options) {
+              if (type === 'beforeunload' || type === 'pagehide') return;
+              return orig.call(this, type, listener, options);
+            };
+          })(window.addEventListener);
+          // 3. 隐藏含「离开游戏」的所有弹窗
+          const all = document.querySelectorAll('div, section, aside, .van-overlay, .van-dialog, .modal');
+          for (const el of all) {
+            const txt = String(el.innerText || '').slice(0, 200);
+            if (/离开游戏|是否继续/.test(txt)) {
+              el.style.setProperty('display', 'none', 'important');
+              el.style.setProperty('pointer-events', 'none', 'important');
+              // 也点取消
+              const btns = el.querySelectorAll('button, a, span');
+              for (const b of btns) {
+                const t = String(b.innerText || b.textContent || '').trim();
+                if (t === '取消') { try { b.click(); } catch (e) {} break; }
+              }
+            }
+          }
+        }""")
     except Exception:
         pass
     for fr in getattr(page, "frames", []) or []:
@@ -1238,6 +1359,25 @@ async def enter_portal_venue(
             already = True
     except Exception:
         already = False
+    if code == "pinnacle":
+        # 平博登录成功后只做一次确定性的体育页跳转。不要走通用的
+        # “足球→篮球→滚球→全部”点击序列，那个序列会触发多个 SPA 路由，
+        # 最终把页面带到错误状态。
+        if already:
+            logger.info("pinnacle already on sports page url=%s", (cur or "")[:160])
+            return page, cur
+        from app.services.bookmakers.plugins.pinnacle.venue import recover_pinnacle_live_list
+
+        ok = await recover_pinnacle_live_list(page)
+        try:
+            final_url = page.url or ""
+        except Exception:
+            final_url = ""
+        if ok:
+            logger.info("pinnacle entered sports page once url=%s", final_url[:160])
+        else:
+            logger.warning("pinnacle sports entry failed url=%s", final_url[:160])
+        return page, final_url
     if already:
         await dismiss_h5_orient_tip(page)
         try:
