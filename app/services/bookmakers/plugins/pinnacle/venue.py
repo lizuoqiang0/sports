@@ -29,19 +29,23 @@ async def pinnacle_session_expired(page) -> bool:
                 return style.display !== 'none' && style.visibility !== 'hidden'
                   && Number(style.opacity || 1) > 0 && rect.width > 1 && rect.height > 1;
               };
-              const body = (document.body && document.body.innerText || '').replace(/\\s+/g, ' ').trim();
               const password = [...document.querySelectorAll(
                 'input[type="password"], input[name*="password" i], input[autocomplete="current-password"]'
               )].some(visible);
-              const loginText = /登录|登入|sign\\s*in|log\\s*in/i.test(body);
-              const credentialText = /密码|password|账号|帳號|用户名|用戶名|username|account/i.test(body);
-              const loggedOut = /退出|登出|logout|sign\\s*out/i.test(body);
-              return {password, loginSurface: password || (loginText && credentialText && !loggedOut)};
+              const username = [...document.querySelectorAll(
+                'input[type="text"], input[type="email"], input[type="tel"], input:not([type])'
+              )].some((el) => {
+                if (!visible(el)) return false;
+                const hint = (el.name || '') + ' ' + (el.id || '') + ' ' + (el.placeholder || '');
+                return !/搜索|search|验证码|verify|captcha|code/i.test(hint);
+              });
+              // 盘口页也可能带有非登录密码控件；必须同时存在可见账号和密码输入才算退出。
+              return {password, username, loginSurface: password && username};
             }"""
         )
     except Exception:
         return False
-    return bool(isinstance(state, dict) and (state.get("password") or state.get("loginSurface")))
+    return bool(isinstance(state, dict) and state.get("loginSurface"))
 
 
 def pinnacle_live_sport_urls(page_url: str = "", *, origin: str = "") -> list[str]:

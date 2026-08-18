@@ -624,7 +624,11 @@ async def _run_odds_sync(req: OddsSyncRequest):
     site_code = (req.site_code or "ob").lower()
     token = sanitize_token(req.session_token)
     if not token:
-        return {"ok": False, "message": "缺少 session token", "matches": []}
+        # 平博主要依赖浏览器 Cookie，会话快照缺失时仍可安全复用已验证的
+        # 同站长连接采盘；没有活动页面时才拒绝，禁止静默创建匿名浏览器。
+        existing = site_sessions.find(base_url=req.base_url, site_code=site_code)
+        if not existing or not existing.page or existing.page.is_closed():
+            return {"ok": False, "message": "缺少 session token 或有效浏览器会话", "matches": []}
 
     lane = await _get_lane(req.base_url, site_code)
     if lane.want_login() or lane.want_bet():

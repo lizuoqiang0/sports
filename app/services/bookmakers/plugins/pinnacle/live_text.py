@@ -2,11 +2,23 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 _PLACEHOLDER_LEAGUES = frozenset({"足球滚球", "篮球滚球", "滚球", "足球", "篮球", "体育", "今日"})
+_LEAGUE_LIMIT_NOTICE_RE = re.compile(
+    r"[\s\u200e\u200f]*(?:您)?已达到(?:选择的)?比赛数量上限[\s\u200e\u200f]*\d*[\s\u200e\u200f]*场?[\s\u200e\u200f]*",
+    re.IGNORECASE,
+)
+
+
+def clean_pinnacle_league(value: Any) -> str:
+    """移除平博列表插入的收藏/选择数量提示，保留真实联赛名。"""
+    league = " ".join(str(value or "").split())
+    league = _LEAGUE_LIMIT_NOTICE_RE.sub(" ", league)
+    return league.strip(" -–—")[:80]
 
 
 async def scrape_pinnacle_live_text(page, *, url_sport: str = "", limit: int = 80) -> list[dict]:
@@ -64,6 +76,8 @@ async def scrape_pinnacle_live_text(page, *, url_sport: str = "", limit: int = 8
                 }
                 if (!m) return '';
                 let lg = String(m[1] || '').trim().replace(/^[\\-–—\\s]+|[\\-–—\\s]+$/g, '');
+                // 平博会把「您已达到选择的比赛数量上限200场」插在联赛标题后。
+                lg = lg.replace(/[\\s\\u200e\\u200f]*(?:您)?已达到(?:选择的)?比赛数量上限[\\s\\u200e\\u200f]*\\d*[\\s\\u200e\\u200f]*场?[\\s\\u200e\\u200f]*/g, ' ').trim();
                 if (lg.length < 2 || lg.length > 48) return '';
                 if (/^(足球|篮球|滚球|体育|今日|比赛)$/.test(lg)) return '';
                 // 拒绝「队A 队B 某某联赛」——若空格分段过多且前段不像地区前缀则截到联赛关键字起
@@ -97,6 +111,20 @@ async def scrape_pinnacle_live_text(page, *, url_sport: str = "", limit: int = 8
               };
               const oddsFrom = (ctx) => (String(ctx || '').match(/(?<![0-9])(\\d\\.\\d{2,3})(?![0-9])/g) || [])
                 .map(Number).filter((n) => n > 1 && n < 50);
+              const totalFrom = (ctx) => {
+                const text = String(ctx || '').replace(/[\\u200e\\u200f]/g, ' ');
+                const re = /(?:^|\\s)(\\d+(?:\\.\\d+)?(?:\\s*-\\s*\\d+(?:\\.\\d+)?)?)\\s+\\d\\.\\d{2,3}\\s*(?:小|Under)\\s*(\\d\\.\\d{2,3})/gi;
+                let hit, last = null;
+                while ((hit = re.exec(text))) last = hit;
+                if (!last) return null;
+                const parts = String(last[1]).split('-').map((x) => Number(String(x).trim()));
+                const numbers = parts.filter((x) => Number.isFinite(x));
+                const line = numbers.length ? numbers.reduce((a, b) => a + b, 0) / numbers.length : NaN;
+                const under = Number(last[2]);
+                return Number.isFinite(line) && line > 0 && Number.isFinite(under) && under > 1
+                  ? { line, under }
+                  : null;
+              };
 
               // 主通道：比分 + 节次 + 分钟' + 主队‎客队‎
               const rePin = /(\\d{1,3})\\s*[-:：]\\s*(\\d{1,3})\\s+(上半场|下半场|中场|加时|1H|2H|HT|Q[1-4]|第[一二三四1-4]\\s*节)\\s+(\\d{1,3})['′]\\s+([^\\u200e]{2,40})\\u200e\\s*([^\\u200e]{2,40})\\u200e?/g;
@@ -112,6 +140,7 @@ async def scrape_pinnacle_live_text(page, *, url_sport: str = "", limit: int = 8
                 if (/\\d{1,2}\\s*月\\s*\\d{4}|未开始|即将开始|,\\s*\\d{2}:\\d{2}:\\d{2}/.test(tail.slice(0, 40))) continue;
                 const odds = oddsFrom(tail);
                 if (odds.length < 2) continue;
+                const total = totalFrom(tail);
                 const isBb = hs >= 20 || as_ >= 20 || hs + as_ >= 40 || /Q[1-4]|第.+节/i.test(period);
                 if (sportHint === 'basketball' && !isBb) continue;
                 const league = leagueBefore(t, m.index) || '';
@@ -119,6 +148,8 @@ async def scrape_pinnacle_live_text(page, *, url_sport: str = "", limit: int = 8
                 pushRow({
                   league,
                   home, away, odds: odds.slice(0, 6),
+                  under: total && total.under,
+                  total_line: total && total.line,
                   home_score: hs, away_score: as_,
                   period: period || '进行中',
                   clock, live: true, sport_hint: isBb ? 'basketball' : 'football',
@@ -138,6 +169,7 @@ async def scrape_pinnacle_live_text(page, *, url_sport: str = "", limit: int = 8
                 if (!isName(home) || !isName(away) || home === away) continue;
                 const odds = oddsFrom(tFlat.slice(m.index + m[0].length, m.index + m[0].length + 80));
                 if (odds.length < 2) continue;
+                const total = totalFrom(tFlat.slice(m.index + m[0].length, m.index + m[0].length + 100));
                 const isBb = hs >= 20 || as_ >= 20 || hs + as_ >= 40 || /Q[1-4]|第.+节/i.test(period);
                 if (sportHint === 'basketball' && !isBb) continue;
                 const league = leagueBefore(tFlat, m.index) || '';
@@ -145,6 +177,8 @@ async def scrape_pinnacle_live_text(page, *, url_sport: str = "", limit: int = 8
                 pushRow({
                   league,
                   home, away, odds: odds.slice(0, 6),
+                  under: total && total.under,
+                  total_line: total && total.line,
                   home_score: hs, away_score: as_,
                   period: period || '进行中',
                   clock, live: true, sport_hint: isBb ? 'basketball' : 'football',
@@ -155,7 +189,17 @@ async def scrape_pinnacle_live_text(page, *, url_sport: str = "", limit: int = 8
             }""",
             url_sport or "",
         )
-        rows = list(rows or [])[:limit]
+        clean_rows = []
+        for row in list(rows or []):
+            if not isinstance(row, dict):
+                continue
+            normalized = dict(row)
+            normalized["league"] = clean_pinnacle_league(normalized.get("league"))
+            if normalized["league"]:
+                clean_rows.append(normalized)
+            if len(clean_rows) >= limit:
+                break
+        rows = clean_rows
         if rows:
             real_lg = sum(
                 1
