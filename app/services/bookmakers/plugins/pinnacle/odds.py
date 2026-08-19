@@ -41,24 +41,10 @@ async ({ liveOnly, sportIds, origins }) => {
   for (const o of (origins || [])) push(o);
 
   const discovered = [];
-  // 从 SPA 最近请求中提取动态版本参数 g/v/lv/cl/ec
-  let dynParams = {};
   try {
-    const entries = performance.getEntriesByType('resource')
-      .filter(e => /sports-service\/sv\/compact\/events/i.test(e.name || ''))
-      .sort((a, b) => (b.startTime || 0) - (a.startTime || 0));
-    for (const e of entries) {
+    for (const e of performance.getEntriesByType('resource')) {
       const n = e.name || '';
-      discovered.push(n.split('#')[0]);
-      if (Object.keys(dynParams).length === 0) {
-        try {
-          const qs = new URL(n).searchParams;
-          for (const k of ['g', 'v', 'lv', 'cl', 'ec', 'pv']) {
-            const val = qs.get(k);
-            if (val !== null) dynParams[k] = val;
-          }
-        } catch (er) {}
-      }
+      if (/sports-service\\/sv\\/compact\\/events/i.test(n)) discovered.push(n.split('#')[0]);
     }
   } catch (e) {}
 
@@ -110,32 +96,30 @@ async ({ liveOnly, sportIds, origins }) => {
         'd=',
         'o=0',
         'l=' + lFilter,
-        'v=' + (dynParams.v || ''),
-        'lv=' + (dynParams.lv || ''),
+        'v=',
+        'lv=',
         'me=0',
         'more=false',
         'tm=0',
         'pa=0',
         'c=Others',
         'pn=-1',
-        'cl=' + (dynParams.cl || '-1'),
+        'cl=-1',
         'hle=true',
         'inl=false',
-        'pv=' + (dynParams.pv || '1'),
+        'pv=1',
         'ic=false',
         'ice=false',
         'withCredentials=true',
         'lang=zh_CN',
-      ];
-      if (dynParams.g) qs.push('g=' + dynParams.g);
-      if (dynParams.ec) qs.push('ec=' + dynParams.ec);
-      const url = origin + '/sports-service/sv/compact/events?' + qs.join('&');
+      ].join('&');
+      const url = origin + '/sports-service/sv/compact/events?' + qs;
       const j = await fetchJson(url);
       if (j) pushPayload(j);
     }
     if (payloads.length >= sportIds.length) break;
   }
-  return { n: payloads.length, origins: originsTry.slice(0, 3), payloads, debug: debug.slice(0, 8), dynParams };
+  return { n: payloads.length, origins: originsTry.slice(0, 3), payloads, debug: debug.slice(0, 8) };
 }
 """
 
@@ -226,16 +210,18 @@ def _odds_from_period0(p0: list, *, mid: str, sport_id: int) -> list[RemoteOdds]
     # 大小
     tot_row = _pick_main_total(p0[1] if isinstance(p0[1], list) else [])
     if tot_row:
+        over = _as_float(tot_row[2])
         under = _as_float(tot_row[3])
         # points 优先数值位，其次展示串
         line = _as_float(tot_row[1]) if len(tot_row) > 1 else None
         if line is None:
             line = _as_float(tot_row[0])
-        if under and line is not None:
+        if over and under and line is not None:
             sel_id = str(tot_row[4] if len(tot_row) > 4 else "")
             od = RemoteOdds(
                 bet_type="total",
                 odds_data={
+                    "over": over,
                     "under": under,
                     "_site": {
                         "bet_type": "total",
@@ -244,6 +230,7 @@ def _odds_from_period0(p0: list, *, mid: str, sport_id: int) -> list[RemoteOdds]
                         "sport_id": str(sport_id),
                         "site_code": "pinnacle",
                         "selections": {
+                            "over": {"id": sel_id, "oid": sel_id, "price": over, "name": "over"},
                             "under": {"id": sel_id, "oid": sel_id, "price": under, "name": "under"},
                         },
                     },
@@ -287,6 +274,50 @@ def _odds_from_period0(p0: list, *, mid: str, sport_id: int) -> list[RemoteOdds]
                 },
             }
             out.append(RemoteOdds(bet_type="moneyline", odds_data=data))
+    return out
+
+
+def _half_totals_from_period(
+    pdata: list, *, mid: str, sport_id: int, period_key: str, half_bt: str, half_label: str
+) -> list[RemoteOdds]:
+    """从半场 period（"1"=上半场, "2"=下半场）提取大小球。
+
+    period 数据结构与 period0 类似：[spread, total, moneyline]。
+    仅提取 total（大小球），返回 RemoteOdds 列表。
+    允许只有 under（与 DOM 路径一致）。
+    """
+    out: list[RemoteOdds] = []
+    if not isinstance(pdata, list) or len(pdata) < 2:
+        return out
+    tot_block = pdata[1] if isinstance(pdata[1], list) else []
+    tot_row = _pick_main_total(tot_block)
+    if not tot_row:
+        return out
+    over = _as_float(tot_row[2])
+    under = _as_float(tot_row[3])
+    line = _as_float(tot_row[1]) if len(tot_row) > 1 else None
+    if line is None:
+        line = _as_float(tot_row[0])
+    if not under or line is None:
+        return out
+    sel_id = str(tot_row[4] if len(tot_row) > 4 else "")
+    od_data: dict[str, Any] = {"under": under}
+    if over:
+        od_data["over"] = over
+    od_data["_site"] = {
+        "bet_type": half_bt,
+        "line": float(line),
+        "mid": mid,
+        "sport_id": str(sport_id),
+        "site_code": "pinnacle",
+        "period": half_label,
+        "selections": {
+            "under": {"id": sel_id, "oid": sel_id, "price": under, "name": "under"},
+        },
+    }
+    if over:
+        od_data["_site"]["selections"]["over"] = {"id": sel_id, "oid": sel_id, "price": over, "name": "over"}
+    out.append(RemoteOdds(bet_type=half_bt, odds_data=od_data, total=float(line)))
     return out
 
 
@@ -378,6 +409,15 @@ def parse_compact_events(
                         mid=mid,
                         sport_id=sport_id,
                     )
+                    # 上下半场大小球
+                    for _pk, _bt, _lbl in (("1", "first_half_total", "上半场"),
+                                            ("2", "second_half_total", "下半场")):
+                        _pdata = periods.get(_pk) or periods.get(int(_pk))
+                        if _pdata and isinstance(_pdata, list):
+                            odds_list.extend(_half_totals_from_period(
+                                _pdata, mid=mid, sport_id=sport_id,
+                                period_key=_pk, half_bt=_bt, half_label=_lbl,
+                            ))
                     if not odds_list:
                         continue
 
@@ -620,94 +660,4 @@ async def fetch_pinnacle_live_odds(
         sorted(sports),
         live_only,
     )
-
-    # compact API 只返回单一球类时，用 dual-live 补另一球类
-    if rows and live_only and len(sports) == 1:
-        try:
-            import asyncio
-            from app.services.bookmakers.plugins.pinnacle.dual_live import (
-                scrape_other_live_sport,
-            )
-            sibling = await asyncio.wait_for(
-                scrape_other_live_sport(page, limit=limit),
-                timeout=30.0,
-            )
-            seen_ids = {m.external_id for m in rows}
-            added = 0
-            for m in sibling or []:
-                if m.external_id not in seen_ids:
-                    rows.append(m)
-                    seen_ids.add(m.external_id)
-                    added += 1
-            if added:
-                logger.info("pinnacle compact dual-live merged +%d (total=%d)", added, len(rows))
-        except asyncio.TimeoutError:
-            logger.warning("pinnacle compact dual-live timeout")
-        except Exception as e:
-            logger.warning("pinnacle compact dual-live failed: %s", e)
-
-    # API 全部失败时，用页面文本正则刮取滚球对阵+赔率
-    if not rows:
-        try:
-            from app.services.bookmakers.plugins.pinnacle.live_text import (
-                scrape_pinnacle_live_text,
-            )
-
-            _url_sport = ""
-            try:
-                _u = (page.url or "").lower()
-                if "basket" in _u:
-                    _url_sport = "basketball"
-                elif "soccer" in _u or "football" in _u:
-                    _url_sport = "football"
-            except Exception:
-                pass
-            text_rows = await scrape_pinnacle_live_text(
-                page, url_sport=_url_sport, limit=limit
-            )
-            if text_rows:
-                for tr in text_rows:
-                    if not isinstance(tr, dict):
-                        continue
-                    home = str(tr.get("home") or "").strip()
-                    away = str(tr.get("away") or "").strip()
-                    if not home or not away:
-                        continue
-                    odds_vals = tr.get("odds") or []
-                    under_val = tr.get("under")
-                    total_line = tr.get("total_line")
-                    odds_list = []
-                    if under_val and total_line:
-                        from app.services.bookmakers.base import RemoteOdds
-                        odds_list.append(RemoteOdds(
-                            bet_type="total",
-                            odds_data={"under": float(under_val)},
-                            total=float(total_line),
-                        ))
-                    if odds_list:
-                        sport = "basketball" if tr.get("sport_hint") == "basketball" else "football"
-                        ext = f"pinnacle:text:{home}:{away}"
-                        rows.append(RemoteMatch(
-                            external_id=ext,
-                            sport=sport,
-                            league=str(tr.get("league") or "")[:100],
-                            home_team=home[:100],
-                            away_team=away[:100],
-                            start_time="",
-                            status="live",
-                            venue="Pinnacle",
-                            odds_list=odds_list,
-                            home_score=int(tr.get("home_score") or 0),
-                            away_score=int(tr.get("away_score") or 0),
-                            clock=str(tr.get("clock") or "")[:32],
-                            period=str(tr.get("period") or "")[:64],
-                        ))
-                logger.info(
-                    "pinnacle live text scrape: rows=%d sport=%s",
-                    len(rows),
-                    _url_sport,
-                )
-        except Exception as e:
-            logger.warning("pinnacle live text scrape failed: %s", e)
-
     return rows

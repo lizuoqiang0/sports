@@ -144,3 +144,11 @@ def get_plugin(code: str) -> BookmakerPlugin:
 def list_plugins() -> list[BookmakerPlugin]:
     _ensure_plugins()
     return [_REGISTRY[k] for k in sorted(_REGISTRY)]
+
+
+def reload_plugins() -> None:
+    """供 browser_gate importlib.reload 后重置注册表。"""
+    global _LOADED, _REGISTRY
+    _LOADED = False
+    _REGISTRY = {}
+    _ensure_plugins()

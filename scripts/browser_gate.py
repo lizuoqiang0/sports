@@ -24,21 +24,6 @@ logging.basicConfig(
 logger = logging.getLogger("browser-gate")
 logging.getLogger("app.services.bookmakers").setLevel(logging.INFO)
 
-# 日志落盘：终端窗口关闭后历史诊断信息（row_not_found 等）不再丢失
-try:
-    from logging.handlers import RotatingFileHandler
-
-    _gate_log_dir = Path(__file__).resolve().parents[1] / "logs"
-    _gate_log_dir.mkdir(parents=True, exist_ok=True)
-    _fh = RotatingFileHandler(
-        _gate_log_dir / "gate.log", maxBytes=8 * 1024 * 1024, backupCount=3, encoding="utf-8"
-    )
-    _fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)-7s | %(name)s | %(message)s"))
-    logging.getLogger().addHandler(_fh)
-    logger.info("gate file log -> %s", _gate_log_dir / "gate.log")
-except Exception as _le:
-    logger.warning("gate file log disabled: %s", _le)
-
 # macOS 本机 / Linux 宿主机 / Docker 容器 统一缓存路径
 if sys.platform == "darwin":
     _stable_pw = os.path.expanduser("~/Library/Caches/ms-playwright")
@@ -88,17 +73,6 @@ _BET_CAPTURE_LOG = "/tmp/pinnacle_bet_capture.log"
 _bet_capture_hooked: set[int] = set()  # 已挂钩的 page hash，防重复
 
 
-async def _append_captured_response_body(resp) -> None:
-    """Playwright 的 Response.text 是协程，异步追加避免阻塞 response 回调。"""
-    try:
-        body = await resp.text()
-        if body:
-            with open(_BET_CAPTURE_LOG, "a", encoding="utf-8") as f:
-                f.write(f"  resp_body={body[:2000]}\n")
-    except Exception:
-        pass
-
-
 def _hook_pinnacle_bet_capture(page) -> None:
     """给平博长连接页挂全量 XHR 监听，捕获下单接口端点/payload/回执。
 
@@ -123,28 +97,19 @@ def _hook_pinnacle_bet_capture(page) -> None:
             if any(x in low for x in (".js", ".css", ".png", ".jpg", ".woff", "analytics", "beacon", "log")):
                 return
             body = req.post_data or ""
-            # 会员/下单类接口：连请求头一起记录（逆向鉴权头必需）
-            hdrs = ""
-            if any(x in low for x in ("member-betslip", "bet-placement", "member-service")):
-                try:
-                    h = req.headers
-                    keep = {k: v for k, v in (h or {}).items()
-                            if k.lower() not in ("cookie", "user-agent", "sec-ch-ua", "sec-fetch-site",
-                                                  "sec-fetch-mode", "sec-fetch-dest", "accept-encoding",
-                                                  "accept-language", "connection", "host", "content-length")}
-                    hdrs = "  req_headers=" + str(keep)[:800] + "\n"
-                except Exception:
-                    pass
             with open(_BET_CAPTURE_LOG, "a", encoding="utf-8") as f:
                 ts = __import__("time").strftime("%F %T")
                 f.write(f"\n[{ts}] POST {url}\n")
                 f.write(f"  status={resp.status}\n")
-                if hdrs:
-                    f.write(hdrs)
                 if body:
                     f.write(f"  req_body={body[:2000]}\n")
-                if hdrs and resp.status < 400:
-                    asyncio.create_task(_append_captured_response_body(resp))
+                try:
+                    # 同步读取响应体（小响应可接受）
+                    rb = resp.text()[:2000] if resp.status < 400 else ""
+                    if rb:
+                        f.write(f"  resp_body={rb}\n")
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -206,26 +171,6 @@ async def _keep_sessions_refresh_loop() -> None:
                             in_book = await is_in_sportsbook(sess.page)
                         except Exception:
                             in_book = False
-                        # 维护横幅自动恢复：整页刷新即清除（实测）。
-                        # 仅检测到横幅才刷新，不破坏 keep-alive 的「无重载」原则
-                        if code == "pinnacle":
-                            try:
-                                from app.services.bookmakers.plugins.pinnacle.venue import (
-                                    clear_pinnacle_maintenance,
-                                    recover_pinnacle_blank_page,
-                                )
-
-                                if not await recover_pinnacle_blank_page(sess.page):
-                                    logger.warning("keep-alive pinnacle page still blank")
-                                    continue
-                                if await clear_pinnacle_maintenance(sess.page):
-                                    try:
-                                        in_book = await is_in_sportsbook(sess.page)
-                                    except Exception:
-                                        pass
-                            except Exception as e:
-                                logger.warning("keep-alive pinnacle recovery failed: %s", e)
-                                continue
                         # 仅场馆内刷新余额；大厅/中心钱包不写入
                         if in_book:
                             bal, recognized = await _scrape_balance_from_page(
@@ -260,10 +205,6 @@ async def _lifespan(_app: FastAPI):
     finally:
         if _refresh_task and not _refresh_task.done():
             _refresh_task.cancel()
-        try:
-            await site_sessions.close_all()
-        except Exception:
-            logger.debug("browser gate session cleanup skipped", exc_info=True)
         _refresh_task = None
 
 
@@ -398,7 +339,7 @@ class BetPlaceRequest(BaseModel):
     selection: str
     odds: float
     stake: float
-    bet_type: str = "total"
+    bet_type: str = "moneyline"
     odds_data: dict = Field(default_factory=dict)
     headed: bool = False
     site_code: str = "ob"
@@ -477,20 +418,11 @@ async def login(req: LoginRequest):
         existing = site_sessions.find(base_url=req.base_url, site_code=site_code)
         if existing and existing.page and not existing.page.is_closed():
             can_reuse = True
-            if site_code == "pinnacle":
-                try:
-                    from app.services.bookmakers.plugins.pinnacle.venue import pinnacle_session_expired
-
-                    can_reuse = not await pinnacle_session_expired(existing.page)
-                    if not can_reuse:
-                        logger.warning("pinnacle session expired; reuse disabled and login will continue")
-                except Exception:
-                    can_reuse = False
             if site_code in ("ob", "pinnacle"):
                 try:
                     from app.services.bookmakers.venue_entry import is_in_sportsbook
 
-                    can_reuse = can_reuse and await is_in_sportsbook(existing.page)
+                    can_reuse = await is_in_sportsbook(existing.page)
                 except Exception:
                     can_reuse = False
             if can_reuse:
@@ -624,11 +556,7 @@ async def _run_odds_sync(req: OddsSyncRequest):
     site_code = (req.site_code or "ob").lower()
     token = sanitize_token(req.session_token)
     if not token:
-        # 平博主要依赖浏览器 Cookie，会话快照缺失时仍可安全复用已验证的
-        # 同站长连接采盘；没有活动页面时才拒绝，禁止静默创建匿名浏览器。
-        existing = site_sessions.find(base_url=req.base_url, site_code=site_code)
-        if not existing or not existing.page or existing.page.is_closed():
-            return {"ok": False, "message": "缺少 session token 或有效浏览器会话", "matches": []}
+        return {"ok": False, "message": "缺少 session token", "matches": []}
 
     lane = await _get_lane(req.base_url, site_code)
     if lane.want_login() or lane.want_bet():
@@ -681,35 +609,9 @@ async def _run_odds_sync(req: OddsSyncRequest):
     refreshed = False
     sess = None
     matches: list = []
-    # 整个请求共享预算。空结果恢复最多使用首轮剩余时间，不能每次再给 70 秒，
-    # 否则客户端已经超时，Gate 仍会长期占住本站车道。
+    # 双球类已加速/冷却后，滚球超时可收紧
     odds_timeout = 70.0 if req.live_only else 75.0
-    odds_deadline = time.monotonic() + odds_timeout
-
-    async def _within_odds_budget(factory):
-        remaining = odds_deadline - time.monotonic()
-        if remaining <= 0:
-            raise asyncio.TimeoutError
-        return await asyncio.wait_for(factory(), timeout=remaining)
-
     try:
-        if site_code == "pinnacle":
-            try:
-                from app.services.bookmakers.plugins.pinnacle.venue import pinnacle_session_expired
-
-                current = site_sessions.find(base_url=req.base_url, site_code=site_code)
-                if current and await pinnacle_session_expired(current.page):
-                    logger.warning("pinnacle session expired during odds sync; requesting automatic re-login")
-                    return {
-                        "ok": False,
-                        "auth_expired": True,
-                        "message": "平博登录已失效，正在自动重新登录",
-                        "matches": [],
-                        "lane": lane.key,
-                    }
-            except Exception:
-                logger.debug("pinnacle session state check skipped", exc_info=True)
-
         async def _fetch_with_session(page):
             if lane.want_login() or lane.want_bet():
                 return []
@@ -748,13 +650,11 @@ async def _run_odds_sync(req: OddsSyncRequest):
                 "lane": lane.key,
             }
 
-        sess = await _within_odds_budget(
-            lambda: site_sessions.ensure_for_odds(
-                base_url=req.base_url,
-                session_token=token,
-                site_code=site_code,
-                venue_url=(req.venue_url or "").strip(),
-            )
+        sess = await site_sessions.ensure_for_odds(
+            base_url=req.base_url,
+            session_token=token,
+            site_code=site_code,
+            venue_url=(req.venue_url or "").strip(),
         )
         if lane.want_login() or lane.want_bet():
             return {
@@ -778,67 +678,59 @@ async def _run_odds_sync(req: OddsSyncRequest):
 
         if sess:
             # 软保活：已在盘口不 reload；掉线才恢复 venue（禁止 force 硬刷新闪烁）
-            refreshed = await _within_odds_budget(
-                lambda: site_sessions.refresh(req.base_url, force=False, site_code=site_code)
-            )
+            refreshed = await site_sessions.refresh(req.base_url, force=False, site_code=site_code)
 
         async def _fetch_and_yield():
             """采集包裹：等待期间若下单/登录到来，主动放弃让路。"""
             task = asyncio.create_task(_fetch_with_session(sess.page if sess else None))
-            try:
-                while True:
-                    done, _ = await asyncio.wait({task}, timeout=3.0)
-                    if done:
-                        return task.result()
-                    if lane.want_login() or lane.want_bet():
-                        raise asyncio.CancelledError("bet/login priority, odds-sync yield")
-            finally:
-                if not task.done():
+            while True:
+                done, _ = await asyncio.wait({task}, timeout=3.0)
+                if done:
+                    return task.result()
+                if lane.want_login() or lane.want_bet():
                     task.cancel()
-                    await asyncio.gather(task, return_exceptions=True)
+                    raise asyncio.CancelledError("bet/login priority, odds-sync yield")
 
-        matches = await _within_odds_budget(_fetch_and_yield)
+        matches = await asyncio.wait_for(
+            _fetch_and_yield(),
+            timeout=odds_timeout,
+        )
         # 手动场馆站：禁止 recreate（会毁掉已进盘口页并跳到大厅）
         from app.services.bookmakers.site_profiles import needs_manual_venue
 
         # 站点插件空结果恢复（平博回滚球）；无插件恢复则 recreate / soft 重试
         if (not matches) and sess:
             try:
-                recovered = await _within_odds_budget(
-                    lambda: get_plugin(site_code).after_empty_odds(sess.page)
-                )
-            except asyncio.TimeoutError:
-                raise
+                recovered = await get_plugin(site_code).after_empty_odds(sess.page)
             except Exception as e:
                 logger.warning("%s empty recover failed: %s", site_code, e)
                 recovered = False
             if recovered:
                 try:
-                    matches = await _within_odds_budget(
-                        lambda: _fetch_with_session(sess.page)
+                    matches = await asyncio.wait_for(
+                        _fetch_with_session(sess.page),
+                        timeout=odds_timeout,
                     )
-                except asyncio.TimeoutError:
-                    raise
                 except Exception as e:
                     logger.warning("%s re-fetch after recover failed: %s", site_code, e)
             elif not lane.want_login() and not lane.want_bet() and not needs_manual_venue(site_code):
-                sess = await _within_odds_budget(
-                    lambda: site_sessions.ensure_for_odds(
-                        base_url=req.base_url,
-                        session_token=token,
-                        recreate=True,
-                        site_code=site_code,
-                        venue_url=(req.venue_url or "").strip(),
-                    )
+                sess = await site_sessions.ensure_for_odds(
+                    base_url=req.base_url,
+                    session_token=token,
+                    recreate=True,
+                    site_code=site_code,
+                    venue_url=(req.venue_url or "").strip(),
                 )
                 if sess:
-                    refreshed = await _within_odds_budget(
-                        lambda: site_sessions.refresh(
+                    refreshed = (
+                        await site_sessions.refresh(
                             req.base_url, force=False, site_code=site_code
                         )
-                    ) or refreshed
-                matches = await _within_odds_budget(
-                    lambda: _fetch_with_session(sess.page if sess else None)
+                        or refreshed
+                    )
+                matches = await asyncio.wait_for(
+                    _fetch_with_session(sess.page if sess else None),
+                    timeout=odds_timeout,
                 )
             else:
                 # 空结果重试：禁止 goto。已在滚球盘则静默再采；否则 gentle 点一次 Tab。
@@ -869,11 +761,10 @@ async def _run_odds_sync(req: OddsSyncRequest):
                             )
                         except Exception:
                             pass
-                    matches = await _within_odds_budget(
-                        lambda: _fetch_with_session(sess.page)
+                    matches = await asyncio.wait_for(
+                        _fetch_with_session(sess.page),
+                        timeout=odds_timeout,
                     )
-                except asyncio.TimeoutError:
-                    raise
                 except Exception:
                     pass
     except asyncio.CancelledError:
@@ -905,17 +796,16 @@ async def _run_odds_sync(req: OddsSyncRequest):
         try:
             from app.services.bookmakers.site_profiles import needs_manual_venue
 
-            sess = await _within_odds_budget(
-                lambda: site_sessions.ensure_for_odds(
-                    base_url=req.base_url,
-                    session_token=token,
-                    recreate=not needs_manual_venue(site_code),
-                    site_code=site_code,
-                    venue_url=(req.venue_url or "").strip(),
-                )
+            sess = await site_sessions.ensure_for_odds(
+                base_url=req.base_url,
+                session_token=token,
+                recreate=not needs_manual_venue(site_code),
+                site_code=site_code,
+                venue_url=(req.venue_url or "").strip(),
             )
-            matches = await _within_odds_budget(
-                lambda: _fetch_with_session(sess.page if sess else None)
+            matches = await asyncio.wait_for(
+                _fetch_with_session(sess.page if sess else None),
+                timeout=odds_timeout,
             )
         except Exception:
             return {
@@ -973,37 +863,13 @@ async def _run_odds_sync(req: OddsSyncRequest):
             pass
         filtered.append(m)
     matches = filtered
-    # 产品边界：只把全场小球送入后端。其它盘口仍可能出现在站点页面或 XHR
-    # 中，但不应进入同步、AI 或前端展示链路。
-    small_ball_matches = []
-    dropped_market = 0
-    for match in matches:
-        small_ball_odds = []
-        for odd in getattr(match, "odds_list", None) or []:
-            if str(getattr(odd, "bet_type", "") or "").strip().lower() != "total":
-                dropped_market += 1
-                continue
-            odds_data = getattr(odd, "odds_data", None) or {}
-            if not isinstance(odds_data, dict) or odds_data.get("under") in (None, ""):
-                dropped_market += 1
-                continue
-            try:
-                odd.bet_type = "total"
-            except Exception:
-                pass
-            small_ball_odds.append(odd)
-        if small_ball_odds:
-            match.odds_list = small_ball_odds
-            small_ball_matches.append(match)
-    matches = small_ball_matches
     logger.info(
-        "odds-sync %s raw=%d out=%d drop_status=%d drop_started=%d drop_market=%d url=%s",
+        "odds-sync %s raw=%d out=%d drop_status=%d drop_started=%d url=%s",
         site_code,
         raw_n,
         len(matches),
         dropped_status,
         dropped_started,
-        dropped_market,
         page_url,
     )
 

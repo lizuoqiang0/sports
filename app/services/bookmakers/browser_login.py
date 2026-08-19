@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import platform
@@ -570,7 +571,17 @@ async def interactive_site_login(
 
         launch_key = _sk(base_url)
         async with site_sessions._launch_lock(launch_key):
-            again = site_sessions.find(base_url=base_url, site_code=site_code)
+            # 用户主动重新验证必须建立全新浏览器会话。旧 Token/Cookie 只能
+            # 用于新窗口内的登录恢复，不能把旧长连接直接当成本次验证成功。
+            if force_new:
+                await site_sessions._evict_duplicates(
+                    key=launch_key,
+                    site_code=site_code,
+                    keep=None,
+                )
+                again = None
+            else:
+                again = site_sessions.find(base_url=base_url, site_code=site_code)
             if again and again.page and not again.page.is_closed():
                 reused_window = True
                 own_browser = False
@@ -579,11 +590,12 @@ async def interactive_site_login(
                 context = again.context
                 page = again.page
             else:
-                await site_sessions._evict_duplicates(
-                    key=launch_key,
-                    site_code=site_code,
-                    keep=None,
-                )
+                if not force_new:
+                    await site_sessions._evict_duplicates(
+                        key=launch_key,
+                        site_code=site_code,
+                        keep=None,
+                    )
                 from app.services.bookmakers.browser_runtime import launch_headed_chromium
 
                 pw = await async_playwright().start()
@@ -617,6 +629,94 @@ async def interactive_site_login(
                 )
     else:
         own_browser = False
+
+    async def _rebind_live_page(*, wait_ms: int = 0, prefer_sportsbook: bool = False):
+        """登录跳转关闭旧标签时，接管同一 context 中新开的有效标签。"""
+        nonlocal page, context
+
+        deadline = time.monotonic() + max(0, int(wait_ms or 0)) / 1000.0
+        while True:
+            current_alive = False
+            try:
+                current_alive = page is not None and not page.is_closed()
+            except Exception:
+                current_alive = False
+
+            candidates = []
+            try:
+                candidates = list(context.pages) if context is not None else []
+            except Exception:
+                candidates = []
+
+            alive = []
+            for candidate in candidates:
+                try:
+                    if candidate is not None and not candidate.is_closed():
+                        alive.append(candidate)
+                except Exception:
+                    continue
+
+            chosen = None
+            if prefer_sportsbook and alive:
+                try:
+                    from app.services.bookmakers.venue_entry import _is_venue_url
+
+                    for candidate in reversed(alive):
+                        try:
+                            if _is_venue_url(candidate.url or ""):
+                                chosen = candidate
+                                break
+                        except Exception:
+                            continue
+                except Exception:
+                    chosen = None
+
+            if chosen is None and current_alive:
+                chosen = page
+
+            if chosen is None and alive:
+                home_host = (urlparse(home_url).netloc or "").lower()
+                for candidate in reversed(alive):
+                    try:
+                        candidate_url = candidate.url or ""
+                    except Exception:
+                        candidate_url = ""
+                    candidate_host = (urlparse(candidate_url).netloc or "").lower()
+                    if candidate_url and not candidate_url.startswith(("about:", "chrome:")) and (
+                        not home_host or candidate_host == home_host
+                    ):
+                        chosen = candidate
+                        break
+                if chosen is None:
+                    chosen = alive[-1]
+
+            if chosen is not None:
+                if chosen is not page:
+                    old_url = ""
+                    try:
+                        old_url = page.url or ""
+                    except Exception:
+                        pass
+                    page = chosen
+                    try:
+                        context = chosen.context
+                    except Exception:
+                        pass
+                    try:
+                        await site_sessions.update_page(base_url, chosen)
+                    except Exception:
+                        pass
+                    logger.info(
+                        "login rebound to replacement tab site=%s old=%s new=%s",
+                        site_code,
+                        old_url[:100],
+                        (getattr(chosen, "url", "") or "")[:100],
+                    )
+                return chosen
+
+            if time.monotonic() >= deadline:
+                return None
+            await asyncio.sleep(0.1)
 
     # NOTE: helpers below close browser only when we own the launch
 
@@ -671,12 +771,17 @@ async def interactive_site_login(
 
             if page is not None:
                 use_manual = needs_manual_venue(site_code) or manual_venue
+                venue_timeout_ms = (
+                    max(60000, int(wait_seconds * 1000))
+                    if use_manual
+                    else (30000 if site_code == "ob" else 45000)
+                )
                 page, venue_url = await enter_portal_venue(
                     page,
                     site_code=site_code,
                     base_url=base_url,
                     context=context,
-                    timeout_ms=max(60000, int(wait_seconds * 1000)),
+                    timeout_ms=venue_timeout_ms,
                     force=True,
                     manual_venue=use_manual,
                     wait_manual=use_manual,
@@ -684,10 +789,31 @@ async def interactive_site_login(
                 # 手动进馆：信任用户已进入场馆，跳过 is_in_sportsbook 检查
                 # 自动进馆：检查是否成功进入盘口
                 if not use_manual:
-                    if not await is_in_sportsbook(page):
-                        return await _fail(
-                            "自动进入场馆失败。请检查站点账号/URL，或设置 BOOKMAKER_MANUAL_VENUE=1 手动进入"
+                    entered = False
+                    for _ in range(6):
+                        rebound = await _rebind_live_page(
+                            wait_ms=500,
+                            prefer_sportsbook=True,
                         )
+                        if rebound is not None:
+                            page = rebound
+                        try:
+                            entered = await is_in_sportsbook(page)
+                        except Exception:
+                            entered = False
+                        if entered:
+                            break
+                        await asyncio.sleep(0.4)
+                    if not entered:
+                        # 已认证但场馆 iframe/新标签仍在加载时不能把整个登录判失败；
+                        # 保留唯一窗口，让用户可继续进入体育页或再次验证。
+                        logger.warning(
+                            "login authenticated but venue confirmation is pending site=%s url=%s",
+                            site_code,
+                            (getattr(page, "url", "") or "")[:120],
+                        )
+                        if "体育页" not in (message or ""):
+                            message = (message or "登录成功") + "；体育页仍在加载，请保持窗口打开"
                 try:
                     vu = venue_url or (page.url or "")
                 except Exception:
@@ -852,6 +978,9 @@ async def interactive_site_login(
         page.on("response", on_response)
 
         async def _finalize_success(message: str) -> dict:
+            rebound = await _rebind_live_page(wait_ms=1500, prefer_sportsbook=True)
+            if rebound is None:
+                return await _fail("登录页面已关闭，请重新验证连接")
             tok = await capture_session_token(context, page, token_keys)
             if auth_mode == "kaiyun":
                 try:
@@ -888,7 +1017,32 @@ async def interactive_site_login(
                 await _wait_nav_settle(page)
             except Exception as e:
                 logger.warning("session restore navigate: %s", e)
-            if await _page_looks_logged_in(page, auth_mode=auth_mode, captured=captured):
+            rebound = await _rebind_live_page(wait_ms=1500, prefer_sportsbook=True)
+            if rebound is not None:
+                page = rebound
+            session_logged_in = await _page_looks_logged_in(
+                page,
+                auth_mode=auth_mode,
+                captured=captured,
+            )
+            if not session_logged_in and site_code == "pinnacle" and rebound is not None:
+                try:
+                    from app.services.bookmakers.plugins.pinnacle.venue import (
+                        pinnacle_session_expired,
+                        recover_pinnacle_live_list,
+                    )
+                    from app.services.bookmakers.venue_entry import is_in_sportsbook
+
+                    if not await pinnacle_session_expired(page):
+                        session_logged_in = await is_in_sportsbook(page)
+                        if not session_logged_in and await recover_pinnacle_live_list(page):
+                            session_logged_in = (
+                                await is_in_sportsbook(page)
+                                and not await pinnacle_session_expired(page)
+                            )
+                except Exception:
+                    session_logged_in = False
+            if session_logged_in:
                 if auth_mode == "kaiyun":
                     try:
                         tok = await page.evaluate("() => localStorage.getItem('X-API-TOKEN') || ''")
@@ -954,7 +1108,20 @@ async def interactive_site_login(
         loops = max(1, int(wait_seconds * 4))
         logged_in = False
         for i in range(loops):
-            await page.wait_for_timeout(250)
+            await asyncio.sleep(0.25)
+            try:
+                page_closed = page is None or page.is_closed()
+            except Exception:
+                page_closed = True
+            if page_closed:
+                rebound = await _rebind_live_page(wait_ms=1500)
+                if rebound is None:
+                    continue
+                page = rebound
+                try:
+                    page.on("response", on_response)
+                except Exception:
+                    pass
             try:
                 if auth_mode == "kaiyun":
                     tok = await page.evaluate("() => localStorage.getItem('X-API-TOKEN') || ''")
@@ -990,6 +1157,9 @@ async def interactive_site_login(
             except Exception as e:
                 if _is_nav_error(e):
                     await _wait_nav_settle(page)
+                    rebound = await _rebind_live_page(wait_ms=1200)
+                    if rebound is not None:
+                        page = rebound
                     continue
                 raise
 

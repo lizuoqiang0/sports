@@ -71,7 +71,9 @@ class SportType(str, Enum):
 class BetType(str, Enum):
     MONEYLINE = "moneyline"        # 胜负
     SPREAD = "spread"              # 让分
-    TOTAL = "total"                # 小球总分
+    TOTAL = "total"                # 全场小球总分
+    FIRST_HALF_TOTAL = "first_half_total"  # 上半场小球
+    SECOND_HALF_TOTAL = "second_half_total"  # 下半场小球
     PROPOSITION = "prop"           # 特殊投注
     PARLAY = "parlay"              # 串关
     LIVE = "live"                  # 滚球

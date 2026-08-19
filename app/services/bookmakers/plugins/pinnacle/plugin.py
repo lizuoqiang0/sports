@@ -1,4 +1,4 @@
-"""平博插件实现：滚球 URL / 正文刮取 / 空盘恢复；下单走通用 site_bet（UI）。"""
+"""平博插件实现：滚球 URL / 正文刮取 / 空盘恢复；下单走通用 site_bet。"""
 from __future__ import annotations
 
 from typing import Any, Optional
@@ -34,15 +34,10 @@ class PinnaclePlugin(BasePlugin):
         return list(rows) if rows else None
 
     async def after_empty_odds(self, page: Any) -> bool:
-        """空盘先修复白屏，随后回到滚球列表并重试。"""
-        from app.services.bookmakers.plugins.pinnacle.venue import (
-            recover_pinnacle_blank_page,
-            recover_pinnacle_live_list,
-        )
+        """已在 /live：不导航，返回 True 触发就地再刮；偏离时才 goto 恢复。"""
+        from app.services.bookmakers.plugins.pinnacle.venue import recover_pinnacle_live_list
 
         try:
-            if not await recover_pinnacle_blank_page(page):
-                return False
             url = ""
             try:
                 url = (page.url or "").lower()
@@ -129,7 +124,8 @@ class PinnaclePlugin(BasePlugin):
                     prev[fld] = r.get(fld)
             if len(r.get("odds") or []) >= len(prev.get("odds") or []):
                 prev["odds"] = r.get("odds")
-            if r.get("under"):
+            if r.get("over") and r.get("under"):
+                prev["over"] = r.get("over")
                 prev["under"] = r.get("under")
                 prev["total_line"] = r.get("total_line")
             by_key[k] = prev

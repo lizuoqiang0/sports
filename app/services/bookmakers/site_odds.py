@@ -144,6 +144,8 @@ def _sel_key_from_name(name: str) -> Optional[str]:
         return "away"
     if any(x in n for x in ("draw", "x", "平", "和")):
         return "draw"
+    if any(x in n for x in ("over", "大", "o ")):
+        return "over"
     if any(x in n for x in ("under", "小", "u ")):
         return "under"
     return None
@@ -275,9 +277,10 @@ def _extract_spread(d: dict) -> Optional[RemoteOdds]:
 
 def _extract_total(d: dict) -> Optional[RemoteOdds]:
     line = _as_line(d.get("total") or d.get("points") or d.get("line") or d.get("ou") or d.get("goalLine"))
+    over = _as_float(d.get("over") or d.get("oddsO") or d.get("o"))
     under = _as_float(d.get("under") or d.get("oddsU") or d.get("u"))
 
-    markets = d.get("markets") or d.get("market") or d.get("total") or d.get("ou")
+    markets = d.get("markets") or d.get("market") or d.get("total") or d.get("ou") or d.get("overUnder")
     candidates = []
     if isinstance(markets, list):
         candidates = markets
@@ -287,7 +290,7 @@ def _extract_total(d: dict) -> Optional[RemoteOdds]:
         if not isinstance(item, dict):
             continue
         mtype = _pick_str(item, "type", "marketType", "name", "key", "betType").lower()
-        if mtype and not any(x in mtype for x in ("total", "ou", "under", "大小", "大/小")):
+        if mtype and not any(x in mtype for x in ("total", "ou", "over", "under", "大小", "大/小")):
             if any(x in mtype for x in ("1x2", "money", "独赢", "spread", "handicap", "让")):
                 continue
         ln = _as_line(item.get("line") or item.get("total") or item.get("points") or line)
@@ -300,14 +303,15 @@ def _extract_total(d: dict) -> Optional[RemoteOdds]:
                     continue
                 key = _sel_key_from_name(_pick_str(p, "name", "label", "selection", "side", "type"))
                 price = _as_float(p.get("price") or p.get("odds") or p.get("odd") or p.get("value"))
-                if key == "under" and price:
+                if key in ("over", "under") and price:
                     data[key] = price
                     local_sels[key] = _selection_ref(p, price)
         else:
+            o = _as_float(item.get("over") or item.get("oddsO"))
             u = _as_float(item.get("under") or item.get("oddsU"))
-            if u:
-                data = {"under": u}
-        if "under" in data:
+            if o and u:
+                data = {"over": o, "under": u}
+        if "over" in data and "under" in data:
             od = RemoteOdds(bet_type="total", odds_data=data, total=float(ln or 0))
             if local_sels:
                 od.odds_data["_site"] = {
@@ -317,10 +321,10 @@ def _extract_total(d: dict) -> Optional[RemoteOdds]:
                 }
             return od
 
-    if under and line is not None:
+    if over and under and line is not None:
         return RemoteOdds(
             bet_type="total",
-            odds_data={"under": under},
+            odds_data={"over": over, "under": under},
             total=float(line),
         )
     return None

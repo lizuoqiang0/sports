@@ -727,11 +727,12 @@ async def one_click_bet(
             data = getattr(resp, "data", None) or {}
             if isinstance(resp, dict):
                 data = resp.get("data") or resp
+            placed_stake = float((data or {}).get("stake") or stake)
             placed_bets.append({
                 "market": bt,
                 "selection": single.get("selection"),
                 "odds": float(single["odds"]),
-                "stake": float(stake),
+                "stake": placed_stake,
                 "provider": provider_label,
                 "provider_code": provider_code,
                 "status": (data or {}).get("status") or "pending",

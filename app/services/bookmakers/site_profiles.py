@@ -65,16 +65,5 @@ def is_live_site_code(code: str) -> bool:
 
 
 def needs_manual_venue(code: str) -> bool:
-    """是否等人手动进场馆。默认自动；BOOKMAKER_MANUAL_VENUE=1 时强制手动。"""
-    env = (os.getenv("BOOKMAKER_MANUAL_VENUE") or "").strip().lower()
-    if env in ("1", "true", "yes", "on"):
-        return True
-    if env in ("0", "false", "no", "off"):
-        return False
-    try:
-        prof = get_plugin(code).profile
-    except ValueError:
-        return False
-    if prof.get("manual_venue") or (code or "").lower() in MANUAL_VENUE_SITE_CODES:
-        return True
-    return bool(prof.get("manual_venue"))
+    """所有站点均需手动进场馆（BOOKMAKER_MANUAL_VENUE=1）。"""
+    return True

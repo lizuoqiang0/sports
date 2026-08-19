@@ -12,7 +12,7 @@ from app.core.cache import cache
 from app.core.crypto import decrypt_secret
 from app.database import AsyncSessionLocal
 from app.models.user import AIConfig, Bet, BetStatus, BetType, BookmakerAccount, BookmakerStatus, Match, Transaction, TransactionType, User
-from app.services.bookmakers.gate_client import _gate_headers, post_login
+from app.services.bookmakers.gate_client import _gate_headers
 
 logger = logging.getLogger(__name__)
 
@@ -265,34 +265,6 @@ async def _fetch_ob_orders(site_acc, *, days: int = 1) -> list[dict]:
                 await asyncio.sleep(busy_interval)
         return [], last_meta
 
-    async def _reopen_gate_session() -> bool:
-        try:
-            password = decrypt_secret(getattr(site_acc, "password_encrypted", "") or "")
-        except Exception as e:
-            logger.warning("待定单补录失败：解密 OB 密码失败: %s", e)
-            return False
-        try:
-            result = await post_login(
-                base_url=site_acc.base_url or "",
-                username=getattr(site_acc, "username", "") or "",
-                password=password,
-                session_token=session_token,
-                site_code="ob",
-                wait_seconds=25,
-                force_new=False,
-                manual_venue=False,
-                timeout=120.0,
-            )
-            ok = bool((result or {}).get("ok"))
-            if not ok:
-                logger.warning("待定单补录：重建 OB 长连接失败: %s", (result or {}).get("message"))
-                return False
-            await asyncio.sleep(6.0)
-            return True
-        except Exception as e:
-            logger.warning("待定单补录：重建 OB 长连接异常: %s", e)
-            return False
-
     try:
         orders, meta = await _request_with_busy_retry()
         if orders:
@@ -304,12 +276,9 @@ async def _fetch_ob_orders(site_acc, *, days: int = 1) -> list[dict]:
             or ("先验证并进入场馆" in message)
         )
         if need_reopen:
-            reopened = await _reopen_gate_session()
-            if reopened:
-                orders, _ = await _request_with_busy_retry()
-                if orders:
-                    logger.info("待定单补录：重建长连接后成功拉到 OB 注单 count=%s", len(orders))
-                    return orders
+            # 用户关闭浏览器后必须在站点配置中重新连接；注单补录等后台
+            # 任务不得静默启动/复用浏览器长连接。
+            logger.info("待定单补录跳过：OB 浏览器已断开，请用户重新连接")
         return []
     except Exception as e:
         logger.warning("待定单补录失败：拉取 OB 注单历史异常: %s", e)

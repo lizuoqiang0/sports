@@ -149,8 +149,6 @@ async def sync_live_scores_odds(
                 continue
             # 无 DB 会话占用期间调用 Gate
             remote_matches = await fetch_live()
-            new_token = getattr(connector, "session_token", None)
-            profile = getattr(connector, "_profile", None)
             bal_val = None
             if refresh_balance:
                 try:
@@ -174,20 +172,12 @@ async def sync_live_scores_odds(
             provider = provider_name(acc_code)
             written_keys: set[tuple] = set()
 
-            # 每站独立短会话写库，避免跨站污染 / 断连。
-            # 仅在提交成功后发送事件，避免客户端看到最终回滚的数据。
-            committed_updates: list[tuple[Match, list[dict]]] = []
+            # 每站独立短会话写库，避免跨站污染 / 断连
             async with AsyncSessionLocal() as wdb:
                 local_by_id = await _reload_live_map(wdb)
                 acc = await wdb.get(BookmakerAccount, acc_id)
                 if acc is None:
                     continue
-                if new_token and new_token != job["session_token"]:
-                    from app.core.crypto import encrypt_secret
-
-                    acc.session_token_encrypted = encrypt_secret(new_token)
-                if isinstance(profile, dict) and profile:
-                    acc.profile_json = profile
                 if bal_val is not None:
                     acc.balance = bal_val
 
@@ -216,13 +206,7 @@ async def sync_live_scores_odds(
                         try:
                             bt = BetType(ro.bet_type)
                         except ValueError:
-                            # 未知 bet_type 不静默降级为独赢：那会把小球/让球数据
-                            # 污染进 moneyline 矩阵且无从发现。跳过并告警。
-                            logger.warning(
-                                "[odds-sync] 跳过未知 bet_type=%r provider=%s match_id=%s",
-                                ro.bet_type, provider, match_id,
-                            )
-                            continue
+                            bt = BetType.MONEYLINE
 
                         write_key = (match_id, provider, bt.value if hasattr(bt, "value") else str(bt))
                         if write_key in written_keys:
@@ -261,14 +245,11 @@ async def sync_live_scores_odds(
                             "is_live": True,
                         })
 
-                    committed_updates.append((match, odds_payload))
+                    await _broadcast_match_update(match, odds_payload, now)
 
                 acc.last_sync_at = now.replace(tzinfo=None) if getattr(now, "tzinfo", None) else now
                 acc.last_error = None
                 await wdb.commit()
-
-            for changed_match, odds_payload in committed_updates:
-                await _broadcast_match_update(changed_match, odds_payload, now)
         except Exception as e:
             err_txt = str(e)
             logger.exception("live sync failed %s", acc_code)
@@ -337,14 +318,9 @@ async def sync_live_scores_odds(
     except Exception:
         logger.debug("stale/not-started live demote failed", exc_info=True)
 
-    # 清列表缓存，下一轮 HTTP 拉到新比分。SCAN 是渐进迭代，不阻塞 Redis。
+    # 清列表缓存，下一轮 HTTP 拉到新比分
     try:
-        keys: list[str] = []
-        async for key in cache.client.scan_iter(match="matches:list:*", count=200):
-            keys.append(key)
-            if len(keys) >= 200:
-                await cache.client.delete(*keys)
-                keys.clear()
+        keys = await cache.client.keys("matches:list:*")
         if keys:
             await cache.client.delete(*keys)
     except Exception:

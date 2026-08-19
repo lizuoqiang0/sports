@@ -293,7 +293,6 @@ async def place_site_bet(
                 pass
             try:
                 from app.services.bookmakers.venue_entry import (
-                    activate_sportsbook_tabs,
                     page_already_on_live_board,
                 )
 
@@ -320,25 +319,11 @@ async def place_site_bet(
                     )
                 except Exception:
                     full_t = ""
-                # 维护横幅 = 过期 DOM 遮罩（站点实际未维护）：整页刷新即恢复
-                # （实测；reload 失败退回 goto 直达滚球 URL 强制全新 SPA 加载）
                 if ("正在维护" in (full_t or "")) or ("维护中" in (full_t or "")):
-                    try:
-                        from app.services.bookmakers.plugins.pinnacle.venue import (
-                            clear_pinnacle_maintenance,
-                        )
-
-                        await clear_pinnacle_maintenance(page)
-                        full_t = await page.evaluate(
-                            "() => ((document.body && document.body.innerText) || '')"
-                        )
-                        logger.warning(
-                            "pinnacle place: maintenance banner cleared url=%s still_banner=%s",
-                            (page.url or "")[:120],
-                            ("维护" in (full_t or "")),
-                        )
-                    except Exception as e:
-                        logger.warning("pinnacle banner clear failed: %s", e)
+                    logger.warning(
+                        "pinnacle place: maintenance banner present; keep page stable url=%s",
+                        (page.url or "")[:120],
+                    )
                 team_visible = bool(
                     (home and home[:4] and home[:4] in (full_t or ""))
                     or (away and away[:4] and away[:4] in (full_t or ""))
@@ -410,56 +395,10 @@ async def place_site_bet(
                 )
                 need_recover = (not on_live) or (not has_board) or shell_only or (not team_visible)
                 if need_recover:
-                    logger.warning("pinnacle place: recover sports UI")
-                    for text in ("体育", "Sports", "足球", "滚球盘", "滚球", "In-Play"):
-                        try:
-                            loc = page.get_by_text(text, exact=False).first
-                            if await loc.count() > 0 and await loc.is_visible():
-                                await loc.click(timeout=1800)
-                                await page.wait_for_timeout(700)
-                        except Exception:
-                            continue
-                    try:
-                        await activate_sportsbook_tabs(page, live_only=True, gentle=True)
-                    except Exception:
-                        pass
-                    await page.wait_for_timeout(1000)
-                    if shell_only or not await _body_has_board() or not team_visible:
-                        try:
-                            cur = page.url or ""
-                            logger.warning("pinnacle place: soft reload url=%s", cur[:140])
-                            # goto 直达滚球 URL（普通 reload 易再停在维护遮罩上）
-                            from urllib.parse import urlparse as _pu
-
-                            from app.services.bookmakers.plugins.pinnacle.venue import (
-                                pinnacle_live_sport_urls as _plsu,
-                            )
-
-                            _r = _pu(cur if "://" in cur else f"https://{cur}")
-                            _org = f"{_r.scheme}://{_r.netloc}" if _r.netloc else ""
-                            _dests = _plsu(origin=_org)[:2] or ([cur] if cur else [])
-                            for dest in _dests:
-                                try:
-                                    await page.goto(dest, wait_until="domcontentloaded", timeout=45000)
-                                    await page.wait_for_timeout(3000)
-                                    break
-                                except Exception:
-                                    continue
-                            for text in ("滚球盘", "滚球", "In-Play", "足球"):
-                                try:
-                                    loc = page.get_by_text(text, exact=False).first
-                                    if await loc.count() > 0:
-                                        await loc.click(timeout=1500)
-                                        await page.wait_for_timeout(1200)
-                                        break
-                                except Exception:
-                                    continue
-                            logger.warning(
-                                "pinnacle place after reload has_board=%s",
-                                await _body_has_board(),
-                            )
-                        except Exception as e:
-                            logger.warning("pinnacle soft reload failed: %s", e)
+                    logger.warning(
+                        "pinnacle place: board not ready; avoid multi-route recovery url=%s",
+                        (page.url or "")[:120],
+                    )
             except Exception as e:
                 logger.debug("pinnacle pre-place live tab: %s", e)
 
@@ -493,13 +432,23 @@ async def place_site_bet(
 
         ui_ok = False
         ui_detail = ""
+        actual_stake = stake
         bt = (bet_type or "").lower()
         if code == "pinnacle" and bt in (
             "total",
             "totals",
             "ou",
         ):
-            ui_ok, ui_detail = await _ui_place_pinnacle_total(
+            stake_policy = (odds_data or {}).get("_stake_policy") or {}
+            try:
+                policy_dynamic = Decimal(str(stake_policy.get("dynamic_stake") or stake))
+                policy_cap = Decimal(str(stake_policy.get("max_stake") or stake))
+                policy_balance = Decimal(str(stake_policy.get("available_balance") or 0))
+            except (ArithmeticError, TypeError, ValueError):
+                policy_dynamic, policy_cap, policy_balance = stake, stake, Decimal("0")
+            # 页面读取到的余额优先于请求时的缓存余额。
+            available_balance = bal_before if bal_before > 0 else policy_balance
+            ui_ok, ui_detail, actual_stake = await _ui_place_pinnacle_total(
                 page,
                 home=home,
                 away=away,
@@ -508,6 +457,9 @@ async def place_site_bet(
                 stake=stake,
                 line=line,
                 sport=sport,
+                dynamic_stake=policy_dynamic,
+                stake_cap=policy_cap,
+                available_balance=available_balance if available_balance > 0 else None,
             )
             logger.info("pinnacle ui place ok=%s detail=%s bt=%s", ui_ok, ui_detail, bt)
             # 赔率变动策略拒绝：直接返回可读原因（≥1.7 接受 / <1.7 放弃）
@@ -516,6 +468,23 @@ async def place_site_bet(
                 return PlaceBetResult(
                     ok=False,
                     message=f"平博放弃下单：{reason}",
+                    balance_after=bal_before,
+                )
+            if not ui_ok and ui_detail in {
+                "requested_stake_exceeds_strategy_cap",
+                "site_minimum_exceeds_strategy_cap",
+                "site_minimum_exceeds_available_balance",
+                "invalid_stake_policy",
+            }:
+                stake_messages = {
+                    "requested_stake_exceeds_strategy_cap": "下注金额超过单笔最大金额",
+                    "site_minimum_exceeds_strategy_cap": "平博最低投注额超过单笔最大金额",
+                    "site_minimum_exceeds_available_balance": "平博最低投注额超过当前可用余额",
+                    "invalid_stake_policy": "下注金额策略无效",
+                }
+                return PlaceBetResult(
+                    ok=False,
+                    message=stake_messages[ui_detail],
                     balance_after=bal_before,
                 )
         else:
@@ -552,6 +521,7 @@ async def place_site_bet(
                     ui_ok = False
                     ui_detail = f"confirm_fail:{e}"
 
+        effective_stake = actual_stake if code == "pinnacle" and ui_ok else stake
         if ui_ok:
             bal_after = await _read_balance_from_page(page)
             # 余额刷新可能滞后：多轮重读（禁止 reload）
@@ -559,7 +529,7 @@ async def place_site_bet(
                 if (
                     bal_before > 0
                     and bal_after > 0
-                    and bal_after <= bal_before - (stake * Decimal("0.5"))
+                    and bal_after <= bal_before - (effective_stake * Decimal("0.5"))
                 ):
                     break
                 await page.wait_for_timeout(900)
@@ -567,33 +537,22 @@ async def place_site_bet(
             debited = (
                 bal_before > 0
                 and bal_after > 0
-                and bal_after <= bal_before - (stake * Decimal("0.5"))
+                and bal_after <= bal_before - (effective_stake * Decimal("0.5"))
             )
             if debited:
-                # 下单成功后离开搜索页，回到滚球列表，避免赛事同步长期采空
-                if code == "pinnacle":
-                    try:
-                        from app.services.bookmakers.venue_entry import (
-                            page_is_off_match_list,
-                            recover_pinnacle_live_list,
-                        )
-
-                        if await page_is_off_match_list(page):
-                            await recover_pinnacle_live_list(page)
-                    except Exception as e:
-                        logger.debug("pinnacle post-bet recover list: %s", e)
                 return PlaceBetResult(
                     ok=True,
                     message=f"{name} 下单成功（余额 {bal_before}→{bal_after}）",
                     external_bet_id=f"{code}:ui:{selection}:{home or 'x'}",
                     balance_after=bal_after,
+                    actual_stake=effective_stake,
                 )
             logger.warning(
                 "%s UI bet no debit before=%s after=%s stake=%s detail=%s",
                 code,
                 bal_before,
                 bal_after,
-                stake,
+                effective_stake,
                 ui_detail,
             )
             return PlaceBetResult(

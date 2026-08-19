@@ -40,10 +40,11 @@ SPORT_RISK: dict[str, dict] = {
     "basketball": {
         "under_min_conf": 0.58,            # 篮球小分波动更大：有基本面也需更高置信度
         "under_min_conf_no_fund": 0.62,    # 无基本面时再加严
+        "under_min_line": 120.0,           # 篮球小球盘线区间下限（低于此线不投）
         "under_max_line": 208.0,           # 高线小分容错极低，提前拦截
         "under_min_played_mins": 14.0,     # 首节/次节早段样本太小，不做小分
         "under_late_block_mins": 44.0,     # 末节最后 4 分钟犯规/罚球波动极大
-        # 闸门2.9 under 余量（全场48分钟按盘口线等比折算剩余期望）
+        # under 余量（全场48分钟按盘口线等比折算剩余期望）
         "margin_min_mins": 24.0,           # 中盘后才看余量
         "margin_full_mins": 48.0,
         "margin_avg_goals": None,          # None=按盘口线折算
@@ -52,13 +53,13 @@ SPORT_RISK: dict[str, dict] = {
         "ev_conf_edge": 0.04,              # 小分必须明显高于盈亏平衡概率
     },
     "football": {
-        "under_min_conf": 0.55,            # under 最低置信度（实盘：21单under，conf>=0.55起跳，0.58-0.62区间仅28.6%WR）
-        "under_min_conf_no_fund": 0.58,  # under 无基本面加严（实盘：无基本面under需更高门槛）
-        "under_max_line": None,            # 足球 under 无高线限制（2.5+线 71.4%WR）
-        "under_min_line": 2.0,             # 足球低线 under 1球破盘（实盘：line=1.75胜率仅40%，2.0+更安全）
+        "under_min_conf": 0.55,            # under 最低置信度
+        "under_min_conf_no_fund": 0.58,  # under 无基本面加严
+        "under_min_line": 2.0,             # 足球低线 under 1球破盘
+        "under_max_line": 6.5,             # 足球 under 高线限制
         "under_min_played_mins": 20.0,
         "under_late_block_mins": 90.0,
-        # 闸门2.9 under 余量（全场90分钟按联赛均值2.75球折算剩余期望）
+        # under 余量（全场90分钟按联赛均值2.75球折算剩余期望）
         "margin_min_mins": 40.0,
         "margin_full_mins": 90.0,
         "margin_avg_goals": 2.75,
@@ -75,6 +76,7 @@ SPORT_RISK["default"] = {k: dict(v) if isinstance(v, dict) else v for k, v in SP
 LEAGUE_BLACKLIST_KEYWORDS: tuple[str, ...] = (
     "u19", "u21", "u18", "u20", "u17", "u16",
     "青年", "青少年", "后备队", "女子", "(女)", "women", "女篮",
+    "友谊赛", "表演赛",
 )
 
 
@@ -294,8 +296,17 @@ class StrategyEngine:
 
         # ══════════════════════════════════════════════════════════
         # 阶段A：信号有效性（AI 输出是否可执行）
-        #   A1 方向合法 + A2 模型共识 + A3 置信度达标（含按方向/基本面分级）
+        #   A0 玩法白名单 + A1 方向合法 + A2 模型共识 + A3 置信度达标（含按方向/基本面分级）
         # ══════════════════════════════════════════════════════════
+
+        # ── A0：玩法白名单（仅全场小球 total/under，其他一律拒绝）──
+        raw_bet_type = str(analysis.get("bet_type", "") or "").lower()
+        if raw_bet_type and raw_bet_type not in ("total", "first_half_total", "second_half_total"):
+            logger.info(
+                "[A0/玩法] ❌ 拒绝 match=%s | bet_type='%s' 不在白名单(仅 total/first_half_total/second_half_total)",
+                mid, raw_bet_type,
+            )
+            return self._reject(match_info, analysis, f"不支持的玩法: {raw_bet_type}（仅全场/半场小球）")
 
         # ── A1：方向检查 ──
         if prediction != "under":
@@ -308,7 +319,7 @@ class StrategyEngine:
         # ── A2：模型共识硬保护 ──
         reasoning = str(analysis.get("reasoning") or "")
         consensus_reached = bool(analysis.get("consensus_reached", False))
-        if False:  # TEMP: bypass A2 for test
+        if not consensus_reached or "[不投注]" in reasoning or "不可下单" in reasoning:
             why = ("文案已标记为不投注" if "[不投注]" in reasoning
                    else "文案已标记为不可下单" if "不可下单" in reasoning
                    else "consensus_reached=false")
@@ -750,7 +761,12 @@ class StrategyEngine:
                 Decimal("0.01"), rounding=ROUND_HALF_UP
             )
 
-        suggested_stake = max(min(suggested_stake, max_amt), min_stake)
+        suggested_stake = min(suggested_stake, max_amt)
+        # min_stake 兜底不击穿余额锚定：余额低于锚定值时用余额与 min_stake 的较小者
+        if bal_cap > 0 and bal_cap < min_stake:
+            suggested_stake = max(Decimal("0"), bal_cap)
+        else:
+            suggested_stake = max(suggested_stake, min_stake)
 
         logger.info(
             "[策略评估] ✅ match=%s 通过 | sel=%s conf=%.2f odds=%.2f | 下注=%.2f（conf_scale=%.2f risk=%.2f→×%.2f 站点×%.2f[%s]）max_bet=%.2f",
@@ -812,14 +828,14 @@ class StrategyEngine:
         )
 
     def _calc_risk_score(self, confidence: float, odds: float, active_count: int) -> float:
-        """综合风险评分"""
+        """综合风险评分（参与仓位计算，不影响放行决策）"""
         # 低置信度 -> 高风险
         risk = (1 - confidence) * settings.AI_RISK_LOW_CONF_WEIGHT
 
-        # 高赔率 -> 高风险
-        if odds > settings.AI_RISK_HIGH_ODDS_THRESHOLD:
+        # 高赔率 -> 高风险（under 实际赔率区间 1.5-1.95，阈值下调）
+        if odds > 1.90:
             risk += settings.AI_RISK_HIGH_ODDS_PENALTY
-        elif odds > settings.AI_RISK_MID_ODDS_THRESHOLD:
+        elif odds > 1.80:
             risk += settings.AI_RISK_MID_ODDS_PENALTY
 
         # 持仓多 -> 略增风险

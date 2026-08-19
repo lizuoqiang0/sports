@@ -27,10 +27,13 @@ async def ui_place_pinnacle_total(
     stake: Decimal,
     line: float | None,
     sport: str = "",
-) -> tuple[bool, str]:
+    dynamic_stake: Decimal | None = None,
+    stake_cap: Decimal | None = None,
+    available_balance: Decimal | None = None,
+) -> tuple[bool, str, Decimal]:
     """
     平博 DOM 兜底：定位赛事行/盘口线 → 点小球赔率 → 填金额并确认。
-    返回 (clicked_confirm, detail)。
+    返回 (clicked_confirm, detail, actual_stake)。
     """
     sel = (selection or "").lower()
     # 仅支持小球 DOM 点选。
@@ -38,7 +41,7 @@ async def ui_place_pinnacle_total(
     if sel in ("under", "u"):
         side_words = ["小", "under", "低于"]
     else:
-        return {"ok": False, "message": "仅支持小球"}
+        return False, "仅支持小球", Decimal("0")
     sport_l = (sport or "").lower()
     if not sport_l:
         # 从当前 URL 猜
@@ -99,11 +102,11 @@ async def ui_place_pinnacle_total(
     except Exception:
         pass
 
-    # 球种定向：篮球赛需要篮球滚球列表（soccer 页无该行 → row_not_found）。
-    # basketball/live 直达 URL 常渲染空（SPA 惰性），优先 URL 直达+侧栏点击双保险。
+    # 球种定向只允许一次确定性的 URL 跳转；不再点侧栏/Tab 触发额外路由。
     try:
         cur_url = (page.url or "").lower()
-        if sport_l == "basketball" and "/basketball" not in cur_url:
+        wanted_sport = "basketball" if sport_l == "basketball" else "soccer"
+        if f"/{wanted_sport}/" not in cur_url or "/live" not in cur_url:
             from urllib.parse import urlparse
 
             pu = urlparse(page.url or "")
@@ -111,31 +114,14 @@ async def ui_place_pinnacle_total(
             if org:
                 try:
                     await page.goto(
-                        f"{org}/zh-cn/compact/sports/basketball/live",
+                        f"{org}/zh-cn/compact/sports/{wanted_sport}/live",
                         wait_until="domcontentloaded",
                         timeout=45000,
                     )
                     await page.wait_for_timeout(4000)
                 except Exception as e:
-                    logger.warning("pinnacle ui: basketball goto err: %s", e)
-                # 页面空则点侧栏「篮球」标签激活 SPA
-                try:
-                    body_len = await page.evaluate(
-                        "() => ((document.body && document.body.innerText) || '').length"
-                    )
-                    if int(body_len or 0) < 3000:
-                        for txt in ("篮球", "Basketball"):
-                            try:
-                                loc = page.get_by_text(txt, exact=False).first
-                                if await loc.count() > 0 and await loc.is_visible():
-                                    await loc.click(timeout=2000)
-                                    await page.wait_for_timeout(3500)
-                                    break
-                            except Exception:
-                                continue
-                except Exception:
-                    pass
-                logger.info("pinnacle ui: goto basketball done url=%s", (page.url or "")[:100])
+                    logger.warning("pinnacle ui: sport goto err: %s", e)
+                logger.info("pinnacle ui: sport page ready url=%s", (page.url or "")[:100])
     except Exception as e:
         logger.warning("pinnacle ui: basketball nav failed: %s", e)
 
@@ -379,17 +365,6 @@ async def ui_place_pinnacle_total(
             )
 
             if on_sports_page:
-                # 已在滚球/体育页：不点「体育」标签（会导航到大厅）
-                # 但可以点「滚球盘」/「滚球」标签触发 SPA 加载赛事列表
-                for txt in ("滚球盘", "滚球", "In-Play", "Live"):
-                    try:
-                        loc = page.get_by_text(txt, exact=False).first
-                        if await loc.count() > 0 and await loc.is_visible():
-                            await loc.click(timeout=2000)
-                            await page.wait_for_timeout(2000)
-                            break
-                    except Exception:
-                        continue
                 # 轮询等 SPA 渲染（最多 18s）
                 for _ in range(12):
                     if await _body_has_odds():
@@ -404,47 +379,8 @@ async def ui_place_pinnacle_total(
                         await page.wait_for_timeout(2500)
                     except Exception:
                         pass
-                # 还是空：reload 重载 SPA（goto 会丢 session，reload 保留 cookie）
-                if not await _body_has_odds():
-                    logger.warning(
-                        "pinnacle ui: page empty after poll, reload url=%s",
-                        cur_url_spa[:100],
-                    )
-                    try:
-                        await page.reload(wait_until="domcontentloaded", timeout=45000)
-                        await page.wait_for_timeout(3000)
-                    except Exception as e:
-                        logger.warning("pinnacle ui: reload failed: %s", e)
-                    # reload 后再轮询 10s
-                    for _ in range(7):
-                        if await _body_has_odds():
-                            break
-                        await page.wait_for_timeout(1500)
             else:
-                # 不在体育页：点「滚球」标签激活（不点「体育」，避免进大厅）
-                for txt in ("滚球盘", "滚球", "In-Play"):
-                    try:
-                        loc = page.get_by_text(txt, exact=False).first
-                        if await loc.count() > 0 and await loc.is_visible():
-                            await loc.click(timeout=2500)
-                            await page.wait_for_timeout(2000)
-                            break
-                    except Exception:
-                        continue
-                # 轮询等待 SPA 列表渲染（最多 15s）
-                for _ in range(10):
-                    if await _body_has_odds():
-                        break
-                    await page.wait_for_timeout(1500)
-                # 激活后仍无赔率：滚一下触发懒加载再等 5s
-                if not await _body_has_odds():
-                    try:
-                        await page.evaluate(
-                            "() => window.scrollTo(0, document.body.scrollHeight / 2)"
-                        )
-                        await page.wait_for_timeout(2500)
-                    except Exception:
-                        pass
+                return False, "not_on_sports_page", Decimal("0")
     except Exception as e:
         logger.warning("pinnacle ui: sportsbook activate failed: %s", e)
 
@@ -586,7 +522,7 @@ async def ui_place_pinnacle_total(
                 continue
             if isinstance(resumed, dict) and resumed.get("ok"):
                 await page.wait_for_timeout(2200)
-                return True, f"resume_ok:{resumed.get('text')}"
+                return False, "stale_confirm_modal", Decimal("0")
     except Exception:
         pass
     try:
@@ -595,11 +531,11 @@ async def ui_place_pinnacle_total(
             if await ok_btn.count() > 0:
                 await ok_btn.click(timeout=2500)
                 await page.wait_for_timeout(2200)
-                return True, "resume_ok:OK_text"
+                return False, "stale_confirm_modal", Decimal("0")
     except Exception:
         pass
 
-    # 确保球类页：足球滚球 / 篮球滚球，避免停在冰球等其它 live 列表
+    # 上方已经按目标球类做过一次确定性跳转；这里禁止再点球类 Tab。
     try:
         want_fb = "basket" not in sport_l
         cur_u = (page.url or "").lower()
@@ -608,15 +544,7 @@ async def ui_place_pinnacle_total(
             or ((not want_fb) and "basket" not in cur_u)
         )
         if need_sport or "ice" in cur_u or "hockey" in cur_u or "冰球" in (await page.evaluate("() => (document.body && document.body.innerText || '').slice(0,400)") or ""):
-            for text in (("足球", "Soccer", "足球滚球") if want_fb else ("篮球", "Basketball", "篮球滚球")):
-                try:
-                    loc = page.get_by_text(text, exact=False).first
-                    if await loc.count() > 0 and await loc.is_visible():
-                        await loc.click(timeout=1800)
-                        await page.wait_for_timeout(900)
-                        break
-                except Exception:
-                    continue
+            return False, "wrong_sport_page", Decimal("0")
     except Exception as e:
         logger.debug("pinnacle sport tab ensure: %s", e)
 
@@ -676,34 +604,13 @@ async def ui_place_pinnacle_total(
             pass
         return False
 
-    try:
-        from app.services.bookmakers.venue_entry import activate_sportsbook_tabs, page_already_on_live_board
-
-        if not await page_already_on_live_board(page):
-            await activate_sportsbook_tabs(page, live_only=True, gentle=True)
-            await page.wait_for_timeout(800)
-        for text in ("滚球盘", "滚球", "In-Play"):
-            try:
-                loc = page.get_by_text(text, exact=False).first
-                if await loc.count() > 0 and await loc.is_visible():
-                    await loc.click(timeout=1500)
-                    await page.wait_for_timeout(600)
-                    break
-            except Exception:
-                continue
-    except Exception:
-        pass
-
-    # 确保在滚球列表（搜索页/白屏时先恢复）；并清掉残留投注单（避免总注金污染/最低额失败）
+    # 必须留在目标体育列表；后台/下单均不得把平博带到其它路由。
     try:
         cur = (page.url or "").lower()
-        if "/search" in cur or "/live" not in cur:
-            from app.services.bookmakers.venue_entry import recover_pinnacle_live_list
-
-            await recover_pinnacle_live_list(page)
-            await page.wait_for_timeout(1000)
+        if "/search" in cur or "/compact/sports/" not in cur or "/live" not in cur:
+            return False, "not_on_live_sports_page", Decimal("0")
     except Exception:
-        pass
+        return False, "sports_page_unavailable", Decimal("0")
     try:
         for fr in ([page] + list(getattr(page, "frames", []) or [])):
             try:
@@ -776,7 +683,7 @@ async def ui_place_pinnacle_total(
         except Exception as e:
             logger.debug("locator odds click: %s", e)
     if not (isinstance(result, dict) and result.get("ok")):
-        return False, last_miss or "stay_page_miss"
+        return False, last_miss or "stay_page_miss", Decimal("0")
 
 
     await page.wait_for_timeout(900)
@@ -821,14 +728,7 @@ async def ui_place_pinnacle_total(
             if await _slip_ready():
                 break
     if not await _slip_ready():
-        logger.warning("pinnacle slip not open after odds click, recover live + retry click")
-        try:
-            from app.services.bookmakers.venue_entry import recover_pinnacle_live_list
-
-            await recover_pinnacle_live_list(page)
-            await page.wait_for_timeout(1200)
-        except Exception:
-            pass
+        logger.warning("pinnacle slip not open after odds click; retry in place")
         # 清搜索框，避免停在搜索结果页
         try:
             await page.evaluate(
@@ -844,14 +744,14 @@ async def ui_place_pinnacle_total(
             pass
         result, last_miss = await _try_click_all_frames()
         if not (isinstance(result, dict) and result.get("ok")):
-            return False, f"slip_not_open|{last_miss}"
+            return False, f"slip_not_open|{last_miss}", Decimal("0")
         await page.wait_for_timeout(1200)
         for _ in range(5):
             if await _slip_ready():
                 break
             await page.wait_for_timeout(400)
         if not await _slip_ready():
-            return False, f"slip_not_open_after_retry|clicked={result.get('sample')}|{result.get('how')}"
+            return False, f"slip_not_open_after_retry|clicked={result.get('sample')}|{result.get('how')}", Decimal("0")
 
     from app.services.bookmakers.odds_change import (
         ODDS_CHANGE_ACCEPT_FLOOR,
@@ -907,7 +807,7 @@ async def ui_place_pinnacle_total(
     ok_chg, why_chg, use_odds = decide_odds_change(requested_odds, slip_odds)
     if not ok_chg:
         logger.info("pinnacle bet abort odds-change: %s", why_chg)
-        return False, f"odds_change_reject|{why_chg}"
+        return False, f"odds_change_reject|{why_chg}", Decimal("0")
     if use_odds is not None:
         odds = float(use_odds)
     logger.info(
@@ -1124,7 +1024,7 @@ async def ui_place_pinnacle_total(
                     pass
             break
     if not filled:
-        return False, fill_detail or "stake_input_missing"
+        return False, fill_detail or "stake_input_missing", Decimal("0")
 
     await page.wait_for_timeout(500)
 
@@ -1141,6 +1041,7 @@ async def ui_place_pinnacle_total(
       const minM = body.match(/最低投注额\\s*([0-9]+(?:\\.[0-9]+)?)/);
       return { got, want: Number(want), minStake: minM ? Number(minM[1]) : null, bodyHas: /投下\\s*\\d+\\s*注/.test(body) };
     }"""
+    actual_stake = Decimal(str(stake))
     try:
         for fr in targets:
             try:
@@ -1150,29 +1051,45 @@ async def ui_place_pinnacle_total(
             if not isinstance(v, dict):
                 continue
             got = v.get("got")
-            # 金额是调用方明确授权的上限。站点最低额高于请求金额时必须拒绝，
-            # 绝不能把 10 元测试单静默抬高到 30 元后继续提交。
             min_stake_site = v.get("minStake")
             if (
                 min_stake_site
                 and min_stake_site == min_stake_site
                 and float(min_stake_site) > float(stake)
             ):
-                reason = "site_minimum_exceeds_requested"
-                logger.warning(
-                    "pinnacle bet abort %s requested=%s minimum=%s",
-                    reason,
-                    stake,
-                    min_stake_site,
+                from app.ai.strategy_gates import resolve_site_minimum_stake
+
+                actual_stake, reason = resolve_site_minimum_stake(
+                    requested_stake=stake,
+                    dynamic_stake=dynamic_stake if dynamic_stake is not None else stake,
+                    site_minimum=Decimal(str(min_stake_site)),
+                    max_stake=stake_cap if stake_cap is not None else stake,
+                    available_balance=available_balance,
                 )
-                return False, reason
-            if got == got and abs(float(got) - float(stake)) > max(0.2, float(stake) * 0.3):
-                logger.warning("pinnacle stake mismatch want=%s got=%s, refill", stake, got)
+                if actual_stake is None:
+                    logger.warning(
+                        "pinnacle bet abort %s requested=%s dynamic=%s minimum=%s cap=%s balance=%s",
+                        reason, stake, dynamic_stake, min_stake_site, stake_cap, available_balance,
+                    )
+                    return False, reason, Decimal("0")
+                logger.info(
+                    "pinnacle stake adjusted requested=%s dynamic=%s minimum=%s actual=%s",
+                    stake, dynamic_stake, min_stake_site, actual_stake,
+                )
+                data = await asyncio.wait_for(fr.evaluate(fill_js, float(actual_stake)), timeout=5.0)
+                if not isinstance(data, dict) or not data.get("ok"):
+                    return False, "stake_adjust_refill_failed", Decimal("0")
+                fill_detail = f"site_minimum_adjusted:{actual_stake}"
+                got = actual_stake
+            if got == got and abs(float(got) - float(actual_stake)) > max(
+                0.2, float(actual_stake) * 0.3
+            ):
+                logger.warning("pinnacle stake mismatch want=%s got=%s, refill", actual_stake, got)
                 try:
-                    data = await asyncio.wait_for(fr.evaluate(fill_js, float(stake)), timeout=5.0)
+                    data = await asyncio.wait_for(fr.evaluate(fill_js, float(actual_stake)), timeout=5.0)
                     if isinstance(data, dict) and data.get("ok"):
                         # 纯 evaluate 重填：不再键盘输入（number 框追加风险）
-                        fill_detail = f"refilled:{stake}:was:{got}"
+                        fill_detail = f"refilled:{actual_stake}:was:{got}"
                 except Exception:
                     pass
             break
@@ -1368,7 +1285,7 @@ async def ui_place_pinnacle_total(
             "pinnacle place_btn_missing samples=%s slip=%s",
             btn_samples, slip_hint[:80],
         )
-        return False, f"place_btn_missing|{fill_detail}|btns=[{btn_samples}]|slip={slip_hint[:80]}"
+        return False, f"place_btn_missing|{fill_detail}|btns=[{btn_samples}]|slip={slip_hint[:80]}", Decimal("0")
 
     await page.wait_for_timeout(800)
     step2_ok = False
@@ -1405,14 +1322,14 @@ async def ui_place_pinnacle_total(
         await page.wait_for_timeout(400)
 
     if not step2_ok:
-        return False, f"ok_modal_missing|{fill_detail}|{confirm_detail}"
+        return False, f"ok_modal_missing|{fill_detail}|{confirm_detail}", Decimal("0")
 
     # 确认后若弹出赔率变化：再读一次，≥1.7 才点「接受变化并投注」
     live2 = await _read_slip_odds()
     ok2, why2, use2 = decide_odds_change(requested_odds, live2 if live2 is not None else slip_odds)
     if not ok2:
         logger.info("pinnacle bet abort after confirm odds-change: %s", why2)
-        return False, f"odds_change_reject|{why2}|{confirm_detail}"
+        return False, f"odds_change_reject|{why2}|{confirm_detail}", Decimal("0")
     if use2 is not None:
         odds = float(use2)
 
@@ -1436,7 +1353,7 @@ async def ui_place_pinnacle_total(
             except Exception:
                 pass
     else:
-        return False, f"odds_change_reject|{why2}|{confirm_detail}"
+        return False, f"odds_change_reject|{why2}|{confirm_detail}", Decimal("0")
     await page.wait_for_timeout(2200)
 
     # 捕获站点拒绝弹窗：step2 确认后若站点拒绝（盘口失效/限额/风控），
@@ -1516,4 +1433,4 @@ async def ui_place_pinnacle_total(
             break
     await page.wait_for_timeout(600)
 
-    return True, f"{result.get('sample')}|{fill_detail}|{confirm_detail}|odds:{odds}"
+    return True, f"{result.get('sample')}|{fill_detail}|{confirm_detail}|odds:{odds}", actual_stake

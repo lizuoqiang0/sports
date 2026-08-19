@@ -198,14 +198,6 @@ async def recover_pinnacle_live_list(page) -> bool:
         cur = (page.url or "")[:160]
     except Exception:
         cur = ""
-    # 维护横幅：即使已在滚球 URL，过期遮罩也会盖住盘口且比分/赔率停更 →
-    # 整页刷新恢复（实测），不能按「已在滚球页」直接跳过
-    try:
-        if await page_shows_maintenance(page):
-            await clear_pinnacle_maintenance(page)
-            return not await page_shows_maintenance(page)
-    except Exception:
-        pass
     # 已在滚球：视为成功，留给调用方就地刮盘（比分由站点自己推送更新）
     # 就地原则：compact/sports/ 下任意页（soccer/basketball/live）都不再导航——
     # 采盘走 sports-service API（fetch compact/events），不依赖页面在 /live；
@@ -224,7 +216,8 @@ async def recover_pinnacle_live_list(page) -> bool:
         pass
     logger.info("pinnacle recover live list from url=%s", cur)
 
-    # 1) 直达滚球 URL（早盘 /sports/soccer 点「滚球」常无效）
+    # 只允许一次确定性的直达。不要再点击侧栏/球类/滚球 Tab；平博 SPA
+    # 的这些点击会继续触发路由并把登录后的页面带到错误页。
     try:
         raw = page.url or ""
         parsed = urlparse(raw if "://" in raw else f"https://{raw}")
@@ -241,43 +234,14 @@ async def recover_pinnacle_live_list(page) -> bool:
             except Exception:
                 continue
         if opened:
-            for text in ("滚球盘", "滚球", "In-Play", "Live"):
-                try:
-                    loc = page.get_by_text(text, exact=False).first
-                    if await loc.count() > 0:
-                        await loc.click(timeout=2000)
-                        await page.wait_for_timeout(700)
-                        break
-                except Exception:
-                    continue
-            from app.services.bookmakers.venue_entry import page_is_off_match_list
-            ok = not await page_is_off_match_list(page)
             try:
                 logger.info(
-                    "pinnacle recover done ok=%s url=%s",
-                    ok,
+                    "pinnacle sports entry done url=%s",
                     (page.url or "")[:140],
                 )
             except Exception:
                 pass
-            if ok:
-                return True
+            return True
     except Exception as e:
         logger.warning("pinnacle recover goto live failed: %s", e)
-
-    # 2) 点侧栏「滚球盘 / In-Play」兜底
-    for text in ("滚球盘", "In-Play", "In Play", "Live Betting"):
-        try:
-            loc = page.get_by_text(text, exact=False).first
-            if await loc.count() > 0:
-                await loc.click(timeout=2500)
-                await page.wait_for_timeout(900)
-                from app.services.bookmakers.venue_entry import page_already_on_live_board, page_is_off_match_list
-                if not await page_is_off_match_list(page):
-                    if await page_already_on_live_board(page) or "/live" in (
-                        (page.url or "").lower()
-                    ):
-                        return True
-        except Exception:
-            continue
     return False

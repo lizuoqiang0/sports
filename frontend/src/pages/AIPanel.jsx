@@ -79,6 +79,16 @@ function normalizeFormData(source, fallback = DEFAULT_FORM_DATA) {
   }
 }
 
+function adjustedRecommendationStake(rec, maxStake, minStake = 1) {
+  const dynamic = Number(rec?.recommendation?.suggested_stake || 0)
+  const maximum = Number(maxStake || 0)
+  const minimum = Math.max(1, Number(minStake || 1))
+  let amount = Number.isFinite(dynamic) && dynamic > 0 ? dynamic : minimum
+  amount = Math.max(minimum, amount)
+  if (Number.isFinite(maximum) && maximum > 0) amount = Math.min(amount, maximum)
+  return Math.round(amount * 100) / 100
+}
+
 function formatCellLine(market, cell) {
   const line = market?.line
   const sel = cell?.selection
@@ -380,8 +390,8 @@ export default function AIPanelPage() {
         rawCount: Number(data.raw_count || 0),
         analysisEnabled: !!data.analysis_enabled,
       })
-      // 金额默认取 AI 配置「单笔最大金额」（见输入框 value ?? formData.max_bet_amount）
-      // 不把历史金额写入 state，避免出现偏离当前配置的旧金额
+      // 金额不写入 state：未手动修改时始终使用每场最新动态仓位，并受
+      // 当前「单笔最大金额」约束；这样推荐更新后不会残留旧金额。
     } catch (err) {
       console.error('Load recommendations failed:', err)
       if (!silent) {
@@ -469,7 +479,8 @@ export default function AIPanelPage() {
   const handlePlaceFromRec = async (rec) => {
     // 走一键接口：服务端按 AI 配置门禁（止损止盈/每日笔数）
     const maxStake = Number(formData.max_bet_amount || 0)
-    const stake = Number(stakeByMatch[rec.match_id] || maxStake || minBetAmount || 1)
+    const suggestedStake = adjustedRecommendationStake(rec, maxStake, minBetAmount)
+    const stake = Number(stakeByMatch[rec.match_id] ?? suggestedStake)
     if (!stake || stake < minBetAmount) {
       toast.error(`金额需 ≥${minBetAmount}（AI 配置）`)
       return
@@ -499,7 +510,9 @@ export default function AIPanelPage() {
 
   // 一键投注：小球下注
   const handleOneClickAll = async (matchId) => {
-    const stake = Number(stakeByMatch[matchId] || formData.max_bet_amount || minBetAmount || 1)
+    const rec = recommendations.find((item) => Number(item.match_id) === Number(matchId))
+    const suggestedStake = adjustedRecommendationStake(rec, formData.max_bet_amount, minBetAmount)
+    const stake = Number(stakeByMatch[matchId] ?? suggestedStake)
     setBettingId(`${matchId}:all`)
     try {
       const res = await aiAPI.oneClickBet(matchId, stake, [])
@@ -556,7 +569,7 @@ export default function AIPanelPage() {
       // 最低金额跟 AI 配置：默认 1，上限为单笔最大金额
       const minBet = Number(c.min_bet_amount ?? 1)
       setMinBetAmount(minBet > 0 ? minBet : 1)
-      // 清空旧的动态金额（如 2.69），改回按配置单笔上限展示
+      // 清空人工覆盖；列表会按每场最新动态仓位重新计算默认金额。
       setStakeByMatch({})
       setFormData(normalizeFormData(c))
     } catch (err) {
@@ -1849,9 +1862,13 @@ export default function AIPanelPage() {
                         type="number"
                         min={minBetAmount}
                         max={Number(formData.max_bet_amount) || undefined}
-                        step="1"
+                        step="0.01"
                         className="input w-28 py-1.5 text-sm"
-                        value={stakeByMatch[rec.match_id] ?? Number(formData.max_bet_amount || minBetAmount || 1)}
+                        value={stakeByMatch[rec.match_id] ?? adjustedRecommendationStake(
+                          rec,
+                          formData.max_bet_amount,
+                          minBetAmount,
+                        )}
                         onChange={(e) => setStakeByMatch((s) => ({
                           ...s,
                           [rec.match_id]: Number(e.target.value) || 0,

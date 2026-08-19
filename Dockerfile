@@ -1,6 +1,10 @@
 # 生产后端：无 Playwright 浏览器；依赖可缓存，日常启动不重建
 FROM python:3.12-slim AS runtime
 
+ARG PIP_INDEX_URL
+ARG DEBIAN_MIRROR
+ARG DEBIAN_SECURITY_MIRROR
+
 WORKDIR /app
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -10,6 +14,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 # 安装运行期健康检查工具。
 RUN set -eux; \
+    if [ -n "${DEBIAN_MIRROR:-}" ]; then \
+        sed -i "s|http://deb.debian.org/debian|${DEBIAN_MIRROR}|g" /etc/apt/sources.list.d/debian.sources; \
+    fi; \
+    if [ -n "${DEBIAN_SECURITY_MIRROR:-}" ]; then \
+        sed -i "s|http://deb.debian.org/debian-security|${DEBIAN_SECURITY_MIRROR}|g" /etc/apt/sources.list.d/debian.sources; \
+    fi; \
     apt-get update \
     && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*

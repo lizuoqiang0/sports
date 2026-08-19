@@ -80,7 +80,7 @@ class BookmakerConnector(ABC):
         selection: str,
         odds: float,
         stake: Decimal,
-        bet_type: str = "total",
+        bet_type: str = "moneyline",
         odds_data: Optional[dict] = None,
     ) -> PlaceBetResult:
         ...

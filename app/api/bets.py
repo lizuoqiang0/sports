@@ -398,6 +398,13 @@ async def place_bet(
         "bet_type": req.bet_type if isinstance(req.bet_type, str) else str(req.bet_type),
         "odds_data": dict(odds_obj.odds_data or {}),
     }
+    # 真实站点可能在投注单中返回更高的最低投注额。允许平博在“本场动态
+    # 仓位”与“单笔最大金额”之间安全调整，并把余额作为第三道硬上限。
+    place_payload["odds_data"]["_stake_policy"] = {
+        "dynamic_stake": str(req.stake),
+        "max_stake": str(hi),
+        "available_balance": str(site_acc.balance or 0),
+    }
     # 队名注入 odds_data：UI 下单依赖队名定位赛事行
     place_payload["odds_data"]["_home_team"] = match.home_team or ""
     place_payload["odds_data"]["_away_team"] = match.away_team or ""
@@ -485,6 +492,13 @@ async def place_bet(
         if not place.ok:
             raise HTTPException(status_code=400, detail=place.message or f"{provider_label}下单失败")
         external_bet_id = place.external_bet_id
+        actual_stake = Decimal(str(place.actual_stake or 0))
+        if actual_stake > 0:
+            stake_val = actual_stake.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            place_payload["stake"] = stake_val
+            potential_payout = (
+                stake_val * Decimal(str(odds_val))
+            ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
         if provider_code == "ob" and external_bet_id:
             logger.info("OB 下单回执已返回 orderNo=%s，按成功受理，不再做存在性验证", external_bet_id)

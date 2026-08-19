@@ -492,13 +492,13 @@ async def browser_closed_internal(
         raise HTTPException(status_code=403, detail="forbidden")
 
     code = str((payload or {}).get("site_code") or "").lower().strip()
-    base_url = str((payload or {}).get("base_url") or "").strip()
     if code not in BOOKMAKER_CATALOG:
         raise HTTPException(status_code=404, detail="未知站点")
 
+    # Browser Gate 每个站点只有一个可见浏览器；该实例退出意味着同站所有
+    # 后端账户都失去真实页面。不要用可能带/不带尾斜杠的 base_url 精确匹配，
+    # 否则会漏掉本应断开的账户。
     q = select(BookmakerAccount).where(BookmakerAccount.code == code)
-    if base_url:
-        q = q.where(BookmakerAccount.base_url == base_url)
     result = await db.execute(q)
     rows = list(result.scalars().all())
     n = 0

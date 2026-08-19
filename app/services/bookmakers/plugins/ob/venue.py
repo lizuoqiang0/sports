@@ -146,7 +146,16 @@ async def recover_ob_live_venue(
                 break
             except Exception:
                 continue
-        await page.wait_for_timeout(2500)
+        await page.wait_for_timeout(1500)
+        # 关闭「您当前操作将会离开游戏，是否继续？」弹窗（点确定继续进馆）
+        try:
+            from app.services.bookmakers.venue_entry import dismiss_blocking_modals
+
+            await dismiss_blocking_modals(page)
+            await page.wait_for_timeout(1000)
+        except Exception:
+            pass
+        await page.wait_for_timeout(1000)
         for u in await _collect_page_urls(page):
             hu, st, _cuid = _sport_ctx_from_url(u)
             if st:

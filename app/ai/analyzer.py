@@ -390,7 +390,8 @@ class MatchAnalyzer:
             if analysis.get("models_used"):
                 try:
                     if analysis.get("consensus_reached"):
-                        await cache.set_json(cache_key, analysis, ttl=settings.LLM_CACHE_TTL)
+                        # 滚球场景比分变化快，正缓存缩短到 3 分钟（跨 1 轮 120s 轮询）
+                        await cache.set_json(cache_key, analysis, ttl=180)
                     else:
                         analysis["neg_cached"] = True
                         await cache.set_json(cache_key, analysis, ttl=settings.LLM_NEG_CACHE_TTL)
@@ -432,7 +433,7 @@ class MatchAnalyzer:
             {"role": "user", "content": prompt},
         ]
         started = time.perf_counter()
-        max_retries = 3
+        max_retries = 2  # 最多 2 次重试（共 3 次调用），确保总时长可控
         for attempt in range(max_retries + 1):
             try:
                 response = await self.client.chat.completions.create(
@@ -441,16 +442,18 @@ class MatchAnalyzer:
                     temperature=settings.LLM_TEMPERATURE,
                     max_tokens=settings.LLM_MAX_TOKENS,
                 )
+                if not response.choices:
+                    raise RuntimeError("GPT 返回空 choices（内容可能被安全过滤）")
                 break
             except Exception as e:
                 err_str = str(e).lower()
                 # 超时：不重试（GPT 已耗时长，重试只会更长）
-                if "timeout" in err_str or "timed out" in err_str:
+                if "timeout" in err_str or "timed out" in err_str or "apitimeout" in type(e).__name__.lower():
                     raise
-                # 429/限流：指数退避（1s -> 2s -> 4s）
-                if "429" in err_str or "rate" in err_str:
+                # 429/限流：指数退避（1s -> 2s），仅重试 2 次
+                if "429" in err_str or "rate" in err_str or "ratelimit" in type(e).__name__.lower():
                     if attempt < max_retries:
-                        backoff = 2 ** attempt  # 1, 2, 4
+                        backoff = 2 ** attempt  # 1, 2
                         logger.warning("[GPT] 429 限流，%ds 后重试 (attempt %d/%d)", backoff, attempt + 1, max_retries)
                         await asyncio.sleep(backoff)
                         continue
@@ -531,6 +534,20 @@ class MatchAnalyzer:
         if summary:
             analysis["reasoning"] = f"[结构化复核] {summary} | {str(analysis.get('reasoning') or '')}"[:900]
         return analysis
+
+    @staticmethod
+    def _elapsed_minutes(match_info: dict) -> Optional[float]:
+        """获取已进行分钟数（篮球倒计时自动转换为已进行时间）。"""
+        from app.services.bookmakers.match_live import match_elapsed_seconds
+        sport = str(match_info.get("sport") or "").strip().lower()
+        period = str(match_info.get("period") or "").strip()
+        clock = str(match_info.get("clock") or "").strip()
+        secs = match_elapsed_seconds(sport=sport, period=period, clock=clock)
+        if secs is not None and secs > 0:
+            return round(secs / 60.0, 2)
+        # 足球回退到直接解析
+        from app.services.bookmakers.match_live import parse_match_clock_minutes
+        return parse_match_clock_minutes(clock)
 
     @staticmethod
     def _analysis_page_signal(analysis: Any) -> dict[str, Any]:
@@ -675,9 +692,8 @@ class MatchAnalyzer:
         aws = info.get("away_score")
         if hs is None or aws is None:
             return {"supportive": False, "conflict": False, "points": 0, "reason": ""}
-        from app.services.bookmakers.match_live import parse_match_clock_minutes
 
-        mins = parse_match_clock_minutes(str(info.get("clock") or "").strip(), allow_countdown=(str(info.get("sport") or "").lower() == "basketball"))
+        mins = MatchAnalyzer._elapsed_minutes(info)
         if mins is None or mins <= 0:
             return {"supportive": False, "conflict": False, "points": 0, "reason": ""}
         current_total = _to_float(hs, 0.0) + _to_float(aws, 0.0)
@@ -726,12 +742,8 @@ class MatchAnalyzer:
         quality = ctx.get("quality") if isinstance(ctx.get("quality"), dict) else {}
         completeness = _to_float(quality.get("completeness"), 0.0)
 
-        from app.services.bookmakers.match_live import parse_match_clock_minutes
         info = match_info if isinstance(match_info, dict) else {}
-        mins = parse_match_clock_minutes(
-            str(info.get("clock") or "").strip(),
-            allow_countdown=(str(info.get("sport") or "").strip().lower() == "basketball"),
-        )
+        mins = MatchAnalyzer._elapsed_minutes(info)
 
         if selection == "under" and delta <= -0.5:
             if (mins is not None and mins <= 60) or completeness < 0.75:
@@ -1117,11 +1129,9 @@ class MatchAnalyzer:
     ) -> dict[str, Any]:
         if bet_type != "total":
             return {"supportive": False, "conflict": False, "reason": ""}
-        from app.services.bookmakers.match_live import parse_match_clock_minutes
 
         sport = str(match_info.get("sport") or "").strip().lower()
-        clock = str(match_info.get("clock") or "").strip()
-        mins = parse_match_clock_minutes(clock, allow_countdown=(sport == "basketball"))
+        mins = MatchAnalyzer._elapsed_minutes(match_info)
         supportive = False
         conflict = False
         reason = ""
@@ -1378,7 +1388,9 @@ class MatchAnalyzer:
 
         total_line = match_info.get("total_line") or match_info.get("line")
         prompt += (
-            "\n## 投注市场（全场小球）\n"
+            "\n## 投注市场（全场小球 / 上下半场小球）\n"
+            "- 仅分析全场小球(total)和上下半场小球(first_half_total/second_half_total)的 under 方向\n"
+            "- 其他玩法(胜负/让球/特殊盘/串关)一律不分析不下注\n"
             f"- 盘口线 total_line: {total_line if total_line is not None else '未知'}"
             f"{score_hint}\n"
         )
@@ -1406,7 +1418,7 @@ class MatchAnalyzer:
                 elapsed = int(mins_match.group(1))
                 if elapsed > 0 and current_goals > 0:
                     pace = round(current_goals / elapsed, 3)
-                    full_mins = 40 if sport == "basketball" else 90
+                    full_mins = 48 if sport == "basketball" else 90
                     score_analysis += f"得分节奏: {current_goals}分/{elapsed}分钟 = {pace}分/分钟。若维持此节奏，全场预计 {round(pace * full_mins, 1)} 分。\n"
 
         # 确定分析模式
@@ -1486,19 +1498,19 @@ class MatchAnalyzer:
 
 ## 输出格式（严格JSON）
 {{
-    "bet_type": "total",
+    "bet_type": "total | first_half_total | second_half_total",
     "prediction": "under 或 skip",
     "line": null,
     "confidence": 0.0-1.0,
-    "reasoning": "1.盘口:初盘X→即时X,水位变化X% 2.实时比分:当前X球,节奏X球/分钟,盘口预期X球/分钟 3.综合:量化信号+置信度理由",
+    "reasoning": "1.盘口:初盘X->即时X,水位变化X% 2.实时比分:当前X球,节奏X球/分钟,盘口预期X球/分钟 3.综合:量化信号+置信度理由",
     "key_factors": ["因素1", "因素2", "因素3"],
     "risk_level": "low/medium/high",
     "value_bets": [
-        {{"selection": "under", "bet_type": "total", "reason": "为什么有价值"}}
+        {{"selection": "under", "bet_type": "total | first_half_total | second_half_total", "reason": "为什么有价值"}}
     ]
 }}
 
-注意：prediction只能是under/skip；skip时confidence=0.0；reasoning必须包含具体数字；只输出JSON。
+注意：prediction只能是under/skip；skip时confidence=0.0；bet_type只能是total/first_half_total/second_half_total；reasoning必须包含具体数字；只输出JSON。
 """
         # 小球严格分析规则（按运动类型分离）
         if sport == "basketball":
@@ -1840,9 +1852,10 @@ class MatchAnalyzer:
                     if elapsed > 0:
                         actual_pace = round(current_goals / elapsed, 3)
                         # 盘口隐含全场预期进球 ≈ total_line
-                        expected_pace = round(total_line / 90, 3)
+                        full_mins = 48 if str(match_info.get("sport") or "").strip().lower() == "basketball" else 90
+                        expected_pace = round(total_line / full_mins, 3)
                         pace_deviation = round((actual_pace - expected_pace) / expected_pace * 100, 1) if expected_pace > 0 else 0
-                        remaining_mins = max(0, 90 - elapsed)
+                        remaining_mins = max(0, full_mins - elapsed)
                         goals_needed = max(0, total_line - current_goals + 0.5)
                         needed_pace = round(goals_needed / remaining_mins, 3) if remaining_mins > 0 else 999
 

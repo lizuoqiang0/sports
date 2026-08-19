@@ -35,6 +35,7 @@ _IN_VENUE_MARKERS = (
     "In-Play",
     "Money Line",
     "Handicap",
+    "大小球",
     "足球",
     "篮球",
     "棒球",
@@ -85,6 +86,7 @@ _STRONG_VENUE_MARKERS = (
     "赛果比分",
     "滚球",
     "独赢",
+    "大小球",
     "半全场",
     "进球数",
     "角球",
@@ -95,8 +97,7 @@ _STRONG_VENUE_MARKERS = (
     "波胆",
     "双重机会",
     "Team",
-    "小球",
-    "Under",
+    "Over/Under",
     "Asian Handicap",
     "1X2",
     "Double Chance",
@@ -153,10 +154,6 @@ def _is_venue_url(url: str) -> bool:
     elif re.search(r"/game/sport/?$", path_only):
         return False
     if re.search(r"[?&]enname=ybty\b", u) and "token=" not in u and "app-h5" not in u and "yewu" not in u:
-        return False
-    # zlshelves 的 /#/home 只是 OB 场馆的导航壳；真正的盘口地址会带
-    # token 或进入具体业务路由。若把它当成 H5，后续会一直在分类页采空。
-    if "zlshelves" in u and re.search(r"/#/?(?:home)?/?(?:[?#].*)?$", u) and "token=" not in u:
         return False
 
     # === 强特征 URL（命中即判定为场馆页）===
@@ -253,29 +250,6 @@ def _is_venue_url(url: str) -> bool:
     return False
 
 
-def is_ob_entry_shell_url(url: str) -> bool:
-    """OB 中心钱包入口壳，不是可拉取 matchesPB 的体育场馆页。"""
-    u = (url or "").lower()
-    path = urlparse(u).path.rstrip("/")
-    return (
-        path in ("/game/sport", "/game/sport/ob")
-        and not any(marker in u for marker in ("token=", "app-h5", "yewu", "zlshelves"))
-    )
-
-
-async def _ob_shell_has_real_venue_frame(page) -> bool:
-    """入口壳仅接受实际 H5 frame，不能依据分类导航文字放行。"""
-    try:
-        for frame in page.frames:
-            if frame == page.main_frame:
-                continue
-            if _is_venue_url(frame.url or ""):
-                return True
-    except Exception:
-        pass
-    return False
-
-
 def _is_dead_page_url(url: str) -> bool:
     u = (url or "").lower()
     return (
@@ -334,61 +308,6 @@ async def capture_live_venue_url(page) -> str:
             except Exception:
                 pass
             return u
-        # OB/开云 常停在壳页，真实 token/h5 地址挂在 iframe storage 里
-        try:
-            found = await p.evaluate(
-                """() => {
-                  const out = [];
-                  const push = (u) => {
-                    if (!u) return;
-                    const s = String(u).trim();
-                    if (s && s.includes('token=') && out.indexOf(s) < 0) out.push(s);
-                  };
-                  const scan = (v, depth = 0) => {
-                    if (v == null || depth > 5) return;
-                    if (typeof v === 'string') {
-                      const s = v.trim();
-                      if (!s) return;
-                      if (s.includes('token=')) push(s);
-                      try {
-                        const j = JSON.parse(s);
-                        if (j && typeof j === 'object') scan(j, depth + 1);
-                      } catch (e) {}
-                      return;
-                    }
-                    if (Array.isArray(v)) {
-                      for (const item of v) scan(item, depth + 1);
-                      return;
-                    }
-                    if (typeof v !== 'object') return;
-                    for (const val of Object.values(v)) scan(val, depth + 1);
-                  };
-                  try { push(location.href); } catch (e) {}
-                  try {
-                    for (const store of [localStorage, sessionStorage]) {
-                      if (!store) continue;
-                      for (let i = 0; i < store.length; i++) {
-                        const key = store.key(i) || '';
-                        const val = store.getItem(key) || '';
-                        if (val) scan(val, 0);
-                      }
-                    }
-                  } catch (e) {}
-                  try {
-                    document.querySelectorAll('iframe').forEach((f) => {
-                      try { push(f.src || ''); } catch (e) {}
-                    });
-                  } catch (e) {}
-                  return out.slice(0, 10);
-                }"""
-            )
-            if isinstance(found, list):
-                for item in found:
-                    cand = str(item or "").strip()
-                    if cand and _is_venue_url(cand):
-                        return cand
-        except Exception:
-            pass
     return ""
 
 
@@ -425,10 +344,6 @@ async def page_looks_like_sportsbook(page) -> bool:
         url = page.url or ""
     except Exception:
         url = ""
-    # OB 入口页本身会渲染滚球分类和数量，通用文本规则会把它误认为盘口。
-    # 只有其 iframe 已打开真实 H5 时，才能判为可用场馆。
-    if is_ob_entry_shell_url(url):
-        return await _ob_shell_has_real_venue_frame(page)
     if _is_venue_url(url):
         return True
 
@@ -546,124 +461,6 @@ async def _click_first_text(page, texts: tuple[str, ...] | list[str], *, exact: 
     return False
 
 
-async def activate_ob_gateway_live(page) -> bool:
-    """在 OB 中心钱包嵌入的 H5 内激活滚球列表，不触碰盘口或下注控件。"""
-    try:
-        if page is None or page.is_closed() or not is_ob_entry_shell_url(page.url or ""):
-            return False
-    except Exception:
-        return False
-
-    # 入口壳页可能每轮同步都会出现；限制点击频率，避免反复刷新 H5 路由。
-    # 冷却 5s（原 20s 太长，H5 会在 20s 内恢复为概览页，导致后续轮次无比赛数据）
-    now = time.monotonic()
-    last = float(getattr(page, "_ob_gateway_live_click_at", 0.0) or 0.0)
-    if now - last < 5.0:
-        return False
-
-    for frame in getattr(page, "frames", []) or []:
-        if frame == getattr(page, "main_frame", None):
-            continue
-        try:
-            frame_url = (frame.url or "").lower()
-        except Exception:
-            frame_url = ""
-        if not any(marker in frame_url for marker in ("zlshelves", "app-h5", "yewu")):
-            continue
-        # 点击「滚球盘」激活滚球列表
-        for label in ("滚球盘", "滚球", "Live"):
-            try:
-                loc = frame.get_by_text(label, exact=True).first
-                if await loc.count() == 0:
-                    loc = frame.get_by_text(label, exact=False).first
-                if await loc.count() == 0:
-                    continue
-                await loc.click(timeout=3000)
-                page._ob_gateway_live_click_at = now
-                await page.wait_for_timeout(2000)
-                logger.info("OB gateway H5 activated live entry label=%s", label)
-                return True
-            except Exception:
-                continue
-    return False
-
-
-async def ensure_ob_football_live(page) -> bool:
-    """每轮调用：确保 H5 在足球滚球页面。无冷却，每轮都执行。
-
-    1. 找到 zlshelves H5 iframe
-    2. 检查当前是否已在足球滚球页（有 LIVE 标记的比赛行）
-    3. 如果不在，点击「足球」菜单 + 「滚球」tab
-    """
-    try:
-        for frame in getattr(page, "frames", []) or []:
-            if frame == getattr(page, "main_frame", None):
-                continue
-            frame_url = frame.url or ""
-            if not any(marker in frame_url for marker in ("zlshelves", "app-h5")):
-                continue
-
-            # 检查是否已在足球滚球页：看 DOM 中是否有 football 比赛行（非"今日"非概览）
-            try:
-                on_football_live = await frame.evaluate("""() => {
-                  const t = document.body?.innerText || '';
-                  // 有"今日 (足球)"说明在今日页，需要切到滚球
-                  if (t.includes('今日') && t.includes('足球') && !t.includes('滚球')) return false;
-                  // 有"滚球"标记且有比赛行（含比分/时间）说明已在滚球页
-                  if (t.includes('滚球') && /\d+['′]/.test(t)) return true;
-                  // 有 LIVE 标记且有队名（非概览页的 X LIVE Y 格式）
-                  const liveMatch = t.match(/(\S+)\s+\d+\s*[:-]\s*\d+\s+(\S+)/);
-                  if (liveMatch && !t.includes('选择联赛')) return true;
-                  return false;
-                }""")
-                if on_football_live:
-                    return True  # 已在足球滚球页，不需要点击
-            except Exception:
-                pass
-
-            # 不在足球滚球页，点击「足球」菜单项
-            try:
-                fb_loc = frame.locator("div.menu-item.menu-fold1").filter(
-                    has_text="足球"
-                ).filter(has_text="LIVE").filter(has_not_text="电子")
-                if await fb_loc.count() > 0:
-                    await fb_loc.first.click(timeout=3000, force=True)
-                    await page.wait_for_timeout(2000)
-                    logger.info("OB H5 ensure_football: clicked football menu")
-
-                    # 在足球页找"滚球"tab并点击（用 dispatchEvent 触发 Vue 事件）
-                    clicked_live = await frame.evaluate("""() => {
-                      // 找精确文本为"滚球"的元素（排除"滚球盘"）
-                      const els = document.querySelectorAll('a, button, span, div, li, [role=tab]');
-                      for (const el of els) {
-                        const t = (el.innerText || '').trim();
-                        if (t === '滚球') {
-                          const r = el.getBoundingClientRect();
-                          if (r.width > 0 && r.height > 0) {
-                            // 用 MouseEvent 模拟真实点击（Vue @click 能捕获）
-                            const ev = new MouseEvent('click', {bubbles: true, cancelable: true, view: window});
-                            el.dispatchEvent(ev);
-                            return true;
-                          }
-                        }
-                      }
-                      return false;
-                    }""")
-                    if clicked_live:
-                        await page.wait_for_timeout(2000)
-                        logger.info("OB H5 ensure_football: clicked 滚球 tab via dispatchEvent")
-                    return True
-                else:
-                    # 没有"足球 LIVE"菜单项，可能当前无足球滚球
-                    return False
-            except Exception as e:
-                logger.debug("OB H5 ensure_football failed: %s", e)
-                return False
-        return False
-    except Exception:
-        return False
-
-
 async def ensure_european_odds_display(page) -> bool:
     """把场馆赔率类型切到亚洲盘（小数），便于分析与下单口径一致。"""
     switched = False
@@ -729,7 +526,7 @@ async def dismiss_blocking_modals(page) -> None:
         return /交易密码|支付密码|资金密码|提款密码|fund\\s*password|pay\\s*password|fundPassword/i.test(t)
           && t.length < 600;
       };
-      const safeClose = ['关闭','取消','稍后','暂不','知道了','我知道了','跳过','忽略','×','X','Close','Cancel','好的'];
+      const safeClose = ['关闭','取消','稍后','暂不','知道了','我知道了','跳过','忽略','×','X','Close','Cancel'];
       const confirmTxt = ['确定','确认','提交','完成','下一步','OK','Confirm','Verify'];
 
       const clickSafeClose = (root) => {
@@ -780,30 +577,8 @@ async def dismiss_blocking_modals(page) -> None:
           return;
         }
         const body = String(m.innerText || '').slice(0, 160);
-        // OB 遮盖弹窗：含「好的」按钮同样处理
-        const hasHaoDe = (() => {
-          const btns = m.querySelectorAll('button, a, span');
-          for (const b of btns) {
-            const t = String(b.innerText || b.textContent || '').trim();
-            if (t === '好的') return true;
-          }
-          return false;
-        })();
-        // 「您当前操作将会离开游戏，是否继续？」弹窗：点「取消」留在场馆
-        const isLeaveGame = /离开游戏|是否继续|离开.*游戏/.test(body);
-        if (isLeaveGame) {
-          const btns = m.querySelectorAll('button, a, span, input[type="button"], input[type="submit"]');
-          for (const el of btns) {
-            const t = String(el.innerText || el.textContent || el.value || '').trim();
-            if (safeClose.some((x) => t === x) || t === '取消') {
-              try { el.click(); } catch (e) {}
-              break;
-            }
-          }
-          touched += 1;
-          return;
-        }
-        if (!/公告|活动|优惠|欢迎|提示|消息|更新|维护|领取/.test(body) && !hasHaoDe) return;
+        // 只处理明显公告/活动弹层；普通业务弹层不动
+        if (!/公告|活动|优惠|欢迎|提示|消息|更新|维护|领取/.test(body)) return;
         clickSafeClose(m);
         const nodes = m.querySelectorAll('button, a, span');
         for (const el of nodes) {
@@ -824,37 +599,6 @@ async def dismiss_blocking_modals(page) -> None:
     }"""
     try:
         await page.evaluate(dismiss_js)
-    except Exception:
-        pass
-    # 彻底移除「离开游戏」弹窗：清除 beforeunload 守卫 + 隐藏弹窗 DOM
-    try:
-        await page.evaluate("""() => {
-          // 1. 移除 beforeunload 守卫，防止导航时弹窗
-          window.onbeforeunload = null;
-          window.onpagehide = null;
-          // 2. 拦截后续的 beforeunload 注册
-          window.addEventListener = (function(orig) {
-            return function(type, listener, options) {
-              if (type === 'beforeunload' || type === 'pagehide') return;
-              return orig.call(this, type, listener, options);
-            };
-          })(window.addEventListener);
-          // 3. 隐藏含「离开游戏」的所有弹窗
-          const all = document.querySelectorAll('div, section, aside, .van-overlay, .van-dialog, .modal');
-          for (const el of all) {
-            const txt = String(el.innerText || '').slice(0, 200);
-            if (/离开游戏|是否继续/.test(txt)) {
-              el.style.setProperty('display', 'none', 'important');
-              el.style.setProperty('pointer-events', 'none', 'important');
-              // 也点取消
-              const btns = el.querySelectorAll('button, a, span');
-              for (const b of btns) {
-                const t = String(b.innerText || b.textContent || '').trim();
-                if (t === '取消') { try { b.click(); } catch (e) {} break; }
-              }
-            }
-          }
-        }""")
     except Exception:
         pass
     for fr in getattr(page, "frames", []) or []:
@@ -986,14 +730,6 @@ async def page_already_on_live_board(page) -> bool:
         url = ""
     # 搜索/账户页绝不是滚球盘（下注后常停在 compact/search）
     if page_url_off_match_list(url):
-        return False
-    # OB 的 enName=YBTY 是赛事分类壳页，包含“滚球盘”等导航文字和数量，
-    # 但尚未展开任何实际比赛；不能因此跳过足球滚球入口。
-    if (
-        "/game/sport/ob" in url
-        and "enname=ybty" in url
-        and not any(marker in url for marker in ("token=", "app-h5", "yewu", "zlshelves"))
-    ):
         return False
     # 平博：侧栏也有「滚球盘」文案，早盘 /sports/soccer 会被误判；必须 URL 带 /live
     if "rowilong" in url or "pinnacle" in url or "/compact/sports/" in url:
@@ -1287,28 +1023,14 @@ async def _auto_click_into_venue(page, *, site_code: str, context=None) -> Any:
             await _click_first_text(active, entries, exact=False)
             await active.wait_for_timeout(1200)
 
-        # 新开页：只接管同源门户页或已识别的体育场馆页。某些门户点击时会
-        # 同时弹出推广/视频标签，不能因为它排在最后就把采盘会话切过去。
+        # 新开页
         ctx = context or getattr(active, "context", None)
         if ctx is not None:
             try:
                 pages = list(ctx.pages)
-                current_url = active.url or ""
-                current_origin = urlparse(current_url).netloc.lower()
-                for candidate in reversed(pages):
-                    try:
-                        if candidate.is_closed():
-                            continue
-                        candidate_url = candidate.url or ""
-                    except Exception:
-                        continue
-                    candidate_origin = urlparse(candidate_url).netloc.lower()
-                    if _is_venue_url(candidate_url) or (
-                        current_origin and candidate_origin == current_origin
-                    ):
-                        active = candidate
-                        break
-                # 禁止 bring_to_front：平博/OB 可见窗会被抢到系统前台
+                if pages:
+                    active = pages[-1]
+                    # 禁止 bring_to_front：平博/OB 可见窗会被抢到系统前台
             except Exception:
                 pass
 
@@ -1351,33 +1073,10 @@ async def enter_portal_venue(
 
     try:
         already = await page_looks_like_sportsbook(page) and not await page_looks_like_venue_lobby(page)
-        # 综合站首页会展示赛事、直播等营销文案，但并非可下注的 OB H5。
-        # OB 只有真实 H5/业务域或带 token 的场馆 URL 才可跳过进馆流程。
-        if code == "ob" and not _is_venue_url(cur):
-            already = False
         if not already and _is_venue_url(cur):
             already = True
     except Exception:
         already = False
-    if code == "pinnacle":
-        # 平博登录成功后只做一次确定性的体育页跳转。不要走通用的
-        # “足球→篮球→滚球→全部”点击序列，那个序列会触发多个 SPA 路由，
-        # 最终把页面带到错误状态。
-        if already:
-            logger.info("pinnacle already on sports page url=%s", (cur or "")[:160])
-            return page, cur
-        from app.services.bookmakers.plugins.pinnacle.venue import recover_pinnacle_live_list
-
-        ok = await recover_pinnacle_live_list(page)
-        try:
-            final_url = page.url or ""
-        except Exception:
-            final_url = ""
-        if ok:
-            logger.info("pinnacle entered sports page once url=%s", final_url[:160])
-        else:
-            logger.warning("pinnacle sports entry failed url=%s", final_url[:160])
-        return page, final_url
     if already:
         await dismiss_h5_orient_tip(page)
         try:
@@ -1457,11 +1156,6 @@ async def is_in_sportsbook(page) -> bool:
         url = ""
     if _is_dead_page_url(url):
         return False
-
-    # 中心钱包的 OB 入口页只有分类导航，必须确认 iframe 已加载真实 H5；
-    # 不能再让「足球 LIVE 125」之类的数量文案误导恢复和同步流程。
-    if is_ob_entry_shell_url(url):
-        return await _ob_shell_has_real_venue_frame(page)
 
     # 1) URL 强匹配（已增强的 _is_venue_url）
     if _is_venue_url(url):

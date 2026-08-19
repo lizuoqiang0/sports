@@ -14,7 +14,7 @@ from app.ai.strategy import (
     load_fresh_strategy,
 )
 from app.config import settings
-from app.models.user import Bet
+from app.models.user import Bet, BetStatus
 
 
 def min_stake_floor(strat: StrategyConfig | None = None) -> Decimal:
@@ -50,6 +50,38 @@ def cap_stake(stake: Decimal | float, strat: StrategyConfig) -> Decimal:
     return min(max(s, lo), hi)
 
 
+def resolve_site_minimum_stake(
+    *,
+    requested_stake: Decimal | float,
+    dynamic_stake: Decimal | float,
+    site_minimum: Decimal | float,
+    max_stake: Decimal | float,
+    available_balance: Decimal | float | None = None,
+) -> tuple[Decimal | None, str]:
+    """按站点最低额调整仓位，并保留策略上限和余额两道硬门禁。"""
+    requested = Decimal(str(requested_stake or 0))
+    dynamic = Decimal(str(dynamic_stake or 0))
+    minimum = Decimal(str(site_minimum or 0))
+    maximum = Decimal(str(max_stake or 0))
+    if requested <= 0 or maximum <= 0:
+        return None, "invalid_stake_policy"
+    if requested > maximum:
+        return None, "requested_stake_exceeds_strategy_cap"
+
+    # 仅在站点最低额高于本次请求时，才提升到策略给出的动态仓位；
+    # 动态仓位仍不足时才以站点最低额为准。
+    adjusted = minimum > requested
+    target = max(requested, dynamic, minimum) if adjusted else requested
+    if target > maximum:
+        return None, "site_minimum_exceeds_strategy_cap"
+    if available_balance is not None:
+        balance = Decimal(str(available_balance or 0))
+        if balance <= 0 or target > balance:
+            return None, "site_minimum_exceeds_available_balance"
+    reason = "site_minimum_adjusted" if adjusted else "requested_stake"
+    return target.quantize(Decimal("0.01")), reason
+
+
 def team_is_excluded(home: str, away: str, excluded: list[str] | None) -> bool:
     if not excluded:
         return False
@@ -77,13 +109,25 @@ def sport_is_preferred(sport: str, preferred: list[str] | None) -> bool:
 
 
 async def calc_daily_pnl(db: AsyncSession, user_id: int) -> Decimal:
-    """日风控盈亏：以午夜总资产为基线，供止损/止盈门禁使用。"""
+    """日风控盈亏：当日总资产变化 + 未结算注单 stake（避免 pending 被误计为亏损）。"""
     from app.services.balances import load_site_balances
     from app.services.daily_pnl import get_daily_pnl
 
     site_balances = await load_site_balances(db, user_id)
     total_assets = sum(float(s.get("balance") or 0) for s in site_balances)
-    pnl_info = await get_daily_pnl(user_id, total_assets)
+
+    # 加回未结算注单的 stake（站点余额已扣除 pending stake，但未结算≠亏损）
+    pending_result = await db.execute(
+        select(func.sum(Bet.stake)).where(
+            Bet.user_id == int(user_id),
+            Bet.status == BetStatus.SUCCESS,
+            Bet.actual_payout.is_(None),
+        )
+    )
+    pending_stake = float(pending_result.scalar() or 0)
+    adjusted_total = total_assets + pending_stake
+
+    pnl_info = await get_daily_pnl(user_id, adjusted_total)
     return Decimal(str(pnl_info["daily_pnl"]))
 
 
@@ -114,9 +158,9 @@ async def check_daily_risk(
     stop = Decimal(str(strat.stop_loss or 0))
     take = Decimal(str(strat.take_profit or 0))
     if stop > 0 and pnl <= -stop:
-        return True, f"触发止损线: 日亏损 {pnl} >= {stop}"
+        return True, f"触发止损线: 日亏损 {abs(float(pnl))} >= 止损额 {stop}"
     if take > 0 and pnl >= take:
-        return True, f"触发止盈线: 日收益 {pnl} >= {take}"
+        return True, f"触发止盈线: 日收益 {float(pnl)} >= 止盈额 {take}"
     n = await count_today_bets(db, user_id)
     max_n = int(strat.max_daily_bets or 10)
     if n >= max_n:
@@ -135,11 +179,25 @@ async def gate_recommendation_for_place(
     一键/手动下单前：完整策略校验。
     返回 (ok, reason, capped_stake, strat)。
     """
-    _, strat = await load_fresh_strategy(user_id)
+    ai_config, strat = await load_fresh_strategy(user_id)
     r = rec.get("recommendation") or {}
     if not r.get("should_bet"):
         why = str(r.get("reasoning") or "策略未通过，不可下单")
         return False, why, Decimal("0"), strat
+
+    # 球队排除检查
+    home = str(rec.get("home_team") or rec.get("home") or "")
+    away = str(rec.get("away_team") or rec.get("away") or "")
+    excluded = list(ai_config.excluded_teams) if ai_config and ai_config.excluded_teams else None
+    if team_is_excluded(home, away, excluded):
+        return False, "球队在排除名单中", Decimal("0"), strat
+
+    # 球类偏好检查
+    sport = str(rec.get("sport") or "")
+    preferred = list(ai_config.preferred_sports) if ai_config and ai_config.preferred_sports else None
+    if not sport_is_preferred(sport, preferred):
+        return False, f"球类 {sport} 不在偏好列表中", Decimal("0"), strat
+
     triggered, risk_why = await check_daily_risk(db, user_id, strat)
     if triggered:
         return False, risk_why, Decimal("0"), strat

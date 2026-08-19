@@ -135,7 +135,9 @@ def skip_reason_for_match(
         return "league_blacklisted"
 
     sport_l = str(sport or "").lower()
-    check = total_odds_meet_min if require_total_only or sport_l == "basketball" else any_market_odds_meet_min
+    # 只分析有小球赔率(TOTAL under)的比赛——全场小球或上下半场小球
+    # 足球和篮球都强制 require_total_only：无 TOTAL 赔率的比赛直接跳过
+    check = total_odds_meet_min
     if odds_map is not None and not check(odds_map, floor=min_odds, ceiling=max_odds):
         return "odds_out_of_range"
     sport_key, period, clock = local_match_clock_period(m)
@@ -297,7 +299,7 @@ async def enrich_recs_skip_from_db(
                 line_by[mid_i] = float(total)
             except (TypeError, ValueError):
                 continue
-        await db.commit()
+        # 只读查询，无需 commit
 
     out: list[dict] = []
     for r in recs:

@@ -142,12 +142,14 @@ class BrowserSiteConnector(BookmakerConnector):
 
         manual = bool(self.extra.get("manual_venue")) or needs_manual_venue(self.code)
 
-        # HTTP 探测受站点风控、地区线路影响，不能据此把旧 token 判成登录成功。
-        # 后续 Browser Gate 会在真实浏览器上下文中校验会话并执行必要的登录恢复。
-        if self.session_token and not await self._probe_site(timeout=3.0):
-            logger.warning(
-                "site probe unavailable for %s; continue with Browser Gate session validation",
-                self.code,
+        # 站点不可达但已有会话：自动模式下可软通过；手动进馆时仍要求可达
+        if self.session_token and not await self._probe_site(timeout=3.0) and not manual:
+            return VerifyResult(
+                ok=True,
+                message="已保存会话；站点暂时不可达，跳过浏览器登录（可稍后同步）",
+                balance=self._balance,
+                profile=self._profile or {"name": self.username},
+                session_token=self.session_token,
             )
 
         if not self.username or not self.password:
@@ -273,7 +275,7 @@ class BrowserSiteConnector(BookmakerConnector):
                     continue
                 odds_list.append(
                     RemoteOdds(
-                        bet_type=str(od.get("bet_type") or "total"),
+                        bet_type=str(od.get("bet_type") or "moneyline"),
                         odds_data=dict(od.get("odds_data") or {}),
                         spread=float(od.get("spread") or 0),
                         total=float(od.get("total") or 0),
@@ -328,7 +330,6 @@ class BrowserSiteConnector(BookmakerConnector):
         import asyncio
 
         data = None
-        recovered_login = False
         # 滚球：Gate 已会等车道；客户端少重试、短退避，避免空等堆叠
         max_attempts = 4 if live_only else 3
         for attempt in range(max_attempts):
@@ -339,22 +340,10 @@ class BrowserSiteConnector(BookmakerConnector):
                 live_only=live_only,
                 limit=limit,
                 venue_url=str((self._profile or {}).get("venue_url") or ""),
-                timeout=120.0 if live_only else 90.0,
+                timeout=90.0 if live_only else 75.0,
             )
             if data is None:
                 return None
-            if data.get("auth_expired") and self.code == "pinnacle" and not recovered_login:
-                recovered_login = True
-                logger.warning("pinnacle session expired; starting automatic re-login before live sync")
-                login = await self._login_via_gate(force_new=False)
-                if not login or not login.ok:
-                    logger.warning(
-                        "pinnacle automatic re-login failed: %s",
-                        getattr(login, "message", "unknown error"),
-                    )
-                    return None
-                # _login_via_gate 已更新 session_token；下一轮会用新 cookie 快照重拉滚球。
-                continue
             if data.get("busy"):
                 logger.info(
                     "gate odds %s busy (attempt %s/%s): %s",
@@ -403,7 +392,7 @@ class BrowserSiteConnector(BookmakerConnector):
         selection: str,
         odds: float,
         stake: Decimal,
-        bet_type: str = "total",
+        bet_type: str = "moneyline",
         odds_data: Optional[dict] = None,
     ) -> PlaceBetResult:
         if gate_url() and self.session_token:

@@ -15,7 +15,7 @@ _CHINA_LEAGUE_RE = re.compile(
     r"chinese\s*basketball|china\s*basketball|"
     r"港超|香港超级|香港甲组|香港联赛|"
     r"澳门|澳門|"
-    r"台湾|台灣|"
+    r"台湾|台灣|中华台北|中華台北|"
     r"\bsbl\b|p\.?\s*league\s*\+?|t1\s*league|"
     r"中国\s*[A-Za-z]*\s*(联赛|杯|锦标赛|超级)"
     r")",

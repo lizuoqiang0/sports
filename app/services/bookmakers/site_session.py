@@ -57,6 +57,9 @@ class KeptSiteSession:
     last_balance: float = 0.0
     balance_recognized: bool = False
     last_restore_at: float = 0.0
+    # 重新验证会主动关闭旧 Chromium。该关闭不是用户退出，不能通知后端
+    # 把正在建立的新连接标记成 DISCONNECTED。
+    suppress_disconnect_notify: bool = False
 
     @property
     def age_sec(self) -> float:
@@ -113,6 +116,10 @@ class SiteSessionManager:
             try:
                 if sess.browser and getattr(sess.browser, "is_connected", lambda: True)():
                     n += 1
+                elif self._page_alive(sess):
+                    # launch_persistent_context 没有单独的 Browser 句柄，但仍是
+                    # 一个真实可见的 Chromium 会话。
+                    n += 1
             except Exception:
                 if sess.page and not sess.page.is_closed():
                     n += 1
@@ -158,6 +165,7 @@ class SiteSessionManager:
                 if same_key or same_code:
                     doomed.append(self._sessions.pop(k))
         for sess in doomed:
+            sess.suppress_disconnect_notify = True
             logger.warning(
                 "evict duplicate browser key=%s site=%s",
                 sess.key,
@@ -187,12 +195,17 @@ class SiteSessionManager:
                 same_key = k == key
                 same_code = code and (old.site_code or "").lower() == code
                 if same_browser:
+                    # 同一 Chromium 从“登录占位”升级为“已登录会话”时会创建
+                    # 新会话对象。旧对象上的监听器仍会随浏览器关闭触发，必须
+                    # 标记为陈旧，否则下次重新验证会误发 browser-closed。
+                    old.suppress_disconnect_notify = True
                     self._sessions.pop(k, None)
                     continue
                 if same_key or same_code:
                     doomed.append(self._sessions.pop(k))
 
         for old in doomed:
+            old.suppress_disconnect_notify = True
             logger.warning(
                 "adopt close other browser key=%s site=%s",
                 old.key,
@@ -239,21 +252,35 @@ class SiteSessionManager:
         sess._listener_gen = gen
         page = sess.page
         browser = sess.browser
+        context = sess.context
         if page is not None:
             try:
                 page.on(
                     "close",
-                    lambda _gen=gen: asyncio.create_task(
+                    lambda *_args, _gen=gen: asyncio.create_task(
                         self._on_page_closed_if_current(sess, _gen)
                     ),
                 )
+            except Exception:
+                pass
+        if context is not None and not getattr(sess, "_context_listener_set", False):
+            try:
+                context.on(
+                    "close",
+                    lambda *_args: asyncio.create_task(
+                        self._on_browser_disconnected(sess)
+                    ),
+                )
+                sess._context_listener_set = True
             except Exception:
                 pass
         if browser is not None and not getattr(sess, "_browser_listener_set", False):
             try:
                 browser.on(
                     "disconnected",
-                    lambda: asyncio.create_task(self._on_browser_disconnected(sess)),
+                    lambda *_args: asyncio.create_task(
+                        self._on_browser_disconnected(sess)
+                    ),
                 )
                 sess._browser_listener_set = True
             except Exception:
@@ -371,24 +398,41 @@ class SiteSessionManager:
                     sess.key,
                 )
                 return
-            async with self._lock:
-                if self._sessions.get(sess.key) is sess:
-                    self._sessions.pop(sess.key, None)
+            # persistent context 关闭时没有 Browser.disconnected 事件；统一走
+            # 完整断连逻辑，清本地凭据并通知后端将站点标成未连接。
+            await self._on_browser_disconnected(sess)
         except Exception:
             logger.debug("recover_after_page_close ignored", exc_info=True)
 
     async def _on_browser_disconnected(self, sess: KeptSiteSession) -> None:
         """浏览器关闭时只清理所属实例，绝不误伤刚替换的新会话。"""
+        if sess.suppress_disconnect_notify:
+            logger.info(
+                "intentional browser replacement closed key=%s site=%s",
+                sess.key,
+                sess.site_code or "?",
+            )
+            return
         logger.warning(
             "browser disconnected: key=%s site=%s",
             sess.key,
             sess.site_code or "?",
         )
         async with self._lock:
+            if bool(getattr(sess, "_disconnect_handled", False)):
+                return
             current = self._sessions.get(sess.key)
+            same_runtime = bool(
+                current is not None
+                and (
+                    (sess.browser is not None and current.browser is sess.browser)
+                    or (sess.context is not None and current.context is sess.context)
+                    or (sess.page is not None and current.page is sess.page)
+                )
+            )
             # 旧 Chromium 的 disconnected 事件可能晚于新浏览器 adopt。此时
             # key 已指向替代会话，旧回调必须完全忽略，不能清 token/通知后端。
-            if current is not None and current is not sess and current.browser is not sess.browser:
+            if current is not None and current is not sess and not same_runtime:
                 logger.info(
                     "ignore stale browser disconnect key=%s old_site=%s new_site=%s",
                     sess.key,
@@ -397,9 +441,13 @@ class SiteSessionManager:
                 )
                 return
 
+            sess._disconnect_handled = True
+
             doomed: list[KeptSiteSession] = []
             for k, s in list(self._sessions.items()):
-                if s is sess or s.browser is sess.browser:
+                same_browser = sess.browser is not None and s.browser is sess.browser
+                same_context = sess.context is not None and s.context is sess.context
+                if s is sess or same_browser or same_context:
                     doomed.append(self._sessions.pop(k))
         for s in doomed:
             # browser 已断：只 stop playwright，勿再 browser.close
@@ -415,11 +463,15 @@ class SiteSessionManager:
             s.playwright = None
             s.venue_url = ""
             s.token = ""
-        # 可选：通知后端标记断开（不阻塞）
+        # 浏览器事件处理完成前确认后端已收到断连通知，避免 UI 继续把已关闭
+        # 的 OB/平博会话显示为“已连接”。
         try:
-            asyncio.create_task(self._notify_backend_disconnected(sess))
-        except Exception:
-            pass
+            await asyncio.wait_for(
+                self._notify_backend_disconnected(sess),
+                timeout=6.0,
+            )
+        except Exception as e:
+            logger.debug("notify backend disconnected did not complete: %s", e)
 
     async def _notify_backend_disconnected(self, sess: KeptSiteSession) -> None:
         """通知后端该站浏览器已关，应标记 DISCONNECTED。"""
@@ -436,7 +488,7 @@ class SiteSessionManager:
             return
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
-                await client.post(
+                resp = await client.post(
                     f"{base}/api/v1/bookmakers/internal/browser-closed",
                     json={
                         "site_code": code,
@@ -444,6 +496,12 @@ class SiteSessionManager:
                     },
                     headers={"X-Internal-Token": token},
                 )
+                if resp.status_code >= 400:
+                    logger.warning(
+                        "notify backend browser-closed rejected status=%s body=%s",
+                        resp.status_code,
+                        (resp.text or "")[:160],
+                    )
         except Exception as e:
             logger.debug("notify backend browser-closed failed: %s", e)
 
@@ -692,6 +750,7 @@ class SiteSessionManager:
                         continue
                     self._sessions.pop(k, None)
                     try:
+                        other.suppress_disconnect_notify = True
                         await self._dispose(other)
                     except Exception:
                         pass
