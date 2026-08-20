@@ -1,6 +1,7 @@
 """人工 / 自动共用的 AI 策略门禁：严格按配置参数运行。"""
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Optional
@@ -15,6 +16,8 @@ from app.ai.strategy import (
 )
 from app.config import settings
 from app.models.user import Bet, BetStatus
+
+logger = logging.getLogger(__name__)
 
 
 def min_stake_floor(strat: StrategyConfig | None = None) -> Decimal:
@@ -109,11 +112,23 @@ def sport_is_preferred(sport: str, preferred: list[str] | None) -> bool:
 
 
 async def calc_daily_pnl(db: AsyncSession, user_id: int) -> Decimal:
-    """日风控盈亏：当日总资产变化 + 未结算注单 stake（避免 pending 被误计为亏损）。"""
+    """日风控盈亏：当日总资产变化 + 未结算注单 stake（避免 pending 被误计为亏损）。
+
+    数据可信性保护：所有站点余额都非 live（src=none，如 Gate 会话掉线）
+    时，总资产读数不可信（读 0 会让基线差被误判成巨额亏损触发止损）。
+    此时返回 Decimal(0)（中性值，不触发风控），等余额恢复再正常计算。
+    """
     from app.services.balances import load_site_balances
     from app.services.daily_pnl import get_daily_pnl
 
     site_balances = await load_site_balances(db, user_id)
+    live_sites = [s for s in site_balances if s.get("is_live") or s.get("live")]
+    if site_balances and not live_sites:
+        logger.warning(
+            "calc_daily_pnl: 所有站点余额均非实时（Gate 会话掉线？），跳过风控盈亏计算 user=%s",
+            user_id,
+        )
+        return Decimal("0")
     total_assets = sum(float(s.get("balance") or 0) for s in site_balances)
 
     # 加回未结算注单的 stake（站点余额已扣除 pending stake，但未结算≠亏损）
