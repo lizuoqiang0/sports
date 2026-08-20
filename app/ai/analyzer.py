@@ -21,13 +21,17 @@ from app.core.cache import cache
 
 logger = logging.getLogger(__name__)
 
-VALID_PREDICTIONS = {"under", "skip"}
+VALID_PREDICTIONS = {"under", "over", "skip"}
 
 _PRED_ALIASES = {
     "under": "under",
     "u": "under",
     "小": "under",
     "小球": "under",
+    "over": "over",
+    "o": "over",
+    "大": "over",
+    "大球": "over",
 }
 
 _BT_ALIASES = {
@@ -53,13 +57,15 @@ def normalize_prediction(raw, *, bet_type: str = "") -> str:
         pred = _PRED_ALIASES[s]
     elif "小球" in s or s == "小" or "under" in s:
         pred = "under"
+    elif "大球" in s or s == "大" or "over" in s:
+        pred = "over"
     elif s == "skip":
         pred = "skip"
     else:
         pred = ""
 
     bt = normalize_bet_type(bet_type)
-    if bt == "total" and pred not in ("under", "skip"):
+    if bt == "total" and pred not in ("under", "over", "skip"):
         return ""
     if pred not in VALID_PREDICTIONS:
         return ""
@@ -262,11 +268,11 @@ class MatchAnalyzer:
             content = raw.get("content", "")
             parsed = self._parse_analysis_result(content)
 
-            # 单市场模式：仅小球，bet_type 恒 total。
+            # 单市场模式：大小球双向，bet_type 恒 total。
             pred = normalize_prediction(parsed.get("prediction"), bet_type="total")
             bt = "total"
 
-            if pred not in ("under", "skip"):
+            if pred not in ("under", "over", "skip"):
                 logger.warning(
                     "[AI分析] GPT 返回无效结果 match=%s | bt=%s pred=%s",
                     match_info.get("id"), parsed.get("bet_type"), parsed.get("prediction"),
@@ -1099,6 +1105,14 @@ class MatchAnalyzer:
                 if selection == "under" and avg_total <= float(line) - margin:
                     supportive = True
                     reason = f"交锋总进球均值 {avg_total:.2f} 偏小"
+                elif selection == "over" and avg_total >= float(line) + margin:
+                    supportive = True
+                    reason = f"交锋总进球均值 {avg_total:.2f} 偏大"
+                elif selection == "over":
+                    over_rate = _to_float(summary.get("over_2_5_rate"), None)
+                    if over_rate and over_rate >= 0.7:
+                        supportive = True
+                        reason = f"交锋大球率 {over_rate:.0%}"
         return {"supportive": supportive, "conflict": conflict, "reason": reason}
 
     @staticmethod
@@ -1130,6 +1144,9 @@ class MatchAnalyzer:
                 if selection == "under" and expected_total <= float(line) - margin:
                     supportive = True
                     reason = f"联赛攻防推导总分 {expected_total:.2f} 偏小"
+                elif selection == "over" and expected_total >= float(line) + margin:
+                    supportive = True
+                    reason = f"联赛攻防推导总分 {expected_total:.2f} 偏大"
         return {"supportive": supportive, "conflict": conflict, "reason": reason}
 
     @staticmethod
@@ -1153,10 +1170,18 @@ class MatchAnalyzer:
             if selection == "under" and mins < 25:
                 supportive = True
                 reason = "比赛早段节奏通常更谨慎"
+            elif selection == "over" and mins >= 65:
+                # 下半场后段是进球高发期：65' 后追大球时机上合理（余量由闸门 D1 把关）
+                supportive = True
+                reason = "65分钟后进入进球高发期"
         elif sport == "basketball":
             if selection == "under" and mins >= 44:
                 conflict = True
                 reason = "篮球最后4分钟犯规与罚球波动大，不利于小分"
+            elif selection == "over" and mins >= 44:
+                # 对称提示：Q4 末段罚球刷分利大分，但领先方压节奏利小分，双向波动
+                supportive = True
+                reason = "篮球末节犯规战术+罚球易刷分，利大分"
         return {"supportive": supportive, "conflict": conflict, "reason": reason}
 
     def _compact_historical_data(self, data: Optional[dict]) -> Optional[dict]:
@@ -1400,19 +1425,20 @@ class MatchAnalyzer:
 
         total_line = match_info.get("total_line") or match_info.get("line")
         prompt += (
-            "\n## 投注市场（全场小球 / 上下半场小球）\n"
-            "- 仅分析全场小球(total)和上下半场小球(first_half_total/second_half_total)的 under 方向\n"
+            "\n## 投注市场（全场大小球 / 上下半场大小球）\n"
+            "- 分析全场大小球(total)和上下半场大小球(first_half_total/second_half_total)的 under 与 over 两个方向\n"
             "- 其他玩法(胜负/让球/特殊盘/串关)一律不分析不下注\n"
+            "- over 与 under 是对称的独立分析：哪边信号强判哪边，都不足则 skip\n"
             f"- 盘口线 total_line: {total_line if total_line is not None else '未知'}"
             f"{score_hint}\n"
         )
         flat = _flatten_market_odds(market_odds)
         if markets_block and "total" in markets_block:
-            # markets_block['total'] 已含 opening 初指与变盘明细，不再重复展开独立摘要
-            prompt += f"- 当前小球盘口（含 opening/变盘）: {json.dumps(markets_block['total'], ensure_ascii=False, separators=(',', ':'))}\n"
+            # markets_block['total'] 已含 opening 初指与变盘明细（over/under 双向水位），不再重复展开独立摘要
+            prompt += f"- 当前大小球盘口（含 opening/变盘）: {json.dumps(markets_block['total'], ensure_ascii=False, separators=(',', ':'))}\n"
         elif flat:
-            prompt += f"- 当前小球赔率: {json.dumps(flat, ensure_ascii=False, separators=(',', ':'))}\n"
-        # 实时比分分析：计算进球节奏和剩余需求
+            prompt += f"- 当前大小球赔率: {json.dumps(flat, ensure_ascii=False, separators=(',', ':'))}\n"
+        # 实时比分分析：计算进球节奏和剩余需求（大小球双向视角）
         score_analysis = ""
         if match_info.get("home_score") is not None and match_info.get("away_score") is not None:
             hs = int(match_info.get("home_score") or 0)
@@ -1420,8 +1446,10 @@ class MatchAnalyzer:
             current_goals = hs + aws
             if total_line:
                 remaining_small_margin = max(0, total_line - current_goals + 0.5)
+                goals_needed_over = max(0, total_line - current_goals + 0.5)
                 score_analysis = f"""当前总得分 {current_goals}，盘口线 {total_line}。
-- 小球剩余容错 {remaining_small_margin} 分
+- 小球视角：剩余容错 {remaining_small_margin} 分（再进超过此分数小球输）
+- 大球视角：还需 {goals_needed_over} 分大球赢
 
 """
             clock_str = str(match_info.get("clock") or "")
@@ -1432,6 +1460,14 @@ class MatchAnalyzer:
                     pace = round(current_goals / elapsed, 3)
                     full_mins = 48 if sport == "basketball" else 90
                     score_analysis += f"得分节奏: {current_goals}分/{elapsed}分钟 = {pace}分/分钟。若维持此节奏，全场预计 {round(pace * full_mins, 1)} 分。\n"
+                    # 大球可达性：当前节奏 × 剩余时间 vs 所需
+                    if total_line:
+                        remain_mins = max(0, full_mins - elapsed)
+                        projected = pace * full_mins
+                        score_analysis += (
+                            f"- 大球按当前节奏预计全场 {projected:.1f} 分（{'达到' if projected >= total_line + 0.5 else '未达到'}盘口线 {total_line}），"
+                            f"剩余 {remain_mins} 分钟还需 {max(0, total_line + 0.5 - current_goals):.1f} 分\n"
+                        )
 
         # 确定分析模式
         if dim_available >= 6:
@@ -1511,32 +1547,33 @@ class MatchAnalyzer:
 ## 输出格式（严格JSON）
 {{
     "bet_type": "total | first_half_total | second_half_total",
-    "prediction": "under 或 skip",
+    "prediction": "under | over | skip",
     "line": null,
     "confidence": 0.0-1.0,
     "reasoning": "1.盘口:初盘X->即时X,水位变化X% 2.实时比分:当前X球,节奏X球/分钟,盘口预期X球/分钟 3.综合:量化信号+置信度理由",
     "key_factors": ["因素1", "因素2", "因素3"],
     "risk_level": "low/medium/high",
     "value_bets": [
-        {{"selection": "under", "bet_type": "total | first_half_total | second_half_total", "reason": "为什么有价值"}}
+        {{"selection": "under或over", "bet_type": "total | first_half_total | second_half_total", "reason": "为什么有价值"}}
     ]
 }}
 
-注意：prediction只能是under/skip；skip时confidence=0.0；bet_type只能是total/first_half_total/second_half_total；reasoning必须包含具体数字；只输出JSON。
+注意：prediction只能是under/over/skip；skip时confidence=0.0；bet_type只能是total/first_half_total/second_half_total；reasoning必须包含具体数字；只输出JSON。
 """
         # 小球严格分析规则（按运动类型分离）
         if sport == "basketball":
             prompt += (
                 "\n## 小球严格分析规则 - 篮球\n"
                 "### 小球方向\n"
-                "选 under 必须满足以下至少3项，且其中必须包含 盘口方向 或 基本面 支持：\n"
-                "1) 盘口方向支持 under，满足其一即算支持：\n"
-                "   - 降盘≥5分（强烈小分信号，无需水位确认）\n"
-                "   - 降盘2-5分 且 小分水位下降>3%\n"
-                "2) 实时得分节奏慢于盘口预期（偏差>25%）\n"
+                "选 under 需要形成同向证据链（盘口/节奏/基本面至少2项同向，其中必须含盘口或基本面）：\n"
+                "1) 盘口方向支持 under（满足其一即算强支持）：\n"
+                "   - 降盘≥5分（强烈小分信号，水位无反向大幅上升即成立）\n"
+                "   - 降盘2-5分 且 小分水位未大幅上升（涨幅<2%即算中性偏支持）\n"
+                "   - 小分水位下降>2%（滚球水位波动小，2%即为有效信号）\n"
+                "2) 实时得分节奏慢于盘口预期（偏差>20%）\n"
                 "3) 基本面支持 under（交锋场均<160/近况得分低/防守型球队）\n"
                 "4) 低分走势占优\n"
-                "仅满足2项且缺少盘口/基本面核心支持 -> skip\n"
+                "盘口强信号（降盘≥5分）+任一其他同向证据 -> 可给 conf 0.55-0.65\n"
                 "5) 注意：Q4后段犯规战术+罚球易刷分，44分钟后 under 默认更谨慎，弱信号必须 skip\n\n"
                 "### 通用规则\n"
                 "- 无基本面数据时，篮球小球不能给高置信度；弱信号直接 skip\n"
@@ -1548,14 +1585,57 @@ class MatchAnalyzer:
             prompt += (
                 "\n## 小球严格分析规则 - 足球\n"
                 "### 小球方向\n"
-                "选 under 必须满足以下至少2项：\n"
-                "1) 盘口方向支持 under（降盘或小球水位下降>5%）\n"
-                "2) 实时进球节奏慢于盘口预期（偏差>25%）\n"
+                "选 under 需要形成同向证据链（盘口/节奏/基本面至少2项同向，其中必须含盘口或基本面）：\n"
+                "1) 盘口方向支持 under（满足其一即算支持）：\n"
+                "   - 降盘≥0.25球（明显小分信号）\n"
+                "   - 小球水位下降>2%（滚球水位波动小，2%即为有效信号）\n"
+                "2) 实时进球节奏慢于盘口预期（偏差>20%）\n"
                 "3) 基本面支持 under（交锋场均<1.5球/近况进球少/防守型球队）\n"
-                "仅满足1项或0项 -> skip\n"
+                "当前比分远低于盘口线（余量≥2球）也构成有利证据\n"
+                "仅满足1项且无节奏配合 -> skip\n"
                 "4) 注意：75分钟后进球概率上升，under 需更谨慎\n\n"
                 "### 通用规则\n"
                 "- 无基本面数据时，小球需 conf>=0.40 且双信号一致\n"
+                "- 三类信号（初指/实时盘口/基本面）全矛盾 -> 必须 skip\n"
+                "- confidence 必须与信号强度匹配，不得虚高\n"
+            )
+
+        # 大球严格分析规则（与小球规则并列，双向分析）
+        if sport == "basketball":
+            prompt += (
+                "\n## 大球严格分析规则 - 篮球\n"
+                "### 大球方向\n"
+                "选 over 需要形成同向证据链（盘口/节奏/基本面至少2项同向，其中必须含盘口或基本面）：\n"
+                "1) 盘口方向支持 over（满足其一即算强支持）：\n"
+                "   - 升盘≥5分（强烈大分信号，水位无反向大幅上升即成立）\n"
+                "   - 升盘2-5分 且 大分水位未大幅上升（涨幅<2%即算中性偏支持）\n"
+                "   - 大分水位下降>2%（滚球水位波动小，2%即为有效信号）\n"
+                "2) 实时得分节奏快于盘口预期（偏差>20%）\n"
+                "3) 基本面支持 over（交锋场均>170/近况得分高/进攻型球队）\n"
+                "4) 高分走势占优\n"
+                "盘口强信号（升盘≥5分）+任一其他同向证据 -> 可给 conf 0.55-0.65\n"
+                "5) 注意：Q4后段若落后方犯规战术+罚球更利刷分，但领先方控节奏压时间利小分；44分钟后 over 默认更谨慎，弱信号必须 skip\n\n"
+                "### 通用规则\n"
+                "- 无基本面数据时，篮球大球不能给高置信度；弱信号直接 skip\n"
+                "- 若初指、实时盘口、基本面三者未形成同向支持，over 优先 skip\n"
+                "- 三类信号全矛盾 -> 必须 skip\n"
+                "- confidence 必须与信号强度匹配，不得虚高\n"
+            )
+        else:
+            prompt += (
+                "\n## 大球严格分析规则 - 足球\n"
+                "### 大球方向\n"
+                "选 over 需要形成同向证据链（盘口/节奏/基本面至少2项同向，其中必须含盘口或基本面）：\n"
+                "1) 盘口方向支持 over（满足其一即算支持）：\n"
+                "   - 升盘≥0.25球（明显大分信号）\n"
+                "   - 大球水位下降>2%（滚球水位波动小，2%即为有效信号）\n"
+                "2) 实时进球节奏快于盘口预期（偏差>20%）\n"
+                "3) 基本面支持 over（交锋场均>2.8球/近况大球率高/进攻型球队）\n"
+                "当前比分已接近盘口线（line-当前球数≤1）也构成有利证据\n"
+                "仅满足1项且无节奏配合 -> skip\n"
+                "4) 注意：75分钟后时间所剩无几，需当前已进 X 球使 line-X<=1 才考虑 over；差2球及以上必须 skip\n\n"
+                "### 通用规则\n"
+                "- 无基本面数据时，大球需 conf>=0.40 且双信号一致\n"
                 "- 三类信号（初指/实时盘口/基本面）全矛盾 -> 必须 skip\n"
                 "- confidence 必须与信号强度匹配，不得虚高\n"
             )
@@ -1730,7 +1810,7 @@ class MatchAnalyzer:
                     "opening_odds": open_odds,
                 }
 
-                # 市场方向判断
+                # 市场方向判断（双向：降盘/under水位降=看小；升盘/over水位降=看大）
                 market_support = "neutral"
                 signal_strength = "weak"
                 if line_delta is not None:
@@ -1740,17 +1820,36 @@ class MatchAnalyzer:
                             market_support = "under"
                             signal_strength = "strong" if abs(ld) >= 0.5 else "medium"
                         elif ld >= 0.25:
-                            market_support = "against_under"
+                            market_support = "over"
                             signal_strength = "strong" if abs(ld) >= 0.5 else "medium"
                     except (TypeError, ValueError):
                         pass
 
-                # 赔率变化增强信号
-                if odds_delta is not None:
+                # 赔率变化增强信号：odds_delta 是 dict（如 {"under":0.04,"over":-0.05}），
+                # 修复：此前 float(dict) 必 TypeError 被静默吞掉，水位信号从未生效。
+                # 语义：某方向水位下降=该方向被打水（市场倾向该方向）。
+                if odds_delta is not None and market_support == "neutral":
                     try:
-                        od = float(odds_delta)
-                        if market_support == "neutral" and abs(od) >= 0.08:
-                            market_support = "under" if od < 0 else "against_under"
+                        if isinstance(odds_delta, dict):
+                            u_od = odds_delta.get("under")
+                            o_od = odds_delta.get("over")
+                            u_od = float(u_od) if u_od is not None else None
+                            o_od = float(o_od) if o_od is not None else None
+                        else:
+                            u_od = o_od = None
+                            od = float(odds_delta)
+                            # 单数值回退语义（历史约定）：水位上升=看小
+                            if od <= -0.08:
+                                market_support = "under"
+                                signal_strength = "medium"
+                            elif od >= 0.08:
+                                market_support = "over"
+                                signal_strength = "medium"
+                        if u_od is not None and u_od <= -0.05 and (o_od is None or o_od > 0):
+                            market_support = "under"  # under 水位降且 over 未同步降
+                            signal_strength = "medium"
+                        elif o_od is not None and o_od <= -0.05 and (u_od is None or u_od > 0):
+                            market_support = "over"   # over 水位降且 under 未同步降
                             signal_strength = "medium"
                     except (TypeError, ValueError):
                         pass
@@ -1827,13 +1926,13 @@ class MatchAnalyzer:
                 if line_delta is not None:
                     try:
                         ld = float(line_delta)
-                        market_support = "under" if ld <= -0.25 else "against_under" if ld >= 0.25 else "neutral"
+                        market_support = "under" if ld <= -0.25 else "over" if ld >= 0.25 else "neutral"
                         signals["line_change"] = {
                             "initial": open_line,
                             "current": total_line,
                             "delta": ld,
                             "magnitude": abs(ld),
-                            "direction": "line_up(不利小球)" if ld > 0 else "line_down(支持小球)" if ld < 0 else "stable",
+                            "direction": "line_up(支持大球)" if ld > 0 else "line_down(支持小球)" if ld < 0 else "stable",
                             "market_support": market_support,
                             "signal_strength": "strong" if abs(ld) >= 0.5 else "medium" if abs(ld) >= 0.25 else "weak",
                         }
@@ -1842,12 +1941,33 @@ class MatchAnalyzer:
 
                 if odds_delta is not None:
                     try:
-                        od = float(odds_delta)
-                        if abs(od) >= 0.05:
-                            signals["odds_change"] = {
-                                "odds_delta": od,
-                                "signal": "小球赔率下降(市场支持小球)" if od < -0.05 else "小球赔率上升(不利小球)" if od > 0.05 else "赔率变化不大(弱信号)",
-                            }
+                        # odds_delta 是 dict（under/over 各自水位差），修复 float(dict) 死代码
+                        if isinstance(odds_delta, dict):
+                            u_od = odds_delta.get("under")
+                            o_od = odds_delta.get("over")
+                            u_f = float(u_od) if u_od is not None else None
+                            o_f = float(o_od) if o_od is not None else None
+                            parts = []
+                            if u_f is not None and abs(u_f) >= 0.05:
+                                parts.append(
+                                    f"小球水位{'下降(市场支持小球)' if u_f < 0 else '上升(不利小球)'} Δ{u_f:+.3f}"
+                                )
+                            if o_f is not None and abs(o_f) >= 0.05:
+                                parts.append(
+                                    f"大球水位{'下降(市场支持大球)' if o_f < 0 else '上升(不利大球)'} Δ{o_f:+.3f}"
+                                )
+                            if parts:
+                                signals["odds_change"] = {
+                                    "odds_delta": odds_delta,
+                                    "signal": "；".join(parts),
+                                }
+                        else:
+                            od = float(odds_delta)
+                            if abs(od) >= 0.05:
+                                signals["odds_change"] = {
+                                    "odds_delta": od,
+                                    "signal": "小球赔率下降(市场支持小球)" if od < -0.05 else "小球赔率上升(不利小球)" if od > 0.05 else "赔率变化不大(弱信号)",
+                                }
                     except (TypeError, ValueError):
                         pass
 
@@ -1880,7 +2000,7 @@ class MatchAnalyzer:
                             "pace_deviation_pct": pace_deviation,
                             "points_remaining_to_exceed_line": goals_needed,
                             "pace_needed_to_exceed_line": needed_pace,
-                            "signal": "节奏明显慢于预期(>30%偏差)→小球" if pace_deviation < -30 else "节奏偏快，不支持小球" if pace_deviation > 30 else "节奏偏差15-30%(弱信号)" if abs(pace_deviation) > 15 else "节奏接近预期(偏差<15%，噪音)",
+                            "signal": "节奏明显慢于预期(>30%偏差)→利小球" if pace_deviation < -30 else "节奏明显快于预期(>30%偏差)→利大球" if pace_deviation > 30 else "节奏偏慢(利小球弱信号)" if pace_deviation < -15 else "节奏偏快(利大球弱信号)" if pace_deviation > 15 else "节奏接近预期(偏差<15%，噪音)",
                         }
             except Exception:
                 pass

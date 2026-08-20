@@ -503,10 +503,12 @@ async def place_ybty_bet(
         score_bm = str(ref.get("scoreBenchmark") or ref.get("score") or "").strip()
         if score_bm:
             detail["scoreBenchmark"] = score_bm
-        # 小球：补 playOptions
+        # 大小球：补 playOptions（over 同样需要，OB 接口要求显式方向）
         sel_l = str(selection or "").lower()
         if sel_l == "under":
             detail["playOptions"] = "Under"
+        elif sel_l == "over":
+            detail["playOptions"] = "Over"
         logger.info(
             "OB bet body mid=%s hid=%s oid=%s hpid=%s stake=%s odds=%s ov=%s mv=%s",
             mid, hid, oid, ref.get("hpid"), stake, odds, ov_int, market_value,

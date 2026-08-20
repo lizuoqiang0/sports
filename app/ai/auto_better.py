@@ -325,16 +325,25 @@ class AIBettingEngine:
                 analyses.append(best)
                 rec = best.get("recommendation") or {}
                 sel = str(rec.get("selection") or "").lower()
-                if sel != "under":
+                # 大小球双向：over 是否参与闸门评估由 AI_ENABLE_OVER（影子模式开关）决定；
+                # 关闭时 over 视为"仅展示"跳过下单评估（第二道防线，策略层 A1 也会拦）。
+                over_enabled = bool(getattr(settings, "AI_ENABLE_OVER", False))
+                if sel not in ("under", "over") or (sel == "over" and not over_enabled):
                     skip_reason = str(
                         rec.get("reasoning")
                         or (best.get("analysis") or {}).get("reasoning")
-                        or "AI 未给出可下单的小球方向"
+                        or "AI 未给出可下单的大小球方向"
                     )
                     if sel == "skip":
                         logger.info(
                             "[AI主循环] AI 判定跳过（数据不足）: match=%s %s vs %s",
                             best.get("match_id"), best.get("home_team", "?"), best.get("away_team", "?"),
+                        )
+                    elif sel == "over" and not over_enabled:
+                        logger.info(
+                            "[AI主循环] 大球影子模式（分析展示，不参与下单评估）: match=%s %s vs %s | conf=%s",
+                            best.get("match_id"), best.get("home_team", "?"), best.get("away_team", "?"),
+                            rec.get("confidence"),
                         )
                     else:
                         logger.info(
@@ -510,17 +519,24 @@ class AIBettingEngine:
         await self._publish_analyses_to_recs_cache(analyses)
 
         # 构建分析摘要供前端日志展示
+        over_enabled_summary = bool(getattr(settings, "AI_ENABLE_OVER", False))
         for item in analyses:
             rec = item.get("recommendation") or {}
             ana = item.get("analysis") or {}
             selection = str(rec.get("selection") or "").lower()
-            skipped = selection != "under"
+            # over 在影子模式下前端仍展示方向与置信度（仅不可下单）
+            if selection in ("under", "over") and not (selection == "over" and not over_enabled_summary):
+                skipped = False
+            else:
+                skipped = True
+                if selection != "skip":
+                    selection = "skip"
             conf_pct = float(
                 rec.get("raw_win_rate")
                 or rec.get("win_rate")
                 or 0
             )
-            if skipped:
+            if selection == "skip":
                 conf_pct = 0.0
             elif conf_pct <= 0:
                 conf = float(rec.get("raw_confidence") or rec.get("confidence") or ana.get("confidence") or 0)
@@ -531,15 +547,15 @@ class AIBettingEngine:
                 "home_team": item.get("home_team", "?"),
                 "away_team": item.get("away_team", "?"),
                 "bet_type": rec.get("bet_type") or ana.get("bet_type") or "total",
-                "selection": "skip" if skipped else selection,
+                "selection": selection,
                 "confidence": round(conf_pct, 1),
-                "odds": 0.0 if skipped else float(rec.get("raw_odds") or rec.get("odds") or 0),
+                "odds": 0.0 if selection == "skip" else float(rec.get("raw_odds") or rec.get("odds") or 0),
                 "should_bet": bool(rec.get("should_bet")),
                 "status": "skipped" if skipped else "rejected",
                 "reasoning": str(
                     rec.get("reasoning")
                     or ana.get("reasoning")
-                    or "AI 未给出可下单的小球方向"
+                    or "AI 未给出可下单的大小球方向"
                 ),
             })
 
@@ -862,12 +878,15 @@ class AIBettingEngine:
 
             sel = str(decision.selection or "").lower()
             bet_type = str(getattr(decision, "bet_type", None) or "total").lower()
-            # 玩法白名单：仅全场小球 + 上下半场小球，其他一律不下单
+            # 玩法白名单：大小球 total 系（全场/半场）；方向 under 恒开、over 受
+            # AI_ENABLE_OVER 灰度开关控制（默认影子模式不下单）。
             ALLOWED_BET_TYPES = {"total", "first_half_total", "second_half_total"}
-            if bet_type not in ALLOWED_BET_TYPES or sel != "under":
+            allowed_sels = {"under", "over"} if bool(getattr(settings, "AI_ENABLE_OVER", False)) else {"under"}
+            if bet_type not in ALLOWED_BET_TYPES or sel not in allowed_sels:
                 logger.warning(
-                    "[AI下单] ❌ 不支持的盘口/方向: match=%s type=%s sel=%s (仅 %s + under)",
+                    "[AI下单] ❌ 不支持的盘口/方向: match=%s type=%s sel=%s (仅 %s + %s)",
                     decision.match_id, bet_type, sel, "/".join(ALLOWED_BET_TYPES),
+                    "under/over" if "over" in allowed_sels else "under",
                 )
                 return False
 
@@ -1895,7 +1914,7 @@ async def analyze_and_recommend(
                 conf_use = max(0.01, min(0.99, wr))
         except (TypeError, ValueError):
             pass
-        if analysis_pick_allowed and sel == "under":
+        if analysis_pick_allowed and sel in ("under", "over"):
             analysis = {
                 **analysis,
                 "prediction": sel,
@@ -1934,7 +1953,7 @@ async def analyze_and_recommend(
         if (
             not analysis_pick_allowed
             or not primary
-            or sel != "under"
+            or sel not in ("under", "over")
             or sel_odds <= 1
         ):
             decision = BetDecision(

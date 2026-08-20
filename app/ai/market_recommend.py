@@ -211,7 +211,9 @@ async def load_market_matrix(
     spread_line = 0.0
     total_line = 0.0
     sel_allow = {
-        "total": ("under",),
+        # 大小球双向：over 水位与 under 同源同存（Odds.odds_data 双向齐备），
+        # AI 分析需要 over 即时水位计算初→即时差（此前被过滤导致大球分析缺水）
+        "total": ("under", "over"),
         "moneyline": ("home", "away", "draw"),
         "spread": ("home", "away"),
     }.get(bt, ())

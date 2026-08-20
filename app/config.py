@@ -92,6 +92,7 @@ class Settings(BaseSettings):
     AI_RECS_LIMIT: int = 80                # 推荐页分析上限
     AI_LIVE_SCAN_LIMIT: int = 120          # 自动引擎扫描上限
     AI_ANALYZE_CONCURRENCY: int = 8        # GPT 分析并发数
+    AI_ENABLE_OVER: bool = False           # 大球 over 下单开关（默认关=影子模式：分析输出 over 但 A1 拦截不下单）
 
     # 赛前上下文（交锋 / 近10场 / 伤病）
     AI_MATCH_CONTEXT_ENABLED: bool = True

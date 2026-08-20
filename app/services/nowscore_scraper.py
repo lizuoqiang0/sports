@@ -1480,9 +1480,10 @@ def _parse_h2h(html: str, home_team: str = "", away_team: str = "") -> dict[str,
                 draws += 1
             else:
                 away_wins += 1
-    # 进球统计
+    # 进球统计（大球率与小球率对称采集，供 AI 双向分析）
     total_goals_list = []
     under_2_5 = 0
+    over_2_5 = 0
     for row in unique:
         hg = row.get("home_goals")
         ag = row.get("away_goals")
@@ -1491,9 +1492,12 @@ def _parse_h2h(html: str, home_team: str = "", away_team: str = "") -> dict[str,
             total_goals_list.append(total)
             if total <= 2:
                 under_2_5 += 1
+            elif total >= 3:
+                over_2_5 += 1
 
     avg_goals = round(sum(total_goals_list) / len(total_goals_list), 2) if total_goals_list else 0
     under_rate = round(under_2_5 / len(total_goals_list), 3) if total_goals_list else 0
+    over_rate = round(over_2_5 / len(total_goals_list), 3) if total_goals_list else 0
 
     return {
         "matches": unique[:10],
@@ -1504,6 +1508,7 @@ def _parse_h2h(html: str, home_team: str = "", away_team: str = "") -> dict[str,
             "away_wins": away_wins,
             "avg_total_goals": avg_goals,
             "under_2_5_rate": under_rate,
+            "over_2_5_rate": over_rate,
         },
     }
 
@@ -1565,6 +1570,8 @@ def _parse_recent_form(
     avg_goals = round(sum(total_goals_list) / len(total_goals_list), 2) if total_goals_list else 0
     under_2_5 = sum(1 for t in total_goals_list if t <= 2)
     under_rate = round(under_2_5 / len(total_goals_list), 3) if total_goals_list else 0
+    over_2_5 = sum(1 for t in total_goals_list if t >= 3)
+    over_rate = round(over_2_5 / len(total_goals_list), 3) if total_goals_list else 0
 
     return {
         "matches": matches[:10],
@@ -1576,6 +1583,7 @@ def _parse_recent_form(
             "win_rate": round(wins / len(matches), 3) if matches else 0,
             "avg_total_goals": avg_goals,
             "under_2_5_rate": under_rate,
+            "over_2_5_rate": over_rate,
         },
     }
 

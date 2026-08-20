@@ -36,12 +36,14 @@ async def ui_place_pinnacle_total(
     返回 (clicked_confirm, detail, actual_stake)。
     """
     sel = (selection or "").lower()
-    # 仅支持小球 DOM 点选。
+    # 大小球双向 DOM 点选。反方向词按方向取（under 防误点大、over 防误点小）。
     # 注意：不含单字母 o/u —— ctx.includes("o") 会命中任意英文文本，side 校验失效
     if sel in ("under", "u"):
         side_words = ["小", "under", "低于"]
+    elif sel in ("over", "o"):
+        side_words = ["大", "over", "高于"]
     else:
-        return False, "仅支持小球", Decimal("0")
+        return False, "仅支持大小球", Decimal("0")
     sport_l = (sport or "").lower()
     if not sport_l:
         # 从当前 URL 猜
@@ -264,7 +266,7 @@ async def ui_place_pinnacle_total(
                   }
                 } catch (e) {}
                 const nl = near.toLowerCase();
-                const anti = ['大'];
+                const anti = selDir === 'over' ? ['小'] : ['大'];
                 const hit = sideWords.some((w) => nl.includes(String(w).toLowerCase()));
                 const hitAnti = anti.some((w) => nl.includes(String(w).toLowerCase()));
                 if (hit && !hitAnti) return true;
@@ -301,13 +303,15 @@ async def ui_place_pinnacle_total(
                 const hitLine = lineTxt ? hitLineTxt(ctx) : false;
                 const inRow = !!(row && row.contains(el));
                 if (!lineTxt) {
-                  const ouCell = /(?:^|[\\s])(小|under)(?:$|[\\s])/i.test(ctx) && !hitSide;
+                  // 反方向格跳过：under 跳小、over 跳大（无盘口线时的方向词格）
+                  const antiWord = selDir === 'over' ? '小' : '大';
+                  const ouCell = new RegExp('(?:^|[\\\\s])(' + antiWord + ')(?:$|[\\\\s])', 'i').test(ctx) && !hitSide;
                   if (ouCell) continue;
                   if (hitSide) { target = el; how = (how || 'odds') + '+side'; break; }
                   if (inRow && !rowFallback) { rowFallback = el; }
                   continue;
                 }
-                // 小球：方向与盘口线双命中才精确点击。
+                // 大小球：方向与盘口线双命中才精确点击。
                 // 删除 line-only / 裸 loose 兜底 —— 不校验方向，会点到反向/错盘
                 if (hitSide && hitLine) { target = el; how = (how || 'odds') + '+side+line'; break; }
               }
