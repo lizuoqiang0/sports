@@ -572,7 +572,7 @@ async def ai_bet_history(
     db: AsyncSession = Depends(get_db),
 ):
     """查询AI投注记录"""
-    from app.models.user import Bet, BetStatus
+    from app.models.user import Bet
     from sqlalchemy import select, desc
 
     offset = (page - 1) * page_size
@@ -605,7 +605,6 @@ async def ai_bet_history(
 # === 一键投注（各盘口独立下注，互不影响） ===
 class OneClickBetRequest(BaseModel):
     stake: float = settings.AI_DEFAULT_STAKE
-    markets: list[str] = []  # 仅支持 total（全场小球）
 
 
 @router.post("/one-click-bet/{match_id}", response_model=APIResponse)
@@ -615,10 +614,11 @@ async def one_click_bet(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """一键投注：OB/平博单边全场小球。"""
-    from app.api.bets import place_bet
-    from app.schemas import PlaceBetRequest
+    """一键投注：OB/平博单边全场小球。
 
+    与自动投注使用同一套 execute_bet 执行逻辑：
+    跨站比价 → provider 解析 → 未连接自动切站 → 动态仓位 → 重试下单。
+    """
     result = await db.execute(select(Match).where(Match.id == match_id))
     match = result.scalar_one_or_none()
     if not match:
@@ -658,13 +658,12 @@ async def one_click_bet(
         raise HTTPException(status_code=400, detail=str(rec["error"]))
 
     from app.ai.strategy_gates import gate_recommendation_for_place, stake_bounds
-    from app.ai.strategy import load_fresh_strategy
+    from app.ai.strategy import load_fresh_strategy, BetDecision
 
     _, strat0 = await load_fresh_strategy(current_user.id)
     lo, hi = stake_bounds(strat0)
     stake = Decimal(str(req.stake or 0))
     if stake <= 0:
-        # 显式 0/负值回退最小注（schema 默认已有 AI_DEFAULT_STAKE，不回退满仓）
         stake = lo
     if stake + Decimal("0.0001") < lo:
         raise HTTPException(status_code=400, detail=f"金额需 ≥{lo:g}（AI 策略配置）")
@@ -674,94 +673,66 @@ async def one_click_bet(
             detail=f"金额超过策略单笔上限 {hi:g}，请在配置中调整「单笔最大金额」",
         )
 
-    ok_gate, why_gate, stake, _strat = await gate_recommendation_for_place(
+    ok_gate, why_gate, stake, _ = await gate_recommendation_for_place(
         user_id=current_user.id, rec=rec, stake=stake, db=db
     )
     if not ok_gate:
         raise HTTPException(status_code=400, detail=f"未通过策略配置: {why_gate}")
 
-    # 只投小球：OB/平博下单链路仅对小球做过可靠性验证
-    allowed_mkt = {"total"}
-    rec_bt = str((rec.get("recommendation") or {}).get("bet_type") or "total").lower()
-    target_markets = {rec_bt} if rec_bt in allowed_mkt else {"total"}
-    if req.markets:
-        asked = {str(x).lower() for x in req.markets} & allowed_mkt
-        if asked:
-            target_markets = asked
-    placed_bets = []
-    failed_bets = []
+    # ── 从推荐结果构造 BetDecision，调用统一下单执行器 ──
+    r = rec.get("recommendation") or {}
+    if not r.get("should_bet"):
+        raise HTTPException(status_code=400, detail="策略未通过，不可下单")
 
-    for mkt in rec.get("markets") or []:
-        bt = str(mkt.get("bet_type") or "")
-        if bt not in target_markets:
-            continue
-        single = mkt.get("single") or {}
-        if not single.get("selection") or not single.get("odds"):
-            failed_bets.append({"market": bt, "error": f"OB/平博暂无{bt}推荐"})
-            continue
-        # 仅允许主推方向（与策略 should_bet 一致）
-        rec_sel = str((rec.get("recommendation") or {}).get("selection") or "").lower()
-        if rec_sel and str(single.get("selection") or "").lower() != rec_sel:
-            continue
-        # 主推盘口类型需一致
-        if rec_bt in allowed_mkt and bt != rec_bt and target_markets == {rec_bt}:
-            continue
-        provider_code = str(
-            single.get("provider_code")
-            or (rec.get("recommendation") or {}).get("provider_code")
-            or "pinnacle"
-        ).lower()
-        if provider_code not in ("pinnacle", "ob"):
-            provider_code = "pinnacle"
-        provider_label = str(single.get("provider") or ("平博" if provider_code == "pinnacle" else "OB体育"))
-        try:
-            bet_req = PlaceBetRequest(
-                match_id=match_id,
-                bet_type=bt,
-                selection=str(single["selection"]),
-                stake=stake,
-                odds=float(single["odds"]),
-                provider=provider_code,
-            )
-            resp = await place_bet(bet_req, db=db, current_user=current_user)
-            data = getattr(resp, "data", None) or {}
-            if isinstance(resp, dict):
-                data = resp.get("data") or resp
-            placed_stake = float((data or {}).get("stake") or stake)
-            placed_bets.append({
-                "market": bt,
-                "selection": single.get("selection"),
-                "odds": float(single["odds"]),
-                "stake": placed_stake,
-                "provider": provider_label,
-                "provider_code": provider_code,
-                "status": (data or {}).get("status") or "pending",
-                "potential_payout": float((data or {}).get("potential_payout") or 0),
-                "site_balance": float((data or {}).get("site_balance") or 0),
-                "place_payload": (data or {}).get("place_payload") or {},
-            })
-        except HTTPException as he:
-            failed_bets.append({"market": bt, "error": he.detail})
-        except Exception as e:
-            failed_bets.append({"market": bt, "error": str(e)})
-            logger.warning("一键单边投注失败 market=%s site=%s: %s", bt, provider_code, e)
+    sel = str(r.get("selection") or "").lower()
+    if not sel:
+        raise HTTPException(status_code=400, detail="推荐结果缺少投注方向")
 
-    if not placed_bets and failed_bets:
-        raise HTTPException(status_code=400, detail=f"全部下注失败: {failed_bets}")
+    decision = BetDecision(
+        match_id=match_id,
+        selection=sel,
+        confidence=float(r.get("confidence") or 0),
+        suggested_stake=stake,
+        reasoning=str(r.get("reasoning") or ""),
+        risk_score=0.0,
+        should_bet=True,
+        bet_type=str(r.get("bet_type") or "total").lower(),
+        provider_code=str(r.get("provider_code") or "").lower(),
+        odds=float(r.get("odds") or 0),
+        line=r.get("line"),
+        sport=str(rec.get("sport") or ""),
+    )
 
-    total_stake = sum(b["stake"] for b in placed_bets)
-    msg = f"已提交 {len(placed_bets)} 笔"
-    if failed_bets:
-        msg += f"，失败 {len(failed_bets)} 笔"
+    from app.ai.bet_executor import execute_bet
+
+    bet_result = await execute_bet(
+        db, current_user, match, decision, strat0,
+        is_auto=False,
+    )
+
+    if not bet_result.ok:
+        raise HTTPException(status_code=400, detail=bet_result.message or "下单失败")
 
     return APIResponse(
-        message=msg,
+        message="已提交真实站点投注",
         data={
-            "bets": placed_bets,
-            "failed": failed_bets,
-            "total_stake": float(total_stake),
-            "success_count": len(placed_bets),
-            "failed_count": len(failed_bets),
-            "provider": "平博",
+            "bets": [{
+                "market": decision.bet_type,
+                "selection": sel,
+                "odds": bet_result.odds,
+                "stake": float(bet_result.stake),
+                "provider": bet_result.provider_label,
+                "provider_code": bet_result.provider_code,
+                "status": "success",
+                "potential_payout": float(bet_result.potential_payout),
+                "site_balance": bet_result.site_balance,
+                "external_bet_id": bet_result.external_bet_id,
+                "bet_id": bet_result.bet_id,
+            }],
+            "failed": [],
+            "total_stake": float(bet_result.stake),
+            "success_count": 1,
+            "failed_count": 0,
+            "provider": bet_result.provider_label,
         },
     )
