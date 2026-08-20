@@ -485,7 +485,13 @@ def _half_totals_from_hps(
     hps: list, *, mid: str = "", csid: str = "", tid: str = "", match_type: int = 1
 ) -> list[RemoteOdds]:
     """解析上下半场大小球（OB API hps 中 hpn 含"上半场"/"下半场" + "大小"的市场）。"""
+    import logging
+    _log = logging.getLogger("app.services.bookmakers.plugins.ob.odds")
     out: list[RemoteOdds] = []
+    # 诊断：打印所有 hps block 的 hpid+hpn
+    all_hpns = [(str(b.get("hpid") or ""), str(b.get("hpn") or "")) for b in hps if isinstance(b, dict)]
+    if all_hpns:
+        _log.debug("[半场诊断] OB match=%s hps blocks: %s", mid, all_hpns)
     for block in hps:
         if not isinstance(block, dict):
             continue

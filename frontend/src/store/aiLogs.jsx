@@ -253,6 +253,25 @@ export function ingestAiEventLog(detail) {
     return
   }
 
+  if (eventType === 'ai_monitor') {
+    const m = data?.matches || {}
+    const o = data?.odds || {}
+    const engineOn = data?.engine?.running
+    const issues = Array.isArray(data?.issues) ? data.issues : []
+    const errCount = issues.filter((i) => i?.level === 'error').length
+    const summary = String(data?.summary || '')
+    const msg = `[实时监控] 比赛=${_num(m.total, 0)} (OB:${_num(m.ob, 0)}/平博:${_num(m.pinnacle, 0)}) 赔率=${_num(o.total, 0)} TOTAL齐全=${_num(o.total_complete, 0)} | 引擎=${engineOn ? '运行中' : '未运行'} | ${summary}`
+    if (errCount > 0) {
+      // 存在错误：每轮立即记录
+      pushLogOnce(eventKey, 'monitor', msg, data)
+    } else {
+      // 正常心跳：5 分钟一条，避免刷屏（日志上限 300 条）
+      const bucket = Math.floor(Date.parse(stamp) / 300000)
+      pushLogOnce(`ai_monitor:hb:${bucket}`, 'monitor', msg, data, 60 * 60 * 1000)
+    }
+    return
+  }
+
   if (eventType === 'ai_prefetch_done') {
     const football = _num(data?.football, 0)
     const basketball = _num(data?.basketball, 0)

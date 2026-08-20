@@ -81,7 +81,7 @@ _LIVE_SCAN_LIMIT = max(
     60, int(getattr(settings, "AI_LIVE_SCAN_LIMIT", 120) or 120)
 )
 _LIVE_ANALYZE_CONCURRENCY = max(
-    2, int(getattr(settings, "AI_ANALYZE_CONCURRENCY", 8) or 8)
+    1, int(getattr(settings, "AI_ANALYZE_CONCURRENCY", 3) or 3)
 )
 
 
@@ -218,6 +218,12 @@ class AIBettingEngine:
             should_stop, reason = await self._check_risk(db, user, ai_config)
             if should_stop:
                 logger.info(f"AI引擎暂停: {reason}")
+                # 止损/风控退出视为停用：清 ai_enabled，防止容器重启后被
+                # 自动恢复逻辑当作"应运行"重新拉起（曾止损后跑了一整夜）。
+                # 用户可重新打开开关继续（触发条件仍在时引擎会再次自停）。
+                user.ai_enabled = False
+                await db.flush()
+                await db.commit()
                 await self._notify(user.id, "risk_stop", reason)
                 self.is_running = False
                 return
@@ -380,7 +386,11 @@ class AIBettingEngine:
                         "provider_code": str(rec.get("provider_code") or ""),
                         "line": rec.get("line"),
                         "consensus_reached": bool((best.get("analysis") or {}).get("consensus_reached")),
-                        "reasoning": str(rec.get("reasoning") or ""),
+                        # 两轮评估设计：第一轮（analyze_and_recommend 内）只验证方向，
+                        # 其闸门拒绝产生的 [不投注] 标记不带入第二轮；第二轮使用原始
+                        # LLM reasoning 重新过全部闸门（B1/C1/D/E 等），在此轮确定最终
+                        # 方向并写入标记。LLM 级失败标记（不可下单）随 analysis 保留。
+                        "reasoning": str((best.get("analysis") or {}).get("reasoning") or ""),
                     },
                     user_balance=spendable,
                     daily_loss=daily_loss_amt,

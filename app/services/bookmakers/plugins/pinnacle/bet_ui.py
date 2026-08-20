@@ -638,6 +638,64 @@ async def ui_place_pinnacle_total(
     except Exception:
         pass
 
+    async def _cleanup_slip_on_failure() -> None:
+        """下单失败后立即清空投注单残留：移除全部 + 确认弹窗点「好的」。
+
+        失败出口若不清，残留注单会在投注单里漂移：赔率变化弹横幅、
+        被下一次误点「投下N注」提交成废单。幂等，无残留时静默返回。
+        """
+        try:
+            for fr in ([page] + list(getattr(page, "frames", []) or [])):
+                try:
+                    hit = await asyncio.wait_for(
+                        fr.evaluate(
+                            """() => {
+                              const nodes = Array.from(document.querySelectorAll('button, a, div[role="button"], span'));
+                              for (const el of nodes) {
+                                const t = String(el.innerText || '').replace(/\\s+/g, ' ').trim();
+                                if (t === '移除全部' || t === 'Remove All' || t === '清除全部') {
+                                  try { el.click(); return t; } catch (e) {}
+                                }
+                              }
+                              return '';
+                            }"""
+                        ),
+                        timeout=3.0,
+                    )
+                    if hit:
+                        await page.wait_for_timeout(700)
+                        # 「清空注单」确认弹窗：点「好的」确认清空
+                        # （与注额保留场景点「取消」相反）
+                        for fr2 in ([page] + list(getattr(page, "frames", []) or [])):
+                            try:
+                                confirmed = await asyncio.wait_for(
+                                    fr2.evaluate(
+                                        """() => {
+                                          const body = String((document.body && document.body.innerText) || '');
+                                          if (!body.includes('清空注单')) return false;
+                                          const nodes = Array.from(document.querySelectorAll('button, a, div[role="button"], span'));
+                                          for (const el of nodes) {
+                                            const t = String(el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+                                            if (t === '好的' || t === '确定' || t === 'OK' || t === '确认') {
+                                              try { el.click(); return true; } catch (e) {}
+                                            }
+                                          }
+                                          return false;
+                                        }"""
+                                    ),
+                                    timeout=2.5,
+                                )
+                                if confirmed:
+                                    break
+                            except Exception:
+                                continue
+                        logger.info("pinnacle slip cleaned after failed bet (removed=%s)", hit)
+                        return
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
     # 过滤输入仅用于列表内定位，绝不 Enter 跳转
     for q in ((home or "")[:8], (away or "")[:8]):
         if q:
@@ -807,6 +865,7 @@ async def ui_place_pinnacle_total(
     ok_chg, why_chg, use_odds = decide_odds_change(requested_odds, slip_odds)
     if not ok_chg:
         logger.info("pinnacle bet abort odds-change: %s", why_chg)
+        await _cleanup_slip_on_failure()
         return False, f"odds_change_reject|{why_chg}", Decimal("0")
     if use_odds is not None:
         odds = float(use_odds)
@@ -1024,6 +1083,7 @@ async def ui_place_pinnacle_total(
                     pass
             break
     if not filled:
+        await _cleanup_slip_on_failure()
         return False, fill_detail or "stake_input_missing", Decimal("0")
 
     await page.wait_for_timeout(500)
@@ -1071,6 +1131,7 @@ async def ui_place_pinnacle_total(
                         "pinnacle bet abort %s requested=%s dynamic=%s minimum=%s cap=%s balance=%s",
                         reason, stake, dynamic_stake, min_stake_site, stake_cap, available_balance,
                     )
+                    await _cleanup_slip_on_failure()
                     return False, reason, Decimal("0")
                 logger.info(
                     "pinnacle stake adjusted requested=%s dynamic=%s minimum=%s actual=%s",
@@ -1078,6 +1139,7 @@ async def ui_place_pinnacle_total(
                 )
                 data = await asyncio.wait_for(fr.evaluate(fill_js, float(actual_stake)), timeout=5.0)
                 if not isinstance(data, dict) or not data.get("ok"):
+                    await _cleanup_slip_on_failure()
                     return False, "stake_adjust_refill_failed", Decimal("0")
                 fill_detail = f"site_minimum_adjusted:{actual_stake}"
                 got = actual_stake
@@ -1285,6 +1347,7 @@ async def ui_place_pinnacle_total(
             "pinnacle place_btn_missing samples=%s slip=%s",
             btn_samples, slip_hint[:80],
         )
+        await _cleanup_slip_on_failure()
         return False, f"place_btn_missing|{fill_detail}|btns=[{btn_samples}]|slip={slip_hint[:80]}", Decimal("0")
 
     await page.wait_for_timeout(800)
@@ -1322,6 +1385,7 @@ async def ui_place_pinnacle_total(
         await page.wait_for_timeout(400)
 
     if not step2_ok:
+        await _cleanup_slip_on_failure()
         return False, f"ok_modal_missing|{fill_detail}|{confirm_detail}", Decimal("0")
 
     # 确认后若弹出赔率变化：再读一次，≥1.7 才点「接受变化并投注」
@@ -1329,6 +1393,7 @@ async def ui_place_pinnacle_total(
     ok2, why2, use2 = decide_odds_change(requested_odds, live2 if live2 is not None else slip_odds)
     if not ok2:
         logger.info("pinnacle bet abort after confirm odds-change: %s", why2)
+        await _cleanup_slip_on_failure()
         return False, f"odds_change_reject|{why2}|{confirm_detail}", Decimal("0")
     if use2 is not None:
         odds = float(use2)
@@ -1353,6 +1418,7 @@ async def ui_place_pinnacle_total(
             except Exception:
                 pass
     else:
+        await _cleanup_slip_on_failure()
         return False, f"odds_change_reject|{why2}|{confirm_detail}", Decimal("0")
     await page.wait_for_timeout(2200)
 
@@ -1432,5 +1498,13 @@ async def ui_place_pinnacle_total(
             confirm_detail = f"{confirm_detail}|dismissed:{str(done)[:60]}"
             break
     await page.wait_for_timeout(600)
+
+    # 站点拒绝兜底清理：拒绝弹窗关闭后，站点可能仍把失效单留在投注单里
+    # （盘口失效/限额被拒的单子不会自行消失）。仅当检测到拒绝类消息时清，
+    # 成功路径（"成功/已接受"）绝不清，避免误删已成交展示。
+    if reject_msg and any(
+        k in reject_msg for k in ("当前选项不适用", "余额不足", "不能低于", "已取消", "无法", "失败", "限额", "拒绝", "不能接受", "失效", "错误")
+    ):
+        await _cleanup_slip_on_failure()
 
     return True, f"{result.get('sample')}|{fill_detail}|{confirm_detail}|odds:{odds}", actual_stake

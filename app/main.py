@@ -91,9 +91,41 @@ async def lifespan(app: FastAPI):
         ns_on = False
         settle_on = False
         clean_on = False
+        mon_on = False
+        engines_resumed = False
         while True:
             try:
                 lead = bool(settings.RUN_BACKGROUND_JOBS) and is_background_leader()
+                if lead and not engines_resumed:
+                    # 容器重启后自动恢复 AI 引擎（仅 active 模式用户，与 /ai/start 约束一致）
+                    try:
+                        from app.ai.auto_better import get_engine_status, start_user_engine
+                        from app.database import AsyncSessionLocal
+                        from app.models.user import User
+                        from app.services.bet_mode import get_user_bet_mode
+                        from sqlalchemy import select
+
+                        async with AsyncSessionLocal() as db:
+                            users = (
+                                (await db.execute(select(User).where(User.ai_enabled == True)))  # noqa: E712
+                                .scalars()
+                                .all()
+                            )
+                        for u in users:
+                            try:
+                                if get_user_bet_mode(u) != "active":
+                                    continue
+                                status = await get_engine_status(int(u.id))
+                                if not status.get("running"):
+                                    r = await start_user_engine(int(u.id))
+                                    logger.info(
+                                        "AI 引擎自动恢复: user=%s result=%s", u.id, r.get("status")
+                                    )
+                            except Exception as e:
+                                logger.warning(f"AI 引擎自动恢复失败 user={u.id}: {e}")
+                    except Exception as e:
+                        logger.warning(f"AI 引擎自动恢复扫描失败: {e}")
+                    engines_resumed = True
                 if lead and not settle_on:
                     try:
                         from app.services.bet_settlement import start_settlement_worker
@@ -142,6 +174,14 @@ async def lifespan(app: FastAPI):
                         logger.info("cleanup task started (leader)")
                     except Exception as e:
                         logger.warning(f"cleanup task 启动失败: {e}")
+                if lead and not mon_on:
+                    try:
+                        from app.services.live_monitor import start_live_monitor
+                        start_live_monitor()
+                        mon_on = True
+                        logger.info("live monitor started (leader)")
+                    except Exception as e:
+                        logger.warning(f"live monitor 启动失败: {e}")
                 if not lead and live_on:
                     try:
                         from app.services.bookmakers.live_poller import stop_live_poller
@@ -184,6 +224,13 @@ async def lifespan(app: FastAPI):
                     except Exception:
                         pass
                     clean_on = False
+                if not lead and mon_on:
+                    try:
+                        from app.services.live_monitor import stop_live_monitor
+                        stop_live_monitor()
+                    except Exception:
+                        pass
+                    mon_on = False
             except Exception:
                 logger.exception("background job supervisor error")
             await asyncio.sleep(5)

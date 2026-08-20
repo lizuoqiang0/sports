@@ -161,6 +161,25 @@ async def _keep_sessions_refresh_loop() -> None:
                     # 平博页挂下单接口抓包（一次性任务，见 _hook_pinnacle_bet_capture）
                     if code == "pinnacle" and sess.page and not sess.page.is_closed():
                         _hook_pinnacle_bet_capture(sess.page)
+                    # 平博 SPA 白屏检测：白屏时余额/采盘全废且易把场馆余额误读为 0。
+                    # 白屏属于渲染崩溃，reload 是唯一恢复手段（正常页面绝不触发）。
+                    if code == "pinnacle" and sess.page and not sess.page.is_closed():
+                        try:
+                            from app.services.bookmakers.plugins.pinnacle.venue import (
+                                recover_pinnacle_blank_page,
+                            )
+
+                            blank_ok = await recover_pinnacle_blank_page(
+                                sess.page, attempts=2
+                            )
+                            if not blank_ok:
+                                logger.error(
+                                    "keep-alive: pinnacle blank page persists, skip balance site=%s",
+                                    base[:40],
+                                )
+                                continue
+                        except Exception:
+                            pass
                     # 绝对禁止 goto/reload：只探测存活 + 刮余额 + 动态记下当前 URL
                     ok = await site_sessions.refresh(base, force=False, site_code=code)
                     if not ok:
@@ -1888,6 +1907,32 @@ async def fetch_balance(req: BalanceRequest):
             "balance_source": "venue_cache" if cached > 0 else "not_in_venue",
             "in_sportsbook": False,
         }
+
+    # 平博白屏保护：白屏时侧栏不存在，刮取必然读到"空钱包"，会把真实余额
+    # （如 393.97）误覆盖为 0。白屏时直接返回缓存，并尝试一次恢复供下轮使用。
+    if site_code == "pinnacle":
+        try:
+            from app.services.bookmakers.plugins.pinnacle.venue import (
+                pinnacle_page_is_blank,
+                recover_pinnacle_blank_page,
+            )
+
+            if await pinnacle_page_is_blank(sess.page):
+                await recover_pinnacle_blank_page(sess.page, attempts=1)
+                cached = float(sess.last_balance or 0)
+                return {
+                    "ok": cached > 0,
+                    "balance": cached,
+                    "message": "平博页面白屏（已触发恢复），返回场馆余额缓存",
+                    "lane": lane.key,
+                    "site_code": sess.site_code or site_code,
+                    "url": (getattr(sess.page, "url", "") or "")[:160],
+                    "cached": True,
+                    "balance_source": "venue_cache" if cached > 0 else "error",
+                    "in_sportsbook": True,
+                }
+        except Exception:
+            pass
 
     api_hint = token
     if token and sess.page and not sess.page.is_closed():

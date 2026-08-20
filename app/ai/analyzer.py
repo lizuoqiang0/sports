@@ -425,7 +425,7 @@ class MatchAnalyzer:
             return self._fallback_result(f"AI分析暂不可用: {e}", error=str(e))
 
     async def _call_gpt(self, prompt: str) -> dict:
-        """调用 GPT 模型，返回 content 和 _meta 信息。429 指数退避，超时不重试。"""
+        """调用 GPT 模型，返回 content 和 _meta 信息。429/529/空响应指数退避，超时不重试。"""
         if not self.client or not self.model:
             raise RuntimeError("GPT 模型未配置")
         messages = [
@@ -434,6 +434,7 @@ class MatchAnalyzer:
         ]
         started = time.perf_counter()
         max_retries = 2  # 最多 2 次重试（共 3 次调用），确保总时长可控
+        content = ""
         for attempt in range(max_retries + 1):
             try:
                 response = await self.client.chat.completions.create(
@@ -444,17 +445,29 @@ class MatchAnalyzer:
                 )
                 if not response.choices:
                     raise RuntimeError("GPT 返回空 choices（内容可能被安全过滤）")
-                break
+                content = response.choices[0].message.content or ""
+                if content.strip():
+                    break
+                # 空内容（上游流被截断，latency~2s 快速返回）：与 529 同样退避重试
+                if attempt < max_retries:
+                    backoff = 2 ** attempt  # 1, 2
+                    logger.warning("[GPT] 空响应 content_len=0，%ds 后重试 (attempt %d/%d)", backoff, attempt + 1, max_retries)
+                    await asyncio.sleep(backoff)
+                    continue
+                break  # 最后一次仍为空，交给上层无效结果兜底
             except Exception as e:
                 err_str = str(e).lower()
                 # 超时：不重试（GPT 已耗时长，重试只会更长）
                 if "timeout" in err_str or "timed out" in err_str or "apitimeout" in type(e).__name__.lower():
                     raise
-                # 429/限流：指数退避（1s -> 2s），仅重试 2 次
-                if "429" in err_str or "rate" in err_str or "ratelimit" in type(e).__name__.lower():
+                # 429 限流 / 529 上游过载：指数退避（1s -> 2s），仅重试 2 次
+                if (
+                    "429" in err_str or "rate" in err_str or "ratelimit" in type(e).__name__.lower()
+                    or "529" in err_str or "upstream stream ended" in err_str or "overloaded" in err_str
+                ):
                     if attempt < max_retries:
                         backoff = 2 ** attempt  # 1, 2
-                        logger.warning("[GPT] 429 限流，%ds 后重试 (attempt %d/%d)", backoff, attempt + 1, max_retries)
+                        logger.warning("[GPT] %s 限流/过载，%ds 后重试 (attempt %d/%d)", "429" if "429" in err_str else "529", backoff, attempt + 1, max_retries)
                         await asyncio.sleep(backoff)
                         continue
                     raise
@@ -464,7 +477,6 @@ class MatchAnalyzer:
                     await asyncio.sleep(0.5)
                     continue
                 raise
-        content = response.choices[0].message.content or ""
         elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
         logger.info("[GPT] 调用完成 latency=%dms content_len=%d", int(elapsed_ms), len(content))
         return {"content": content, "_meta": {"latency_ms": elapsed_ms, "model": "gpt"}}

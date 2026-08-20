@@ -43,6 +43,7 @@ const LOG_TYPES = [
   { key: 'analysis', label: '分析' },
   { key: 'recommend', label: '推荐' },
   { key: 'prefetch', label: '数据源' },
+  { key: 'monitor', label: '实时监控' },
 ]
 
 const TYPE_META = {
@@ -55,6 +56,7 @@ const TYPE_META = {
   analysis:   { icon: '📊', color: 'text-ink-500', bg: 'bg-ink-50/60 border-ink-100' },
   recommend:   { icon: '📊', color: 'text-ink-500', bg: 'bg-ink-50/60 border-ink-100' },
   prefetch:   { icon: '📡', color: 'text-violet-600', bg: 'bg-violet-50/60 border-violet-100' },
+  monitor:    { icon: '🩺', color: 'text-teal-600', bg: 'bg-teal-50/60 border-teal-100' },
 }
 
 export default function LogsPage() {

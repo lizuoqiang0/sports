@@ -404,6 +404,10 @@ def parse_compact_events(
 
                     periods = ev[8] if isinstance(ev[8], dict) else {}
                     p0 = periods.get("0") or periods.get(0)
+                    # 诊断：打印 periods keys
+                    import logging
+                    _plog = logging.getLogger("app.services.bookmakers.plugins.pinnacle.odds")
+                    _plog.debug("[半场诊断] 平博 match=%s periods keys=%s", mid, list(periods.keys()) if isinstance(periods, dict) else "N/A")
                     odds_list = _odds_from_period0(
                         p0 if isinstance(p0, list) else [],
                         mid=mid,
@@ -618,6 +622,19 @@ async def fetch_pinnacle_live_odds(
             return []
     except Exception:
         return []
+
+    # 白屏检测：SPA 渲染崩溃时 evaluate 会失败/返回空，先恢复再采盘
+    # （正常页面无副作用：检测通过立即返回，不触发 reload）
+    try:
+        from app.services.bookmakers.plugins.pinnacle.venue import (
+            recover_pinnacle_blank_page,
+        )
+
+        if not await recover_pinnacle_blank_page(page, attempts=2):
+            logger.warning("pinnacle odds aborted: blank page persists")
+            return []
+    except Exception:
+        pass
 
     origins = await _collect_origins(page, base_url=base_url)
     sport_ids = list(SPORT_IDS.keys())
