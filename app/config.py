@@ -88,10 +88,12 @@ class Settings(BaseSettings):
     AI_MAX_ODDS: float = 5.00              # 下单最高赔率
     LIVE_ODDS_MAX_AGE_SEC: int = 90        # 滚球下单允许的赔率最大年龄
 
-    AI_SCAN_INTERVAL_SEC: int = 120        # AI 引擎扫描间隔（秒）
+    AI_SCAN_INTERVAL_SEC: int = 120        # AI 引擎扫描间隔（秒，有候选时）
     AI_RECS_LIMIT: int = 80                # 推荐页分析上限
     AI_LIVE_SCAN_LIMIT: int = 120          # 自动引擎扫描上限
     AI_ANALYZE_CONCURRENCY: int = 8        # GPT 分析并发数
+    AI_IDLE_RESCAN_SEC: int = 30           # 空轮快扫间隔（无候选时，捕捉刚开赛）
+    AI_SKIP_COOLDOWN_SEC: int = 300        # 同场 LLM skip 冷却（避免 TTL 内重复调用）
     AI_ENABLE_OVER: bool = False           # 大球 over 下单开关（默认关=影子模式：分析输出 over 但 A1 拦截不下单）
 
     # 赛前上下文（交锋 / 近10场 / 伤病）

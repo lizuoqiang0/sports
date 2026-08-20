@@ -81,7 +81,17 @@ _LIVE_SCAN_LIMIT = max(
     60, int(getattr(settings, "AI_LIVE_SCAN_LIMIT", 120) or 120)
 )
 _LIVE_ANALYZE_CONCURRENCY = max(
-    1, int(getattr(settings, "AI_ANALYZE_CONCURRENCY", 3) or 3)
+    1, int(getattr(settings, "AI_ANALYZE_CONCURRENCY", 8) or 8)
+)
+# 空轮快速重扫：无候选赛事时缩短等待（刚开赛/滚球上新是时间敏感窗口，
+# 死等完整间隔会错过黄金分析期）。有候选走正常 AI_SCAN_INTERVAL_SEC。
+_IDLE_RESCAN_SEC = max(
+    15, int(getattr(settings, "AI_IDLE_RESCAN_SEC", 30) or 30)
+)
+# 同场冷却：LLM 判定 skip 后短时间内不重复调用（缓存 TTL 600s 内
+# 同场重复分析是纯浪费——比赛状态变化不足以推翻 skip 判定）
+_SKIP_COOLDOWN_SEC = max(
+    60, int(getattr(settings, "AI_SKIP_COOLDOWN_SEC", 300) or 300)
 )
 
 
@@ -99,6 +109,9 @@ class AIBettingEngine:
         self._task: Optional[asyncio.Task] = None
         self._cycle_ai_config = None  # 每轮缓存，避免逐场查 DB
         self._cycle_strat_cfg = None
+        # 同场 skip 冷却：fixture_key → 时间戳（LLM 判 skip 后 _SKIP_COOLDOWN_SEC
+        # 内不再对该场发起 LLM 调用——缓存 TTL 600s 内重复分析同场是纯浪费）
+        self._skip_cooldown: dict[str, float] = {}
 
     # === 生命周期 ===
     async def start(self):
@@ -123,11 +136,17 @@ class AIBettingEngine:
         logger.info(f"AI投注引擎停止: user={self.user_id}")
 
     async def _main_loop(self):
-        """主循环：分析/下单一轮后休眠（默认 120 秒）"""
+        """主循环：分析/下单一轮后休眠（动态间隔）。
+
+        间隔策略：
+        - 有候选赛事（本轮实际分析过）：AI_SCAN_INTERVAL_SEC（默认 120s）
+        - 无候选/空轮：AI_IDLE_RESCAN_SEC（默认 30s 快扫）
+          —— 刚开赛/滚球上新是时间敏感窗口，快扫能更早介入分析
+        """
         try:
             while self.is_running:
                 try:
-                    await self._run_cycle()
+                    had_candidates = await self._run_cycle()
                     # 周期续期跨进程锁/运行标记（TTL 900s，每轮 ~120s 续一次）
                     try:
                         from app.core.cache import cache
@@ -140,9 +159,13 @@ class AIBettingEngine:
                         await cache.set(f"ai:engine:running:{self.user_id}", "1", ttl=_ENGINE_LOCK_TTL)
                     except Exception:
                         pass
-                    # 每轮间隔：默认 120s（热读 settings，改 .env 后重启生效）
-                    interval = max(120, int(getattr(settings, "AI_SCAN_INTERVAL_SEC", 120) or 120))
-                    logger.info("AI 引擎本轮结束，%s 秒后下一轮", interval)
+                    # 轮间隔：有候选走完整周期（分析本身耗时长），空轮快扫
+                    base_interval = max(60, int(getattr(settings, "AI_SCAN_INTERVAL_SEC", 120) or 120))
+                    interval = base_interval if had_candidates else _IDLE_RESCAN_SEC
+                    logger.info(
+                        "AI 引擎本轮结束（%s），%s 秒后下一轮",
+                        "有候选" if had_candidates else "空轮快扫", interval,
+                    )
                     await asyncio.sleep(interval)
                 except asyncio.CancelledError:
                     break
@@ -171,8 +194,8 @@ class AIBettingEngine:
                 pass
 
     # === 单次执行周期 ===
-    async def _run_cycle(self):
-        """执行一次完整的分析+投注周期。
+    async def _run_cycle(self) -> bool:
+        """执行一次完整的分析+投注周期。返回本轮是否有候选赛事（供动态间隔）。
 
         关键：LLM 分析前必须释放 DB 会话，否则长分析会触发
         idle_in_transaction / connection closed，导致选中后无法下单。
@@ -193,14 +216,14 @@ class AIBettingEngine:
             user = user_result.scalar_one_or_none()
             if not user or not user.ai_enabled:
                 self.is_running = False
-                return
+                return False
 
             ai_config, strat_cfg = await load_fresh_strategy(self.user_id)
             self._cycle_ai_config = ai_config  # 缓存供本轮复用
             self._cycle_strat_cfg = strat_cfg
             if not ai_config or not getattr(ai_config, "is_active", True):
                 self.is_running = False
-                return
+                return False
             if not bool(getattr(strat_cfg, "use_llm_analysis", True)):
                 logger.info("[AI主循环] user=%s AI分析已关闭，自动下单引擎自停", self.user_id)
                 user.ai_enabled = False
@@ -213,7 +236,7 @@ class AIBettingEngine:
                     })
                 except Exception:
                     pass
-                return
+                return False
 
             should_stop, reason = await self._check_risk(db, user, ai_config)
             if should_stop:
@@ -226,7 +249,7 @@ class AIBettingEngine:
                 await db.commit()
                 await self._notify(user.id, "risk_stop", reason)
                 self.is_running = False
-                return
+                return False
 
             bet_mode = get_user_bet_mode(user)
             auto_place = is_active_mode(user)
@@ -238,7 +261,7 @@ class AIBettingEngine:
             candidates = await self._scan_candidates(db, ai_config)
             if not candidates:
                 logger.info("[AI主循环] user=%s 本轮无滚球候选赛事", self.user_id)
-                return
+                return False
             logger.info(
                 "[AI主循环] user=%s 扫描到 %d 场候选赛事 | bet_mode=%s auto_place=%s",
                 self.user_id, len(candidates), bet_mode, auto_place,
@@ -267,14 +290,43 @@ class AIBettingEngine:
             groups = group_matches_by_fixture([_C(c) for c in candidates])
             fixture_groups = [[int(m.id) for m in g] for g in groups]
 
+            # skip 冷却过滤：冷却中的同场分组跳过 LLM 调用（省 token 省时延）。
+            # 冷却键用分组内最小 match_id（同场多站 id 稳定映射到同一场）。
+            now_ts = asyncio.get_event_loop().time()
+            if self._skip_cooldown:
+                # 顺手清理过期项，防 dict 无界增长
+                self._skip_cooldown = {
+                    k: ts for k, ts in self._skip_cooldown.items()
+                    if now_ts - ts < _SKIP_COOLDOWN_SEC
+                }
+            cooled_out = 0
+            active_groups: list[list[int]] = []
+            for g in fixture_groups:
+                key = str(min(g))
+                ts = self._skip_cooldown.get(key)
+                if ts is not None and now_ts - ts < _SKIP_COOLDOWN_SEC:
+                    cooled_out += 1
+                    continue
+                active_groups.append(g)
+            if cooled_out:
+                logger.info(
+                    "[AI主循环] %d 组处于 skip 冷却期（%ds），跳过重复分析",
+                    cooled_out, _SKIP_COOLDOWN_SEC,
+                )
+                fixture_groups = active_groups
+                if not fixture_groups:
+                    logger.info("[AI主循环] 全部分组冷却中，本轮跳过 LLM 分析")
+                    return False
+
             logger.info(
-                "[AI主循环] user=%s 策略: stake<=%s daily<=%s stop=%s tp=%s | 同场分组=%d 组",
+                "[AI主循环] user=%s 策略: stake<=%s daily<=%s stop=%s tp=%s | 同场分组=%d 组（冷却跳过 %d）",
                 self.user_id,
                 strat_cfg.max_bet_amount,
                 strat_cfg.max_daily_bets,
                 strat_cfg.stop_loss,
                 strat_cfg.take_profit,
                 len(fixture_groups),
+                cooled_out,
             )
             daily_loss = await self._calc_daily_pnl(db, user)
             daily_loss_amt = abs(daily_loss) if daily_loss < 0 else Decimal("0")
@@ -282,7 +334,7 @@ class AIBettingEngine:
             spendable = await self._spendable_balance(db, user)
             if spendable < settings.AI_MIN_BALANCE:
                 logger.info("可用余额不足: %s", spendable)
-                return
+                return False
             await db.commit()
         # Phase 1 结束：连接已释放，再跑 LLM
 
@@ -334,6 +386,10 @@ class AIBettingEngine:
                         or (best.get("analysis") or {}).get("reasoning")
                         or "AI 未给出可下单的大小球方向"
                     )
+                    # 记录同场 skip 冷却：状态未质变前不再重复 LLM 调用
+                    # （skip 判定多为"信号中性/数据不足"，几分钟内翻转概率低）
+                    if ids:
+                        self._skip_cooldown[str(min(ids))] = asyncio.get_event_loop().time()
                     if sel == "skip":
                         logger.info(
                             "[AI主循环] AI 判定跳过（数据不足）: match=%s %s vs %s",
@@ -578,7 +634,7 @@ class AIBettingEngine:
                     else "人工模式：已更新高胜率推荐，请手动确认"
                 ),
             })
-            return
+            return True
 
         logger.info(
             "[AI主循环] 本轮完成 | 候选=%d 分析=%d 通过=%d 执行=%d | 模式=%s",
@@ -598,6 +654,7 @@ class AIBettingEngine:
             "analysis_summary": analysis_summary,
             "decisions": [d.model_dump() for d in decisions if d.should_bet],
         })
+        return True
 
     async def _publish_analyses_to_recs_cache(self, analyses: list[dict]) -> None:
         """把本轮全部分析结果写入推荐缓存；前端再按人工/自动模式过滤。"""
