@@ -104,6 +104,23 @@ def _finalize(ctx: dict) -> dict:
     return ctx
 
 
+async def _scrape_switch_enabled() -> bool:
+    """数据源总开关（与前端"爬取数据源开关"同键）。
+
+    关闭（0/false）时：预取循环停 + AI 分析不实时爬取。
+    读取失败时保守返回 True（避免 Redis 抖动导致分析缺数据）。
+    """
+    try:
+        from app.core.cache import cache
+
+        val = await cache.get("nowscore:prefetch:enabled")
+        if val is not None:
+            return str(val) in ("1", "true", "True", "on")
+    except Exception:
+        pass
+    return bool(getattr(settings, "NOWSCORE_PREFETCH_ENABLED", True))
+
+
 async def _persist(match_info: dict, fixture_key: str, ctx: dict) -> dict:
     from app.services.match_context_store import save_context
 
@@ -166,7 +183,11 @@ async def fetch_match_context_fast(match_info: dict) -> dict:
 
 
 async def fetch_match_context(match_info: dict, *, refresh_on_miss: bool = True) -> dict:
-    """优先读 DB / Redis；默认允许慢速抓取补全，关闭时直接快速跳过。"""
+    """优先读 DB / Redis；默认允许慢速抓取补全，关闭时直接快速跳过。
+
+    数据源开关（nowscore:prefetch:enabled）关闭时不再实时爬取——
+    缓存命中照常返回（历史数据仍可用），未命中走快路径。
+    """
     if not bool(getattr(settings, "AI_MATCH_CONTEXT_ENABLED", True)):
         return empty_match_context(source="disabled", note="AI_MATCH_CONTEXT_ENABLED=false")
 
@@ -183,6 +204,14 @@ async def fetch_match_context(match_info: dict, *, refresh_on_miss: bool = True)
         return empty_match_context(
             source="none",
             note="缓存未命中，已快速跳过抓取",
+            context_mode="fast_cache_only",
+        )
+
+    # 数据源开关关闭 → 不实时爬取（缓存未命中即返回空上下文）
+    if not await _scrape_switch_enabled():
+        return empty_match_context(
+            source="none",
+            note="数据源开关已关闭，未实时抓取（缓存未命中）",
             context_mode="fast_cache_only",
         )
 

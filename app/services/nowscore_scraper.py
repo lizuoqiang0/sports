@@ -2319,8 +2319,22 @@ async def prefetch_today_all_contexts(
 
     async def _parse_and_save(sid: int, title: str):
         nonlocal success_count
+        # 场间检查点：开关被关闭时不再发起新场次爬取（在飞请求自然完成）
+        try:
+            from app.services.nowscore_prefetcher import _is_enabled
+            if not await _is_enabled():
+                return
+        except Exception:
+            pass
         async with sem:
             try:
+                # 二次检查：排队等到信号量时开关可能已被关闭
+                try:
+                    from app.services.nowscore_prefetcher import _is_enabled
+                    if not await _is_enabled():
+                        return
+                except Exception:
+                    pass
                 meta = match_meta.get(sid) or {}
                 home = str(meta.get("home_team") or "").strip()
                 away = str(meta.get("away_team") or "").strip()
