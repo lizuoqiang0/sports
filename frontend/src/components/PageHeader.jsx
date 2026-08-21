@@ -21,7 +21,7 @@ export default function PageHeader({ eyebrow, title, description, actions, child
         className="mt-5 h-px w-full max-w-md"
         style={{
           background:
-            'linear-gradient(90deg, rgba(31,122,76,0.45), rgba(31,122,76,0.08), transparent)',
+            'linear-gradient(90deg, rgba(37,99,235,0.45), rgba(37,99,235,0.08), transparent)',
         }}
         aria-hidden
       />

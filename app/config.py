@@ -94,7 +94,7 @@ class Settings(BaseSettings):
     AI_ANALYZE_CONCURRENCY: int = 8        # GPT 分析并发数
     AI_IDLE_RESCAN_SEC: int = 30           # 空轮快扫间隔（无候选时，捕捉刚开赛）
     AI_SKIP_COOLDOWN_SEC: int = 300        # 同场 LLM skip 冷却（避免 TTL 内重复调用）
-    AI_ENABLE_OVER: bool = False           # 大球 over 下单开关（默认关=影子模式：分析输出 over 但 A1 拦截不下单）
+    AI_ENABLE_OVER: bool = True            # 大球 over 下单开关（已启用：over 与 under 对等参与闸门评估）
 
     # 赛前上下文（交锋 / 近10场 / 伤病）
     AI_MATCH_CONTEXT_ENABLED: bool = True

@@ -92,6 +92,11 @@ _SKIP_COOLDOWN_SEC = max(
     60, int(getattr(settings, "AI_SKIP_COOLDOWN_SEC", 300) or 300)
 )
 
+# 同一场比赛最多投注次数（跨站点择优，允许 2 次）
+MAX_BETS_PER_FIXTURE = max(
+    1, int(getattr(settings, "AI_MAX_BETS_PER_FIXTURE", 2) or 2)
+)
+
 
 class AIBettingEngine:
     """
@@ -350,7 +355,7 @@ class AIBettingEngine:
         analyses: list[dict] = []
         decisions: list[BetDecision] = []
         executed_box: list[int] = [0]          # 已下单数（list 便于闭包内修改）
-        placed_matches: set[int] = set()
+        placed_fixture_counts: dict[int, int] = {}  # match_id → 本轮已下注次数（含 sibling）
         bet_lock = asyncio.Lock()             # 保护下单环节：风控/防重复/计数
         analysis_summary: list[dict] = []
 
@@ -375,35 +380,54 @@ class AIBettingEngine:
                 analyses.append(best)
                 rec = best.get("recommendation") or {}
                 sel = str(rec.get("selection") or "").lower()
-                # 大小球双向：over 是否参与闸门评估由 AI_ENABLE_OVER（影子模式开关）决定；
-                # 关闭时 over 视为"仅展示"跳过下单评估（第二道防线，策略层 A1 也会拦）。
-                over_enabled = bool(getattr(settings, "AI_ENABLE_OVER", False))
-                if sel not in ("under", "over") or (sel == "over" and not over_enabled):
-                    skip_reason = str(
-                        rec.get("reasoning")
-                        or (best.get("analysis") or {}).get("reasoning")
-                        or "AI 未给出可下单的大小球方向"
-                    )
-                    # 记录同场 skip 冷却：状态未质变前不再重复 LLM 调用
-                    # （skip 判定多为"信号中性/数据不足"，几分钟内翻转概率低）
+                analysis_obj = best.get("analysis") or {}
+
+                # ── 双向独立闸门评估 ──
+                # under 和 over 各自独立走完整闸门链，谁通过谁下单
+                under_conf = float(analysis_obj.get("under_confidence") or 0)
+                over_conf = float(analysis_obj.get("over_confidence") or 0)
+
+                # GPT prediction confidence 是对推荐方向的"官方"置信度，
+                # 可能与 under_confidence/over_confidence 不一致（GPT 输出差异）。
+                # 对预测方向取 max(prediction_conf, direction_conf) 保证一致性，
+                # 避免已通过的单被双向重评用更低置信度拒绝。
+                pred_conf = float(analysis_obj.get("confidence") or 0)
+                pred_dir = str(analysis_obj.get("prediction") or "").lower().strip()
+                if pred_dir == "over" and pred_conf > over_conf:
+                    over_conf = pred_conf
+                elif pred_dir == "under" and pred_conf > under_conf:
+                    under_conf = pred_conf
+
+                # 提取双向赔率
+                odds_map = dict(best.get("current_odds") or {})
+                if rec.get("odds"):
+                    odds_map[sel] = float(rec["odds"])
+                # 从 cells 补充另一方向的赔率
+                for cell in (best.get("primary_market") or {}).get("cells") or []:
+                    if cell.get("available") and cell.get("odds") and cell.get("selection"):
+                        odds_map.setdefault(str(cell["selection"]), float(cell["odds"]))
+
+                bt = "total"
+                async with bet_lock:
+                    active_count_now = active_count + executed_box[0]
+
+                # 构建双向方向列表：先评估更强的方向
+                directions = []
+                if under_conf >= 0.30:
+                    directions.append(("under", under_conf))
+                if over_conf >= 0.30:
+                    directions.append(("over", over_conf))
+                directions.sort(key=lambda x: x[1], reverse=True)
+
+                if not directions:
+                    # 两个方向都不足 0.30 → skip
                     if ids:
                         self._skip_cooldown[str(min(ids))] = asyncio.get_event_loop().time()
-                    if sel == "skip":
-                        logger.info(
-                            "[AI主循环] AI 判定跳过（数据不足）: match=%s %s vs %s",
-                            best.get("match_id"), best.get("home_team", "?"), best.get("away_team", "?"),
-                        )
-                    elif sel == "over" and not over_enabled:
-                        logger.info(
-                            "[AI主循环] 大球影子模式（分析展示，不参与下单评估）: match=%s %s vs %s | conf=%s",
-                            best.get("match_id"), best.get("home_team", "?"), best.get("away_team", "?"),
-                            rec.get("confidence"),
-                        )
-                    else:
-                        logger.info(
-                            "[AI主循环] 跳过无效方向: match=%s %s vs %s | sel=%s",
-                            best.get("match_id"), best.get("home_team", "?"), best.get("away_team", "?"), sel,
-                        )
+                    logger.info(
+                        "[AI主循环] 双向信号均不足 match=%s %s vs %s | under=%.2f over=%.2f",
+                        best.get("match_id"), best.get("home_team", "?"), best.get("away_team", "?"),
+                        under_conf, over_conf,
+                    )
                     await self._notify(self.user_id, "analysis_done", {
                         "match_id": best.get("match_id"),
                         "home_team": best.get("home_team", "?"),
@@ -412,151 +436,177 @@ class AIBettingEngine:
                         "confidence": 0.0,
                         "odds": 0.0,
                         "should_bet": False,
-                        "bet_type": rec.get("bet_type") or "total",
+                        "bet_type": bt,
                         "status": "skipped",
-                        "reasoning": skip_reason,
+                        "reasoning": f"双向信号不足 under={under_conf:.2f} over={over_conf:.2f}",
                     })
                     return best
 
-                # 2. 策略闸门评估（无 DB）
-                bt = "total"
-                odds_map = dict(best.get("current_odds") or {})
-                if rec.get("odds"):
-                    odds_map[sel] = float(rec["odds"])
-                conf = float(rec.get("confidence") or (best.get("analysis") or {}).get("confidence") or 0)
-                async with bet_lock:
-                    active_count_now = active_count + executed_box[0]
-                decision = await user_engine.evaluate_bet(
-                    match_info={
-                        "id": int(best["match_id"]),
-                        "odds": odds_map,
-                        "provider_code": str(rec.get("provider_code") or ""),
-                        "home_team": best.get("home_team"),
-                        "away_team": best.get("away_team"),
-                        "league": best.get("league"),
-                        "sport": best.get("sport"),
-                        "period": best.get("period"),
-                        "clock": best.get("clock"),
-                        "home_score": best.get("home_score"),
-                        "away_score": best.get("away_score"),
-                    },
-                    analysis={
-                        **(best.get("analysis") or {}),
-                        "prediction": sel,
-                        "bet_type": bt,
-                        "confidence": conf,
-                        "odds": float(rec.get("odds") or 0),
-                        "provider_code": str(rec.get("provider_code") or ""),
-                        "line": rec.get("line"),
-                        "consensus_reached": bool((best.get("analysis") or {}).get("consensus_reached")),
-                        # 两轮评估设计：第一轮（analyze_and_recommend 内）只验证方向，
-                        # 其闸门拒绝产生的 [不投注] 标记不带入第二轮；第二轮使用原始
-                        # LLM reasoning 重新过全部闸门（B1/C1/D/E 等），在此轮确定最终
-                        # 方向并写入标记。LLM 级失败标记（不可下单）随 analysis 保留。
-                        "reasoning": str((best.get("analysis") or {}).get("reasoning") or ""),
-                    },
-                    user_balance=spendable,
-                    daily_loss=daily_loss_amt,
-                    active_bets_count=active_count_now,
-                )
-                stake = Decimal(str(decision.suggested_stake or 0))
-                if stake < Decimal("1.00"):
-                    stake = Decimal("1.00")
-                decision = decision.model_copy(update={"suggested_stake": stake})
-                decisions.append(decision)
-                # 回写 recommendation 展示字段
-                if best.get("recommendation") is not None:
-                    best["recommendation"] = {
-                        **(best.get("recommendation") or {}),
+                # 逐方向评估闸门
+                for direction, dir_conf in directions:
+                    dir_odds = float(odds_map.get(direction) or rec.get("odds") or 0)
+                    dir_reasoning = str(
+                        analysis_obj.get(f"{direction}_reasoning")
+                        or analysis_obj.get("reasoning")
+                        or ""
+                    )
+                    decision = await user_engine.evaluate_bet(
+                        match_info={
+                            "id": int(best["match_id"]),
+                            "odds": odds_map,
+                            "provider_code": str(rec.get("provider_code") or ""),
+                            "home_team": best.get("home_team"),
+                            "away_team": best.get("away_team"),
+                            "league": best.get("league"),
+                            "sport": best.get("sport"),
+                            "period": best.get("period"),
+                            "clock": best.get("clock"),
+                            "home_score": best.get("home_score"),
+                            "away_score": best.get("away_score"),
+                            # 传递盘口变动数据，C1 闸门需要判断市场方向
+                            "line_movement": (best.get("primary_market") or {}).get("line_movement"),
+                            "line_movements": best.get("line_movements") or {},
+                        },
+                        analysis={
+                            **analysis_obj,
+                            "prediction": direction,
+                            "bet_type": bt,
+                            "confidence": dir_conf,
+                            "odds": dir_odds,
+                            "provider_code": str(rec.get("provider_code") or ""),
+                            "line": rec.get("line"),
+                            "consensus_reached": True,
+                            "reasoning": dir_reasoning,
+                        },
+                        user_balance=spendable,
+                        daily_loss=daily_loss_amt,
+                        active_bets_count=active_count_now,
+                    )
+                    stake = Decimal(str(decision.suggested_stake or 0))
+                    if stake < Decimal("1.00"):
+                        stake = Decimal("1.00")
+                    decision = decision.model_copy(update={"suggested_stake": stake})
+                    decisions.append(decision)
+
+                    # 回写 recommendation 展示字段（取首个通过的方向）
+                    if best.get("recommendation") is not None and decision.should_bet:
+                        best["recommendation"] = {
+                            **(best.get("recommendation") or {}),
+                            "should_bet": True,
+                            "confidence": float(decision.confidence or dir_conf),
+                            "win_rate": round(float(decision.confidence or dir_conf) * 100, 1),
+                            "suggested_stake": float(decision.suggested_stake or 0),
+                            "reasoning": decision.reasoning,
+                            "selection": decision.selection,
+                            "odds": float(decision.odds or dir_odds or 0),
+                            "provider_code": decision.provider_code or rec.get("provider_code"),
+                            "line": decision.line if decision.line is not None else rec.get("line"),
+                        }
+
+                    await self._notify(self.user_id, "analysis_done", {
+                        "match_id": best.get("match_id"),
+                        "home_team": best.get("home_team", "?"),
+                        "away_team": best.get("away_team", "?"),
+                        "selection": direction,
+                        "confidence": dir_conf,
+                        "odds": dir_odds,
                         "should_bet": bool(decision.should_bet),
-                        "confidence": float(decision.confidence or conf),
-                        "win_rate": round(float(decision.confidence or conf) * 100, 1),
-                        "suggested_stake": float(decision.suggested_stake or 0),
-                        "reasoning": decision.reasoning,
-                        "selection": decision.selection,
-                        "odds": float(decision.odds or rec.get("odds") or 0),
-                        "provider_code": decision.provider_code or rec.get("provider_code"),
-                        "line": decision.line if decision.line is not None else rec.get("line"),
-                    }
-                rec_event = best.get("recommendation") or rec
+                        "bet_type": bt,
+                        "under_conf": under_conf,
+                        "over_conf": over_conf,
+                    })
 
-                await self._notify(self.user_id, "analysis_done", {
-                    "match_id": best.get("match_id"),
-                    "home_team": best.get("home_team", "?"),
-                    "away_team": best.get("away_team", "?"),
-                    "selection": rec_event.get("selection", ""),
-                    "confidence": float(
-                        rec_event.get("raw_confidence")
-                        or rec_event.get("confidence")
-                        or (best.get("analysis") or {}).get("confidence")
-                        or 0
-                    ),
-                    "odds": float(rec_event.get("raw_odds") or rec_event.get("odds") or 0),
-                    "should_bet": bool(decision.should_bet),
-                    "bet_type": rec_event.get("bet_type") or "total",
-                })
-
-                if not decision.should_bet:
-                    return best
-
-                logger.info(
-                    "✅ 策略通过（流式） | match=%s %s vs %s | %s/%s | conf=%.2f odds=%.2f stake=$%s",
-                    best.get("match_id"), best.get("home_team", "?"), best.get("away_team", "?"),
-                    decision.bet_type, decision.selection,
-                    float(decision.confidence or 0), float(decision.odds or 0),
-                    decision.suggested_stake,
-                )
-
-                # 3. 立即下单（加锁保护：防重复/风控）
-                async with bet_lock:
-                    mid = int(decision.match_id or 0)
-                    if mid in placed_matches:
-                        logger.info("[AI主循环] 跳过同场重复: match=%s", mid)
-                        return best
-                    # 独立 session 下单（async session 不能跨任务共享）
-                    async with AsyncSessionLocal() as db:
-                        user = await db.get(User, self.user_id)
-                        if not user or not user.ai_enabled:
-                            self.is_running = False
-                            return best
-                        ai_config2 = self._cycle_ai_config
-                        strat_cfg2 = self._cycle_strat_cfg
-                        if not ai_config2:
-                            return best
-                        # 风控实时检查
-                        should_stop, reason = await self._check_risk(db, user, ai_config2)
-                        if should_stop:
-                            logger.info("[AI主循环] ❌ 下单前触发风控，停止: %s", reason)
-                            return best
-                        # 跨轮次防重复
-                        if mid > 0 and await self._match_already_bet(db, self.user_id, mid):
-                            logger.info("[AI主循环] 跳过今日已下注比赛: match=%s", mid)
-                            return best
-                        # 最新策略二次校验
-                        ok_pass, why = decision_passes_strategy(decision, strat_cfg2)
-                        if not ok_pass:
-                            logger.info("[AI主循环] ❌ 最新策略拦截 match=%s: %s", decision.match_id, why)
-                            return best
-                        if not auto_place:
-                            await self._notify(user.id, "manual_recommend", {
-                                **decision.model_dump(),
-                                "bet_mode": bet_mode,
-                                "strategy": strat_cfg2.model_dump(),
-                                "message": "人工模式：已按最新 AI 策略生成推荐，请手动确认后真实下单",
-                            })
-                            return best
-                        ok = await self._execute_bet(
-                            db,
-                            user,
-                            decision,
-                            analysis_cache=best.get("analysis") or {},
-                            ai_config=ai_config2,
+                    if not decision.should_bet:
+                        logger.info(
+                            "[AI主循环] ❌ %s 闸门拒绝 match=%s | conf=%.2f",
+                            direction, best.get("match_id"), dir_conf,
                         )
-                        if ok:
-                            executed_box[0] += 1
+                        continue
+
+                    logger.info(
+                        "✅ 策略通过（流式） | match=%s %s vs %s | %s/%s | conf=%.2f odds=%.2f stake=$%s | 双向[under=%.2f over=%.2f]",
+                        best.get("match_id"), best.get("home_team", "?"), best.get("away_team", "?"),
+                        decision.bet_type, decision.selection,
+                        float(decision.confidence or 0), float(decision.odds or 0),
+                        decision.suggested_stake, under_conf, over_conf,
+                    )
+
+                    # 立即下单（加锁保护：防重复/风控）
+                    async with bet_lock:
+                        mid = int(decision.match_id or 0)
+                        if placed_fixture_counts.get(mid, 0) >= MAX_BETS_PER_FIXTURE:
+                            logger.info("[AI主循环] 跳过同场已达上限: match=%s count=%d/%d", mid, placed_fixture_counts.get(mid, 0), MAX_BETS_PER_FIXTURE)
+                            continue
+                        # 独立 session 下单
+                        async with AsyncSessionLocal() as db:
+                            user = await db.get(User, self.user_id)
+                            if not user or not user.ai_enabled:
+                                self.is_running = False
+                                return best
+                            ai_config2 = self._cycle_ai_config
+                            strat_cfg2 = self._cycle_strat_cfg
+                            if not ai_config2:
+                                return best
+                            # 风控实时检查
+                            should_stop, reason = await self._check_risk(db, user, ai_config2)
+                            if should_stop:
+                                logger.info("[AI主循环] ❌ 下单前触发风控，停止: %s", reason)
+                                return best
+                            # 跨轮次防重复（含同场 sibling 检查，允许 MAX_BETS_PER_FIXTURE 次）
                             if mid > 0:
-                                placed_matches.add(mid)
-                        await db.commit()
+                                bet_count = await self._match_bet_count(db, self.user_id, mid)
+                                if bet_count >= MAX_BETS_PER_FIXTURE:
+                                    logger.info("[AI主循环] 跳过今日已达上限比赛: match=%s count=%d/%d", mid, bet_count, MAX_BETS_PER_FIXTURE)
+                                    # 同时记录 sibling ids 防止同场另一方向重复
+                                    try:
+                                        from app.services.fixture_key import sibling_match_ids as _sib
+                                        from app.models.user import Match as _Match
+                                        from sqlalchemy import select as _sel
+                                        m_obj = (await db.execute(_sel(_Match).where(_Match.id == mid))).scalar_one_or_none()
+                                        if m_obj:
+                                            for sid in await _sib(db, m_obj):
+                                                placed_fixture_counts[int(sid)] = MAX_BETS_PER_FIXTURE
+                                    except Exception:
+                                        pass
+                                    continue
+                            # 最新策略二次校验
+                            ok_pass, why = decision_passes_strategy(decision, strat_cfg2)
+                            if not ok_pass:
+                                logger.info("[AI主循环] ❌ 最新策略拦截 match=%s: %s", decision.match_id, why)
+                                continue
+                            if not auto_place:
+                                await self._notify(user.id, "manual_recommend", {
+                                    **decision.model_dump(),
+                                    "bet_mode": bet_mode,
+                                    "strategy": strat_cfg2.model_dump(),
+                                    "message": "人工模式：已按最新 AI 策略生成推荐，请手动确认后真实下单",
+                                })
+                                return best
+                            ok = await self._execute_bet(
+                                db,
+                                user,
+                                decision,
+                                analysis_cache=analysis_obj,
+                                ai_config=ai_config2,
+                            )
+                            if ok:
+                                executed_box[0] += 1
+                                if mid > 0:
+                                    # 记录同场所有 sibling match ids（含自身），同步计数
+                                    # 注意：sibling_match_ids 包含 mid 自身，无需单独累加
+                                    try:
+                                        from app.services.fixture_key import sibling_match_ids as _sib
+                                        from app.models.user import Match as _Match
+                                        from sqlalchemy import select as _sel
+                                        m_obj = (await db.execute(_sel(_Match).where(_Match.id == mid))).scalar_one_or_none()
+                                        if m_obj:
+                                            for sid in await _sib(db, m_obj):
+                                                placed_fixture_counts[int(sid)] = placed_fixture_counts.get(int(sid), 0) + 1
+                                        else:
+                                            placed_fixture_counts[mid] = placed_fixture_counts.get(mid, 0) + 1
+                                    except Exception:
+                                        placed_fixture_counts[mid] = placed_fixture_counts.get(mid, 0) + 1
+                            await db.commit()
                 return best
 
         # 并发跑所有同场分组：分析完立即评估+下单
@@ -573,13 +623,12 @@ class AIBettingEngine:
         await self._publish_analyses_to_recs_cache(analyses)
 
         # 构建分析摘要供前端日志展示
-        over_enabled_summary = bool(getattr(settings, "AI_ENABLE_OVER", False))
         for item in analyses:
             rec = item.get("recommendation") or {}
             ana = item.get("analysis") or {}
             selection = str(rec.get("selection") or "").lower()
-            # over 在影子模式下前端仍展示方向与置信度（仅不可下单）
-            if selection in ("under", "over") and not (selection == "over" and not over_enabled_summary):
+            # under/over 均可展示
+            if selection in ("under", "over"):
                 skipped = False
             else:
                 skipped = True
@@ -644,7 +693,7 @@ class AIBettingEngine:
             "candidates": len(candidates),
             "approved": len(approved),
             "executed": executed,
-            "placed_matches": sorted(placed_matches),
+            "placed_matches": [mid for mid, c in placed_fixture_counts.items() if c > 0],
             "bet_mode": bet_mode,
             "auto_place": auto_place,
             "market": "total",
@@ -896,22 +945,29 @@ class AIBettingEngine:
         if not match:
             return False
 
-        # 同场已有未结算单 → 跳过（OB/平博只投一单）
+        # 同场注单计数检查（允许 MAX_BETS_PER_FIXTURE 次）
         from app.services.fixture_key import sibling_match_ids
 
         try:
             sib_ids = await sibling_match_ids(db, match)
         except Exception:
             sib_ids = [int(match.id)]
-        open_bet = await db.execute(
-            select(Bet.id).where(
+        today = datetime.now(timezone.utc).date()
+        today_start = datetime.combine(today, datetime.min.time(), tzinfo=timezone.utc)
+        count_res = await db.execute(
+            select(func.count(Bet.id)).where(
                 Bet.user_id == user.id,
                 Bet.match_id.in_(sib_ids),
                 Bet.status == BetStatus.SUCCESS,
-            ).limit(1)
+                Bet.created_at >= today_start,
+            )
         )
-        if open_bet.scalar_one_or_none() is not None:
-            logger.info("同场已有注单，跳过 AI 下单 match=%s sibs=%s", match.id, sib_ids)
+        existing_count = int(count_res.scalar_one() or 0)
+        if existing_count >= MAX_BETS_PER_FIXTURE:
+            logger.info(
+                "同场注单已达上限 %d/%d，跳过 AI 下单 match=%s sibs=%s",
+                existing_count, MAX_BETS_PER_FIXTURE, match.id, sib_ids,
+            )
             return False
 
         # match 级别短期锁：防止 API 一键下单与自动引擎并发下单同一比赛
@@ -1006,14 +1062,16 @@ class AIBettingEngine:
         )
         return result.scalar_one()
 
-    async def _match_already_bet(self, db: AsyncSession, user_id: int, match_id: int) -> bool:
-        """检查今天是否已对该比赛下过注（防止跨轮次重复下单）。
+    async def _match_bet_count(self, db: AsyncSession, user_id: int, match_id: int) -> int:
+        """检查今天已对该比赛下过多少注（含同场 sibling + Redis pending）。
 
-        同时检查 DB（已确认注单）和 Redis（OB 返回了 orderNo 但验证未通过的待定注单）。
+        返回注单总数，调用方按 MAX_BETS_PER_FIXTURE 判定是否允许继续下注。
         """
-        # 1. 检查 DB 已确认注单
         today = datetime.now(timezone.utc).date()
         today_start = datetime.combine(today, datetime.min.time(), tzinfo=timezone.utc)
+        total = 0
+
+        # 1. 检查 DB 已确认注单（含同场 sibling）
         result = await db.execute(
             select(func.count(Bet.id)).where(
                 Bet.user_id == user_id,
@@ -1022,18 +1080,36 @@ class AIBettingEngine:
                 Bet.created_at >= today_start,
             )
         )
-        if int(result.scalar_one() or 0) > 0:
-            return True
+        total += int(result.scalar_one() or 0)
 
-        # 2. 检查 Redis 待定注单（OB 返回 orderNo 但验证未通过）
+        # 1b. 检查同场 sibling 注单
+        try:
+            m_obj = (await db.execute(select(Match).where(Match.id == match_id))).scalar_one_or_none()
+            if m_obj:
+                from app.services.fixture_key import sibling_match_ids as _sib
+                sib_ids = await _sib(db, m_obj)
+                if sib_ids:
+                    sib_res = await db.execute(
+                        select(func.count(Bet.id)).where(
+                            Bet.user_id == user_id,
+                            Bet.is_ai_bet.is_(True),
+                            Bet.match_id.in_(sib_ids),
+                            Bet.created_at >= today_start,
+                        )
+                    )
+                    total += int(sib_res.scalar_one() or 0)
+        except Exception:
+            pass
+
+        # 2. 检查 Redis 待定注单（commit 失败或 OB 返回 orderNo）
         try:
             from app.core.cache import cache
             val = await cache.get_json(f"ai:bet:pending:{user_id}:{match_id}")
-            if val and val.get("order_no"):
-                return True
+            if val:
+                total += 1
         except Exception:
             pass
-        return False
+        return total
 
     async def _notify(self, user_id: int, event_type: str, data: dict):
         """推送通知"""
@@ -1361,7 +1437,7 @@ async def analyze_and_recommend(
         conf_use = float(analysis.get("confidence") or conf0 or 0)
         conf_use = max(0.0, min(0.99, conf_use))
         pred = str(analysis.get("prediction") or "").lower().strip()
-        if pred != "under":
+        if pred not in ("under", "over"):
             pred = ""
 
         markets = await build_match_market_recommendations(
@@ -1399,7 +1475,8 @@ async def analyze_and_recommend(
             }
             provider_name_str = str(primary.get("provider") or provider_name_str)
 
-        mkt_pack = await engine._get_best_market_pack(
+        from app.ai.bet_executor import get_best_market_pack
+        mkt_pack = await get_best_market_pack(
             db, match_id, bet_type, providers_filter=providers_filter
         )
         market_odds_flat = dict(mkt_pack.get("odds") or {})
@@ -1407,7 +1484,7 @@ async def analyze_and_recommend(
             if cell.get("available") and cell.get("odds") and cell.get("selection"):
                 market_odds_flat.setdefault(str(cell["selection"]), float(cell["odds"]))
 
-        analysis_pick_allowed = bool(use_llm) and pred == "under"
+        analysis_pick_allowed = bool(use_llm) and pred in ("under", "over")
         consensus_ok = True if not use_llm else bool(analysis.get("consensus_reached", True))
         if analysis_pick_allowed:
             sel = str(primary.get("selection") or pred or "").lower()

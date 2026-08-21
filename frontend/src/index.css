@@ -2,26 +2,26 @@
 @tailwind components;
 @tailwind utilities;
 
-/* === OB Sports — Pitch Signal === */
+/* === OB Sports — 商务蓝白主题 === */
 :root {
-  --ink: #101820;
-  --ink-soft: #1c2a25;
-  --muted: #5a6f67;
-  --muted-soft: #7a8f87;
-  --line: #d7e0db;
-  --line-soft: #e8efeb;
+  --ink: #0f172a;
+  --ink-soft: #1e293b;
+  --muted: #64748b;
+  --muted-soft: #94a3b8;
+  --line: #cbd5e1;
+  --line-soft: #e2e8f0;
   --surface: #ffffff;
-  --canvas: #eef2f0;
-  --canvas-deep: #e2e9e5;
-  --accent: #1f7a4c;
-  --accent-mid: #268a56;
-  --accent-soft: #eef8f2;
-  --pitch: #0e1714;
-  --pitch-mid: #15221d;
-  --signal: #c8f06c;
-  --live: #c0392b;
-  --shadow-sm: 0 1px 0 rgba(16, 24, 32, 0.04);
-  --shadow-md: 0 10px 28px rgba(16, 24, 32, 0.07);
+  --canvas: #f1f5f9;
+  --canvas-deep: #e2e8f0;
+  --accent: #2563eb;
+  --accent-mid: #3b82f6;
+  --accent-soft: #eff6ff;
+  --pitch: #0f172a;
+  --pitch-mid: #1e293b;
+  --signal: #60a5fa;
+  --live: #dc2626;
+  --shadow-sm: 0 1px 0 rgba(15, 23, 42, 0.04);
+  --shadow-md: 0 10px 28px rgba(15, 23, 42, 0.07);
   --radius: 0.625rem;
   --radius-lg: 0.875rem;
   --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
@@ -52,8 +52,8 @@ body {
 
 ::-webkit-scrollbar { width: 5px; height: 5px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: #b8c7bf; border-radius: 4px; }
-::-webkit-scrollbar-thumb:hover { background: #8fa399; }
+::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
 
 @layer components {
   .page {
@@ -90,7 +90,7 @@ body {
   }
 
   .card-hover:hover {
-    border-color: rgba(31, 122, 76, 0.35);
+    border-color: rgba(37, 99, 235, 0.35);
     box-shadow: var(--shadow-md);
     transform: translateY(-1px);
   }
@@ -106,7 +106,7 @@ body {
     background: var(--ink);
   }
   .btn-primary:hover {
-    background: #1c2a25;
+    background: #1e293b;
   }
 
   .btn-danger {
@@ -122,7 +122,7 @@ body {
     background: var(--accent);
   }
   .btn-success:hover {
-    background: #1a6340;
+    background: #1d4ed8;
   }
 
   .btn-secondary {
@@ -139,8 +139,8 @@ body {
     border-radius: var(--radius);
   }
   .input:focus {
-    border-color: rgba(31, 122, 76, 0.55);
-    box-shadow: 0 0 0 3px rgba(31, 122, 76, 0.12);
+    border-color: rgba(37, 99, 235, 0.55);
+    box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12);
   }
 
   .badge {
@@ -224,14 +224,14 @@ body {
   .app-sidebar {
     @apply w-[252px] flex flex-col shrink-0 z-40;
     background:
-      linear-gradient(165deg, rgba(200, 240, 108, 0.07) 0%, transparent 42%),
-      linear-gradient(180deg, #15221d 0%, #0e1714 55%, #0b1310 100%);
-    border-right: 1px solid rgba(255, 255, 255, 0.06);
+      linear-gradient(165deg, rgba(96, 165, 250, 0.04) 0%, transparent 42%),
+      linear-gradient(180deg, #ffffff 0%, #f8fafc 55%, #f1f5f9 100%);
+    border-right: 1px solid var(--line);
   }
 
   .app-sidebar-brand {
     @apply h-[72px] md:h-[76px] flex items-center gap-3 px-5;
-    border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+    border-bottom: 1px solid var(--line-soft);
   }
 
   .app-mark {
@@ -240,7 +240,7 @@ body {
     font-size: 1.65rem;
     letter-spacing: -0.04em;
     line-height: 1;
-    color: #f4faf6;
+    color: var(--ink);
     position: relative;
   }
   .app-mark::after {
@@ -257,22 +257,22 @@ body {
 
   .app-main {
     @apply flex-1 overflow-y-auto relative min-w-0;
-    background-color: #eef2f0;
+    background-color: #f1f5f9;
     background-image:
-      radial-gradient(ellipse 80% 45% at 8% -8%, rgba(31, 122, 76, 0.09), transparent 55%),
-      radial-gradient(ellipse 55% 35% at 100% 0%, rgba(16, 24, 32, 0.04), transparent 50%),
+      radial-gradient(ellipse 80% 45% at 8% -8%, rgba(37, 99, 235, 0.09), transparent 55%),
+      radial-gradient(ellipse 55% 35% at 100% 0%, rgba(15, 23, 42, 0.04), transparent 50%),
       repeating-linear-gradient(
         -12deg,
         transparent,
         transparent 11px,
-        rgba(16, 24, 32, 0.015) 11px,
-        rgba(16, 24, 32, 0.015) 12px
+        rgba(15, 23, 42, 0.015) 11px,
+        rgba(15, 23, 42, 0.015) 12px
       );
   }
 
   .app-topbar {
     @apply md:hidden sticky top-0 z-30 flex items-center justify-between gap-3 px-4 h-14;
-    background: rgba(238, 242, 240, 0.92);
+    background: rgba(241, 245, 249, 0.92);
     backdrop-filter: blur(10px);
     border-bottom: 1px solid var(--line);
   }
@@ -280,17 +280,18 @@ body {
   .nav-link {
     @apply flex items-center gap-3 px-3 py-2.5 text-[13.5px] transition-all relative;
     border-radius: 0.55rem;
-    color: rgba(232, 240, 236, 0.58);
+    color: var(--muted);
   }
 
   .nav-link:hover {
-    color: #f6fbf8;
-    background: rgba(255, 255, 255, 0.05);
+    color: var(--ink);
+    background: rgba(37, 99, 235, 0.06);
   }
 
   .nav-link.is-active {
-    color: #ffffff;
-    background: rgba(31, 122, 76, 0.38);
+    color: var(--accent);
+    background: rgba(37, 99, 235, 0.10);
+    font-weight: 600;
   }
 
   .nav-link.is-active::before {
@@ -307,7 +308,7 @@ body {
 
   .sidebar-scrim {
     @apply fixed inset-0 z-30 md:hidden;
-    background: rgba(10, 16, 20, 0.45);
+    background: rgba(15, 23, 42, 0.25);
     animation: fadeIn 0.2s ease both;
   }
 
@@ -322,9 +323,9 @@ body {
     position: relative;
     overflow: hidden;
     background:
-      radial-gradient(ellipse 70% 50% at 15% 10%, rgba(31, 122, 76, 0.14), transparent 55%),
-      radial-gradient(ellipse 50% 40% at 90% 80%, rgba(200, 240, 108, 0.12), transparent 50%),
-      linear-gradient(165deg, #e8efe9 0%, #f3f6f4 45%, #e6ece8 100%);
+      radial-gradient(ellipse 70% 50% at 15% 10%, rgba(37, 99, 235, 0.14), transparent 55%),
+      radial-gradient(ellipse 50% 40% at 90% 80%, rgba(96, 165, 250, 0.12), transparent 50%),
+      linear-gradient(165deg, #e2e8f0 0%, #f1f5f9 45%, #e2e8f0 100%);
   }
 
   .login-page::before {
@@ -338,8 +339,8 @@ body {
         -18deg,
         transparent,
         transparent 22px,
-        rgba(16, 24, 32, 0.03) 22px,
-        rgba(16, 24, 32, 0.03) 23px
+        rgba(15, 23, 42, 0.03) 22px,
+        rgba(15, 23, 42, 0.03) 23px
       );
   }
 
@@ -435,7 +436,7 @@ body {
   .login-field span {
     font-size: 0.8rem;
     font-weight: 600;
-    color: #364540;
+    color: #334155;
   }
 
   .login-field input {
@@ -451,11 +452,11 @@ body {
     transition: border-color 0.2s, box-shadow 0.2s;
   }
 
-  .login-field input::placeholder { color: #a3b5ac; }
+  .login-field input::placeholder { color: #94a3b8; }
 
   .login-field input:focus {
-    border-color: rgba(31, 122, 76, 0.55);
-    box-shadow: 0 0 0 3px rgba(31, 122, 76, 0.12);
+    border-color: rgba(37, 99, 235, 0.55);
+    box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12);
   }
 
   .login-password { position: relative; }
@@ -468,12 +469,12 @@ body {
     transform: translateY(-50%);
     border: none;
     background: transparent;
-    color: #a3b5ac;
+    color: #94a3b8;
     cursor: pointer;
     padding: 0.2rem;
     display: inline-flex;
   }
-  .login-eye:hover { color: #455853; }
+  .login-eye:hover { color: #475569; }
 
   .login-submit {
     margin-top: 0.25rem;
@@ -495,7 +496,7 @@ body {
   }
 
   .login-submit:hover:not(:disabled) {
-    background: #1c2a25;
+    background: #1e293b;
     transform: translateY(-1px);
   }
 
@@ -516,7 +517,7 @@ body {
     margin-top: 1.25rem;
     text-align: center;
     font-size: 0.72rem;
-    color: #8a9c93;
+    color: #94a3b8;
   }
 }
 
@@ -536,12 +537,12 @@ body {
 }
 
 @keyframes oddsFlashUp {
-  0% { background: rgba(31, 122, 76, 0.14); }
+  0% { background: rgba(37, 99, 235, 0.14); }
   100% { background: transparent; }
 }
 
 @keyframes oddsFlashDown {
-  0% { background: rgba(192, 57, 43, 0.12); }
+  0% { background: rgba(220, 38, 38, 0.12); }
   100% { background: transparent; }
 }
 
@@ -554,7 +555,7 @@ body {
     bottom: 0;
     transform: translateX(-105%);
     transition: transform 0.28s var(--ease-out);
-    box-shadow: 8px 0 32px rgba(10, 16, 20, 0.25);
+    box-shadow: 8px 0 32px rgba(2, 6, 23, 0.25);
   }
 
   .app-sidebar.is-open {

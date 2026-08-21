@@ -113,17 +113,57 @@ async def scrape_pinnacle_live_text(page, *, url_sport: str = "", limit: int = 8
                 .map(Number).filter((n) => n > 1 && n < 50);
               const totalFrom = (ctx) => {
                 const text = String(ctx || '').replace(/[\\u200e\\u200f]/g, ' ');
-                const re = /(?:^|\\s)(\\d+(?:\\.\\d+)?(?:\\s*-\\s*\\d+(?:\\.\\d+)?)?)\\s+\\d\\.\\d{2,3}\\s*(?:小|Under)\\s*(\\d\\.\\d{2,3})/gi;
+                // 格式: <line> <over_odds> 小/Under <under_odds>
+                const reUnder = /(?:^|\\s)(\\d+(?:\\.\\d+)?(?:\\s*-\\s*\\d+(?:\\.\\d+)?)?)\\s+(\\d\\.\\d{2,3})\\s*(?:小|Under)\\s*(\\d\\.\\d{2,3})/gi;
                 let hit, last = null;
-                while ((hit = re.exec(text))) last = hit;
-                if (!last) return null;
-                const parts = String(last[1]).split('-').map((x) => Number(String(x).trim()));
-                const numbers = parts.filter((x) => Number.isFinite(x));
-                const line = numbers.length ? numbers.reduce((a, b) => a + b, 0) / numbers.length : NaN;
-                const under = Number(last[2]);
-                return Number.isFinite(line) && line > 0 && Number.isFinite(under) && under > 1
-                  ? { line, under }
-                  : null;
+                while ((hit = reUnder.exec(text))) last = hit;
+                if (last) {
+                  const parts = String(last[1]).split('-').map((x) => Number(String(x).trim()));
+                  const numbers = parts.filter((x) => Number.isFinite(x));
+                  const line = numbers.length ? numbers.reduce((a, b) => a + b, 0) / numbers.length : NaN;
+                  const over = Number(last[2]);
+                  const under = Number(last[3]);
+                  if (Number.isFinite(line) && line > 0 && Number.isFinite(under) && under > 1)
+                    return { line, under, over: Number.isFinite(over) && over > 1 ? over : null };
+                }
+                // 兜底: <line> <under_odds> 大/Over <over_odds>
+                const reOver = /(?:^|\\s)(\\d+(?:\\.\\d+)?(?:\\s*-\\s*\\d+(?:\\.\\d+)?)?)\\s+(\\d\\.\\d{2,3})\\s*(?:大|Over)\\s*(\\d\\.\\d{2,3})/gi;
+                let hit2, last2 = null;
+                while ((hit2 = reOver.exec(text))) last2 = hit2;
+                if (last2) {
+                  const parts = String(last2[1]).split('-').map((x) => Number(String(x).trim()));
+                  const numbers = parts.filter((x) => Number.isFinite(x));
+                  const line = numbers.length ? numbers.reduce((a, b) => a + b, 0) / numbers.length : NaN;
+                  const under = Number(last2[2]);
+                  const over = Number(last2[3]);
+                  if (Number.isFinite(line) && line > 0 && Number.isFinite(over) && over > 1)
+                    return { line, under: Number.isFinite(under) && under > 1 ? under : null, over };
+                }
+                // 兜底2: 仅匹配 <line> 小/Under <under_odds>（无 over）
+                const reUnderOnly = /(?:^|\\s)(\\d+(?:\\.\\d+)?(?:\\s*-\\s*\\d+(?:\\.\\d+)?)?)\\s*(?:小|Under)\\s*(\\d\\.\\d{2,3})/gi;
+                let hit3, last3 = null;
+                while ((hit3 = reUnderOnly.exec(text))) last3 = hit3;
+                if (last3) {
+                  const parts = String(last3[1]).split('-').map((x) => Number(String(x).trim()));
+                  const numbers = parts.filter((x) => Number.isFinite(x));
+                  const line = numbers.length ? numbers.reduce((a, b) => a + b, 0) / numbers.length : NaN;
+                  const under = Number(last3[2]);
+                  if (Number.isFinite(line) && line > 0 && Number.isFinite(under) && under > 1)
+                    return { line, under, over: null };
+                }
+                // 兜底3: 仅匹配 <line> 大/Over <over_odds>（无 under）
+                const reOverOnly = /(?:^|\\s)(\\d+(?:\\.\\d+)?(?:\\s*-\\s*\\d+(?:\\.\\d+)?)?)\\s*(?:大|Over)\\s*(\\d\\.\\d{2,3})/gi;
+                let hit4, last4 = null;
+                while ((hit4 = reOverOnly.exec(text))) last4 = hit4;
+                if (last4) {
+                  const parts = String(last4[1]).split('-').map((x) => Number(String(x).trim()));
+                  const numbers = parts.filter((x) => Number.isFinite(x));
+                  const line = numbers.length ? numbers.reduce((a, b) => a + b, 0) / numbers.length : NaN;
+                  const over = Number(last4[2]);
+                  if (Number.isFinite(line) && line > 0 && Number.isFinite(over) && over > 1)
+                    return { line, under: null, over };
+                }
+                return null;
               };
 
               // 主通道：比分 + 节次 + 分钟' + 主队‎客队‎
@@ -149,6 +189,7 @@ async def scrape_pinnacle_live_text(page, *, url_sport: str = "", limit: int = 8
                   league,
                   home, away, odds: odds.slice(0, 6),
                   under: total && total.under,
+                  over: total && total.over,
                   total_line: total && total.line,
                   home_score: hs, away_score: as_,
                   period: period || '进行中',
@@ -178,6 +219,7 @@ async def scrape_pinnacle_live_text(page, *, url_sport: str = "", limit: int = 8
                   league,
                   home, away, odds: odds.slice(0, 6),
                   under: total && total.under,
+                  over: total && total.over,
                   total_line: total && total.line,
                   home_score: hs, away_score: as_,
                   period: period || '进行中',

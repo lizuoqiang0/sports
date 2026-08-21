@@ -263,7 +263,14 @@ def match_elapsed_seconds(
                 return int((12 + max(0.0, quarter_len - mins_cd)) * 60)
             if any(x in period_l for x in ("第1节", "Q1")) or re.search(r"\bq1\b", pl):
                 return int(max(0.0, quarter_len - mins_cd) * 60)
-            return int(mins_cd * 60)
+            # 节次无法识别时，尝试从 period 字符串提取数字（如 "4" / "第4" / "4th"）
+            q_match = re.search(r"(\d)", period_l)
+            if q_match:
+                q_num = int(q_match.group(1))
+                if 1 <= q_num <= 4:
+                    return int(((q_num - 1) * 12 + max(0.0, quarter_len - mins_cd)) * 60)
+            # 篮球节次完全未知时无法计算已进行时间，返回 None 让闸门跳过时间检查
+            return None
         # 无时钟：按节次中点粗估（12 分钟一节）
         if any(x in pl for x in ("完场", "finished", "ft")):
             return 10**9

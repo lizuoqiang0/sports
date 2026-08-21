@@ -157,6 +157,25 @@ def _parse_total_from_raw(raw: str, *, sport: str = "football") -> Optional[dict
                 if not (0.5 <= line_u <= 280):
                     return None
             return {"line": line_u, "under": under_u}
+        # Fallback: 仅提取 over（平博 DOM 可能不显示 under）
+        m_over = re.search(
+            r"(?:大|O(?:ver)?)\s*([0-9]+(?:\.[0-9]+)?)\s+(\d{1,2}\.\d{1,3})",
+            text, re.I,
+        )
+        if m_over:
+            try:
+                line_o = float(m_over.group(1))
+                over_o = float(m_over.group(2))
+            except (TypeError, ValueError):
+                return None
+            if over_o <= 1:
+                return None
+            if sport == "football" and not (0.5 <= line_o <= 12):
+                return None
+            if sport == "basketball" and not (100 <= line_o <= 280):
+                if not (0.5 <= line_o <= 280):
+                    return None
+            return {"line": line_o, "over": over_o}
         return None
     try:
         line = float(m.group(1))
@@ -684,10 +703,9 @@ async def scrape_dom_matches(page, *, site_code: str, live_only: bool = False, l
                 under_v = under_v or tot.get("under")
                 if total_line is None:
                     total_line = tot.get("line")
-        # 允许只有 under 时也创建 TOTAL（OB H5 可能不显示 over）
-        if under_v and under_v >= 1.1 and under_v <= 10 and total_line:
+        # 允许只有 under 或只有 over 时也创建 TOTAL
+        if total_line and ((under_v and 1.1 <= under_v <= 10) or (over_v and over_v > 1)):
             total_data: dict[str, Any] = {
-                "under": float(under_v),
                 "_site": {
                     "bet_type": "total",
                     "source": "dom",
@@ -696,6 +714,8 @@ async def scrape_dom_matches(page, *, site_code: str, live_only: bool = False, l
                     "line": float(total_line),
                 },
             }
+            if under_v and 1.1 <= under_v <= 10:
+                total_data["under"] = float(under_v)
             if over_v and over_v > 1:
                 total_data["over"] = float(over_v)
             odds_list.append(
@@ -711,13 +731,12 @@ async def scrape_dom_matches(page, *, site_code: str, live_only: bool = False, l
         for half_label, half_bt in (("上半场", "first_half_total"), ("下半场", "second_half_total")):
             if half_label in raw_txt:
                 ht = _parse_total_from_raw(raw_txt, sport=sport)
-                if ht and ht.get("under"):
-                    ht_under = ht["under"]
+                if ht and (ht.get("under") or ht.get("over")):
+                    ht_under = ht.get("under")
                     ht_over = ht.get("over")
                     ht_line = ht.get("line")
-                    if ht_under and 1.1 <= ht_under <= 10 and ht_line:
+                    if ht_line and ((ht_under and 1.1 <= ht_under <= 10) or (ht_over and ht_over > 1)):
                         ht_data: dict[str, Any] = {
-                            "under": float(ht_under),
                             "_site": {
                                 "bet_type": half_bt,
                                 "source": "dom",
@@ -727,6 +746,8 @@ async def scrape_dom_matches(page, *, site_code: str, live_only: bool = False, l
                                 "period": half_label,
                             },
                         }
+                        if ht_under and 1.1 <= ht_under <= 10:
+                            ht_data["under"] = float(ht_under)
                         if ht_over and ht_over > 1:
                             ht_data["over"] = float(ht_over)
                         odds_list.append(

@@ -304,6 +304,50 @@ async def _record_alias_candidate(
         current["home_variants"] = _dedupe_keep_order(list(current.get("home_variants") or []) + home_variants)[:8]
         current["away_variants"] = _dedupe_keep_order(list(current.get("away_variants") or []) + away_variants)[:8]
         await cache.hset(_ALIAS_CANDIDATE_HASH_KEY, candidate_key, current)
+
+        # 自动生效：候选别名同时写入正式别名，无需手动确认
+        override = _build_alias_override_record(
+            {
+                "id": candidate_key,
+                "sport": _sport_cache_key(sport),
+                "source_home": home,
+                "source_away": away,
+                "candidate_home": candidate_home,
+                "candidate_away": candidate_away,
+                "candidate_title": best_title,
+                "schedule_id": int(best_sid),
+                "best_score": float(best_score),
+                "approved_by": "auto",
+                "source_count": int(current.get("count") or 0),
+                "home_variants": list(current.get("home_variants") or []),
+                "away_variants": list(current.get("away_variants") or []),
+            },
+            approved_by="auto",
+        )
+        if override:
+            await cache.hset(_ALIAS_OVERRIDE_HASH_KEY, candidate_key, override)
+            _invalidate_alias_override_cache()
+            logger.info(
+                "nowscore: alias auto-approved & effective | %s vs %s -> %s vs %s | score=%.3f | home_group=%s | away_group=%s",
+                home, away,
+                candidate_home, candidate_away,
+                float(best_score),
+                override.get("home_alias_group"),
+                override.get("away_alias_group"),
+            )
+            await _emit_alias_audit_log(
+                "auto_approve",
+                actor="auto",
+                payload={
+                    "record_id": candidate_key,
+                    "sport": _sport_cache_key(sport),
+                    "source_home": home,
+                    "source_away": away,
+                    "candidate_home": candidate_home,
+                    "candidate_away": candidate_away,
+                    "best_score": float(best_score),
+                },
+            )
     except Exception as e:
         logger.debug("nowscore alias candidate store failed: %s", e)
 
@@ -354,6 +398,12 @@ async def _get_runtime_alias_index(
 
     _alias_override_cache["ts"] = now
     _alias_override_cache["data"] = index_by_sport
+    fb_count = len(index_by_sport.get("football", {}))
+    bk_count = len(index_by_sport.get("basketball", {}))
+    logger.info(
+        "nowscore: runtime alias index loaded | football=%d basketball=%d entries (sport=%s, ttl=%ss)",
+        fb_count, bk_count, cache_key, _ALIAS_OVERRIDE_CACHE_TTL,
+    )
     return index_by_sport.get(cache_key) or {}
 
 
@@ -996,6 +1046,15 @@ async def _find_schedule_id(
     away_variants = _team_alias_variants(away, sport, runtime_alias_index)
     home_lowers = [v.lower().strip() for v in home_variants if v.strip()]
     away_lowers = [v.lower().strip() for v in away_variants if v.strip()]
+
+    runtime_home = [v for v in home_variants if v not in [home, re.sub(r"\s+", "", home)]]
+    runtime_away = [v for v in away_variants if v not in [away, re.sub(r"\s+", "", away)]]
+    if runtime_home or runtime_away:
+        logger.info(
+            "nowscore: runtime alias expanded | home: %s -> %d variants (runtime +%d: %s) | away: %s -> %d variants (runtime +%d: %s)",
+            home, len(home_variants), len(runtime_home), runtime_home[:5],
+            away, len(away_variants), len(runtime_away), runtime_away[:5],
+        )
 
     for sid, title in titles.items():
         title_lower = title.lower()

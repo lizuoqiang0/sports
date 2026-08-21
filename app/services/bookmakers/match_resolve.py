@@ -25,16 +25,26 @@ def _norm_team(name: str) -> str:
     for suf in ("女足", "男足", "青年", "后备", "预备队", "二队"):
         if s.endswith(suf) and len(s) > len(suf) + 1:
             s = s[: -len(suf)]
+    # B队/2队/3队 等编号后缀：B队→去掉，2队→去掉
+    s = re.sub(r"b队$", "", s)
+    s = re.sub(r"[23]队$", "", s)
     # 去掉尾部的"中"字（捷报比分用"切尔西中"表示中场/青年，OB 用"切尔西"）
     if s.endswith("中") and len(s) > 2:
         s = s[:-1]
     for suf in ("足球俱乐部", "足球队", "俱乐部", "fc", "cf", "sc", "afc", "队"):
         if s.endswith(suf) and len(s) > len(suf) + 1:
             s = s[: -len(suf)]
+    # 去掉尾部年份后缀：帕尔马1913 → 帕尔马，慕尼黑1860 → 慕尼黑
+    s = re.sub(r"\d{2,4}$", "", s)
     # 去掉常见前缀噪声
     for pref in ("pec", "fc", "afc", "sc"):
         if s.startswith(pref) and len(s) > len(pref) + 1:
             s = s[len(pref) :]
+    # 去掉常见地名前缀（里约热内卢州、布加勒斯特等）仅当剩余部分 >= 2 字时
+    for pref in ("里约热内卢州", "布加勒斯特", "布格勒斯特"):
+        if s.startswith(pref) and len(s) > len(pref) + 1:
+            s = s[len(pref) :]
+            break
     return s
 
 

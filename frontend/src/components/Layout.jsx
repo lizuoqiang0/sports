@@ -26,7 +26,7 @@ const intelligenceNav = [
 function NavGroup({ title, items, onNavigate }) {
   return (
     <div className="mb-7">
-      <div className="px-3 mb-2.5 text-[10px] font-semibold tracking-[0.16em] uppercase text-white/30">
+      <div className="px-3 mb-2.5 text-[10px] font-semibold tracking-[0.16em] uppercase text-ink-400">
         {title}
       </div>
       <div className="space-y-0.5">
@@ -137,12 +137,12 @@ export default function Layout() {
         <div className="app-sidebar-brand">
           <div className="app-mark">OB</div>
           <div className="min-w-0 flex-1">
-            <div className="font-display text-[14px] text-white tracking-tight">OB Sports</div>
-            <div className="text-[11px] text-white/40 mt-0.5">投注工作台</div>
+            <div className="font-display text-[14px] text-ink-900 tracking-tight">OB Sports</div>
+            <div className="text-[11px] text-ink-500 mt-0.5">投注工作台</div>
           </div>
           <button
             type="button"
-            className="md:hidden p-1.5 text-white/60 hover:text-white"
+            className="md:hidden p-1.5 text-ink-500 hover:text-ink-900"
             onClick={() => setNavOpen(false)}
             aria-label="关闭菜单"
           >
@@ -155,11 +155,11 @@ export default function Layout() {
           <NavGroup title="智能" items={intelligenceNav} onNavigate={() => setNavOpen(false)} />
         </nav>
 
-        <div className="p-3 border-t border-white/[0.07]">
+        <div className="p-3 border-t border-ink-100">
           <div className={`flex items-center gap-2 px-3 py-2 rounded-lg text-xs mb-2.5 font-medium ${
             connected
-              ? 'text-[#d8f5a6] bg-[rgba(200,240,108,0.12)]'
-              : 'text-rose-200 bg-rose-500/15'
+              ? 'text-brand-700 bg-brand-50'
+              : 'text-rose-600 bg-rose-50'
           }`}>
             {connected ? <Wifi size={13} /> : <WifiOff size={13} />}
             {connected ? '实时已连接' : '实时已断开'}
@@ -169,14 +169,14 @@ export default function Layout() {
             <button
               type="button"
               onClick={() => setShowUserMenu(!showUserMenu)}
-              className="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-white/[0.06] transition-colors"
+              className="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-ink-50 transition-colors"
             >
-              <div className="w-9 h-9 rounded-lg bg-brand-600/90 text-white flex items-center justify-center shrink-0 ring-1 ring-white/10">
+              <div className="w-9 h-9 rounded-lg bg-brand-600 text-white flex items-center justify-center shrink-0 ring-1 ring-ink-200">
                 <User size={15} />
               </div>
               <div className="flex-1 text-left min-w-0">
-                <div className="text-sm font-semibold truncate text-white/95">{user?.username}</div>
-                <div className="text-xs text-white/40 tabular-nums">
+                <div className="text-sm font-semibold truncate text-ink-900">{user?.username}</div>
+                <div className="text-xs text-ink-500 tabular-nums">
                   ¥{formatMoney(user?.balance)}
                 </div>
               </div>

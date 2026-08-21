@@ -56,7 +56,7 @@ async def ui_place_pinnacle_total(
         except Exception:
             sport_l = "football"
 
-    # 队名 token：完整名 + 片段（先不导航，避免打掉当前已渲染的滚球列表）
+    # 队名 token：完整名 + 片段 + 规范化名（去后缀/前缀）
     tokens = []
     for t in (home, away):
         t = (t or "").strip()
@@ -67,6 +67,22 @@ async def ui_place_pinnacle_total(
             if len(t) >= n:
                 tokens.append(t[:n])
                 tokens.append(t[-n:])
+        # 规范化 token：去掉常见后缀/前缀后生成额外搜索 token
+        import re as _re
+        nt = t.lower().replace(" ", "").replace("\u200e", "").replace("\u200f", "")
+        nt = _re.sub(r"[\(（][^\)）]*[\)）]", "", nt)
+        for suf in ("足球俱乐部", "足球队", "俱乐部", "fc", "cf", "sc", "afc", "队", "女足", "男足", "青年", "后备", "预备队", "二队", "b队"):
+            if nt.endswith(suf) and len(nt) > len(suf) + 1:
+                nt2 = nt[:-len(suf)]
+                if len(nt2) >= 2:
+                    tokens.append(nt2)
+                    for n in (2, 3, 4):
+                        if len(nt2) >= n:
+                            tokens.append(nt2[:n])
+                break
+        nt = _re.sub(r"\d{2,4}$", "", nt)
+        if nt and nt != t.lower().replace(" ", ""):
+            tokens.append(nt)
     seen: set[str] = set()
     tokens = [x for x in tokens if not (x in seen or seen.add(x))]
 

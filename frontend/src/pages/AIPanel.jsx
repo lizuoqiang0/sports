@@ -11,8 +11,8 @@ import BetModeSwitch from '../components/BetModeSwitch.jsx'
 import toast from 'react-hot-toast'
 import {
   Bot, Play, Square, Settings, Loader2, Shield,
-  AlertTriangle, Zap, Brain,
-  ChevronDown, ChevronUp, Database, Power, Download, Upload, RefreshCw, CheckSquare, Trash2,
+  Zap, Brain,
+  Database, Power,
 } from 'lucide-react'
 
 const SEL_LABEL = {
@@ -32,17 +32,6 @@ const SPORT_TABS = [
 ]
 
 const SITE_TABS = SITE_ORDER.map((code) => ({ key: code, label: SITE_NAMES[code] }))
-const ALIAS_SPORT_TABS = [{ key: 'all', label: '全部' }, ...SPORT_TABS]
-const CANDIDATE_SORTS = [
-  { key: 'score_desc', label: '分数从高到低' },
-  { key: 'count_desc', label: '出现次数从多到少' },
-  { key: 'recent_desc', label: '最近出现优先' },
-]
-const OVERRIDE_SORTS = [
-  { key: 'recent_desc', label: '最近批准优先' },
-  { key: 'score_desc', label: '分数从高到低' },
-  { key: 'name_asc', label: '名称排序' },
-]
 
 const DEFAULT_FORM_DATA = {
   is_active: false,
@@ -123,34 +112,6 @@ function formatDateTime(value) {
   }
 }
 
-function downloadJson(filename, data) {
-  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json;charset=utf-8' })
-  const url = URL.createObjectURL(blob)
-  const a = document.createElement('a')
-  a.href = url
-  a.download = filename
-  document.body.appendChild(a)
-  a.click()
-  a.remove()
-  URL.revokeObjectURL(url)
-}
-
-function parseAliasImportDraft(text) {
-  if (!String(text || '').trim()) {
-    return { items: [], error: '' }
-  }
-  try {
-    const parsed = JSON.parse(text)
-    const items = Array.isArray(parsed) ? parsed : parsed.items
-    if (!Array.isArray(items)) {
-      return { items: [], error: 'JSON 中缺少 items 数组' }
-    }
-    return { items, error: '' }
-  } catch {
-    return { items: [], error: 'JSON 格式无效' }
-  }
-}
-
 export default function AIPanelPage() {
   const { updateUser } = useAuth()
   const [engineStatus, setEngineStatus] = useState(null)
@@ -176,24 +137,6 @@ export default function AIPanelPage() {
   const [dsLoading, setDsLoading] = useState(false)
   const [prefetchProgress, setPrefetchProgress] = useState(null)
   const [prefetchNullCount, setPrefetchNullCount] = useState(0)
-  const [aliasCandidates, setAliasCandidates] = useState([])
-  const [aliasOverrides, setAliasOverrides] = useState([])
-  const [aliasAuditLogs, setAliasAuditLogs] = useState([])
-  const [aliasLoading, setAliasLoading] = useState(false)
-  const [selectedCandidateIds, setSelectedCandidateIds] = useState([])
-  const [selectedOverrideIds, setSelectedOverrideIds] = useState([])
-  const [importText, setImportText] = useState('')
-  const [importLoading, setImportLoading] = useState(false)
-  const [previewLoading, setPreviewLoading] = useState(false)
-  const [importPreview, setImportPreview] = useState(null)
-  const [aliasSportFilter, setAliasSportFilter] = useState('all')
-  const [candidateSort, setCandidateSort] = useState('score_desc')
-  const [overrideSort, setOverrideSort] = useState('recent_desc')
-  const [candidateSearch, setCandidateSearch] = useState('')
-  const [overrideSearch, setOverrideSearch] = useState('')
-  const [minScoreFilter, setMinScoreFilter] = useState('')
-  const [maxScoreFilter, setMaxScoreFilter] = useState('')
-  const [highScoreThreshold, setHighScoreThreshold] = useState(0.6)
   const prefetchTimerRef = useRef(null)
   const runtimeVersionRef = useRef(0)
 
@@ -226,28 +169,6 @@ export default function AIPanelPage() {
       }
     } catch {
       // ignore
-    }
-  }
-
-  const loadAliasData = async ({ silent = false } = {}) => {
-    if (!silent) setAliasLoading(true)
-    try {
-      const [candRes, overrideRes, auditRes] = await Promise.all([
-        adminAPI.getAliasCandidates('all', 100, 0),
-        adminAPI.getAliasOverrides('all', 100),
-        adminAPI.getAliasAuditLogs(30),
-      ])
-      const nextCandidates = candRes.data?.items || []
-      const nextOverrides = overrideRes.data?.items || []
-      setAliasCandidates(nextCandidates)
-      setAliasOverrides(nextOverrides)
-      setAliasAuditLogs(auditRes.data?.items || [])
-      setSelectedCandidateIds((prev) => prev.filter((id) => nextCandidates.some((item) => item.id === id)))
-      setSelectedOverrideIds((prev) => prev.filter((id) => nextOverrides.some((item) => item.id === id)))
-    } catch (e) {
-      if (!silent) toast.error(e?.message || '别名清单加载失败')
-    } finally {
-      if (!silent) setAliasLoading(false)
     }
   }
 
@@ -326,7 +247,6 @@ export default function AIPanelPage() {
     loadAll()
     loadDsSwitch()
     checkActivePrefetch()
-    loadAliasData()
     // 组件卸载时清理轮询，但不停止后端任务
     return () => {
       clearInterval(prefetchTimerRef.current)
@@ -622,185 +542,6 @@ export default function AIPanelPage() {
     }
   }
 
-  const toggleCandidateSelection = (id) => {
-    setSelectedCandidateIds((prev) => (
-      prev.includes(id) ? prev.filter((item) => item !== id) : [...prev, id]
-    ))
-  }
-
-  const toggleSelectAllCandidates = () => {
-    if (selectedCandidateIds.length === visibleCandidates.length && visibleCandidates.length) {
-      setSelectedCandidateIds([])
-      return
-    }
-    setSelectedCandidateIds(visibleCandidates.map((item) => item.id))
-  }
-
-  const handleSelectHighScoreCandidates = () => {
-    const picked = visibleCandidates
-      .filter((item) => Number(item.best_score || 0) >= Number(highScoreThreshold || 0))
-      .map((item) => item.id)
-    setSelectedCandidateIds(picked)
-    if (!picked.length) {
-      toast.error('当前筛选下没有达到阈值的候选别名')
-    }
-  }
-
-  const toggleOverrideSelection = (id) => {
-    setSelectedOverrideIds((prev) => (
-      prev.includes(id) ? prev.filter((item) => item !== id) : [...prev, id]
-    ))
-  }
-
-  const toggleSelectAllOverrides = () => {
-    if (selectedVisibleOverrideCount === visibleOverrides.length && visibleOverrides.length) {
-      setSelectedOverrideIds([])
-      return
-    }
-    setSelectedOverrideIds(visibleOverrides.map((item) => item.id))
-  }
-
-  const handleApproveSelectedCandidates = async () => {
-    if (!selectedCandidateIds.length) {
-      toast.error('请先勾选候选别名')
-      return
-    }
-    setAliasLoading(true)
-    try {
-      const res = await adminAPI.approveAliasCandidatesBatch(selectedCandidateIds, true)
-      const approvedCount = Number(res.data?.approved_count || 0)
-      toast.success(`已批准 ${approvedCount} 条候选别名`)
-      setSelectedCandidateIds([])
-      await loadAliasData({ silent: true })
-    } catch (e) {
-      toast.error(e?.message || '批量批准失败')
-    } finally {
-      setAliasLoading(false)
-    }
-  }
-
-  const handleApproveSingleCandidate = async (id) => {
-    setAliasLoading(true)
-    try {
-      await adminAPI.approveAliasCandidate(id, true)
-      toast.success('候选别名已生效')
-      await loadAliasData({ silent: true })
-    } catch (e) {
-      toast.error(e?.message || '批准失败')
-    } finally {
-      setAliasLoading(false)
-    }
-  }
-
-  const handleExportOverrides = async () => {
-    try {
-      const res = await adminAPI.exportAliasOverrides('all', 5000)
-      const data = res.data || {}
-      const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')
-      downloadJson(`nowscore-alias-overrides-${stamp}.json`, data)
-      toast.success(`已导出 ${data.count || 0} 条正式别名`)
-    } catch (e) {
-      toast.error(e?.message || '导出失败')
-    }
-  }
-
-  const handlePreviewImportOverrides = async () => {
-    const { items, error } = parseAliasImportDraft(importText)
-    if (error) {
-      toast.error(error)
-      return
-    }
-    if (!items.length) {
-      toast.error('导入内容里没有可用的别名 items')
-      return
-    }
-    setPreviewLoading(true)
-    try {
-      const res = await adminAPI.previewAliasOverridesImport(items)
-      setImportPreview(res.data || null)
-      const summary = res.data?.summary || {}
-      toast.success(
-        `预览完成：新增 ${summary.create || 0}，更新 ${summary.update || 0}，不变 ${summary.nochange || 0}`,
-      )
-    } catch (e) {
-      toast.error(e?.message || '导入预览失败')
-    } finally {
-      setPreviewLoading(false)
-    }
-  }
-
-  const handleImportOverrides = async () => {
-    const { items, error } = parseAliasImportDraft(importText)
-    if (error) {
-      toast.error(error)
-      return
-    }
-    if (!items.length) {
-      toast.error('导入内容里没有可用的别名 items')
-      return
-    }
-    setImportLoading(true)
-    try {
-      const res = await adminAPI.importAliasOverrides(items)
-      const saved = Number(res.data?.saved_count || 0)
-      const skipped = Number(res.data?.skipped_count || 0)
-      toast.success(`导入完成：成功 ${saved} 条，跳过 ${skipped} 条`)
-      setImportText('')
-      setImportPreview(null)
-      await loadAliasData({ silent: true })
-    } catch (e) {
-      toast.error(e?.message || '导入失败')
-    } finally {
-      setImportLoading(false)
-    }
-  }
-
-  const handleImportFile = async (event) => {
-    const file = event.target.files?.[0]
-    event.target.value = ''
-    if (!file) return
-    try {
-      const text = await file.text()
-      setImportText(text)
-      toast.success('导入文件已加载，请确认后执行导入')
-    } catch {
-      toast.error('读取文件失败')
-    }
-  }
-
-  const handleDeleteOverride = async (recordId) => {
-    setAliasLoading(true)
-    try {
-      await adminAPI.deleteAliasOverride(recordId)
-      toast.success('正式别名已删除')
-      await loadAliasData({ silent: true })
-    } catch (e) {
-      toast.error(e?.message || '删除失败')
-    } finally {
-      setAliasLoading(false)
-    }
-  }
-
-  const handleDeleteSelectedOverrides = async () => {
-    if (!selectedOverrideIds.length) {
-      toast.error('请先勾选正式别名')
-      return
-    }
-    setAliasLoading(true)
-    try {
-      const res = await adminAPI.deleteAliasOverridesBatch(selectedOverrideIds)
-      const deletedCount = Number(res.data?.deleted_count || 0)
-      const missedCount = Number(res.data?.missed_count || 0)
-      toast.success(`已删除 ${deletedCount} 条正式别名${missedCount ? `，未命中 ${missedCount} 条` : ''}`)
-      setSelectedOverrideIds([])
-      await loadAliasData({ silent: true })
-    } catch (e) {
-      toast.error(e?.message || '批量删除失败')
-    } finally {
-      setAliasLoading(false)
-    }
-  }
-
   if (loading) {
     return (
       <div className="flex items-center justify-center h-full">
@@ -837,65 +578,6 @@ export default function AIPanelPage() {
   const dsLastText = dsLast?.finished_at
     ? new Date(Number(dsLast.finished_at) * 1000).toLocaleString('zh-CN', { hour12: false })
     : ''
-  const candidateQuery = candidateSearch.trim().toLowerCase()
-  const overrideQuery = overrideSearch.trim().toLowerCase()
-  const minCandidateScore = minScoreFilter === '' ? null : Number(minScoreFilter)
-  const maxCandidateScore = maxScoreFilter === '' ? null : Number(maxScoreFilter)
-  const visibleCandidates = [...aliasCandidates]
-    .filter((item) => aliasSportFilter === 'all' || item.sport === aliasSportFilter)
-    .filter((item) => {
-      const score = Number(item.best_score || 0)
-      if (minCandidateScore != null && Number.isFinite(minCandidateScore) && score < minCandidateScore) return false
-      if (maxCandidateScore != null && Number.isFinite(maxCandidateScore) && score > maxCandidateScore) return false
-      return true
-    })
-    .filter((item) => {
-      if (!candidateQuery) return true
-      const text = [
-        item.source_home,
-        item.source_away,
-        item.candidate_home,
-        item.candidate_away,
-        item.candidate_title,
-      ].join(' ').toLowerCase()
-      return text.includes(candidateQuery)
-    })
-    .sort((a, b) => {
-      if (candidateSort === 'count_desc') return Number(b.count || 0) - Number(a.count || 0)
-      if (candidateSort === 'recent_desc') {
-        return new Date(b.last_seen_at || 0).getTime() - new Date(a.last_seen_at || 0).getTime()
-      }
-      return Number(b.best_score || 0) - Number(a.best_score || 0)
-    })
-  const visibleOverrides = [...aliasOverrides]
-    .filter((item) => aliasSportFilter === 'all' || item.sport === aliasSportFilter)
-    .filter((item) => {
-      if (!overrideQuery) return true
-      const text = [
-        item.source_home,
-        item.source_away,
-        item.candidate_home,
-        item.candidate_away,
-        ...(item.home_alias_group || []),
-        ...(item.away_alias_group || []),
-      ].join(' ').toLowerCase()
-      return text.includes(overrideQuery)
-    })
-    .sort((a, b) => {
-      if (overrideSort === 'score_desc') return Number(b.best_score || 0) - Number(a.best_score || 0)
-      if (overrideSort === 'name_asc') {
-        return `${a.source_home || ''}${a.source_away || ''}`.localeCompare(`${b.source_home || ''}${b.source_away || ''}`, 'zh-CN')
-      }
-      return new Date(b.approved_at || 0).getTime() - new Date(a.approved_at || 0).getTime()
-    })
-  const selectedVisibleCount = visibleCandidates.filter((item) => selectedCandidateIds.includes(item.id)).length
-  const selectedVisibleOverrideCount = visibleOverrides.filter((item) => selectedOverrideIds.includes(item.id)).length
-  const highScoreVisibleCount = visibleCandidates.filter((item) => Number(item.best_score || 0) >= Number(highScoreThreshold || 0)).length
-  const { items: importDraftItems, error: importDraftError } = parseAliasImportDraft(importText)
-  const importDraftCount = importDraftItems.length
-  const importPreviewSummary = importPreview?.summary || {}
-  const importPreviewItems = Array.isArray(importPreview?.items) ? importPreview.items.slice(0, 8) : []
-
   return (
     <div className="page">
       <PageHeader
@@ -938,8 +620,8 @@ export default function AIPanelPage() {
                 </button>
               )
             ) : (
-              <span className="text-xs text-ink-500 px-2">
-                人工模式使用下方“开始分析”
+              <span className="flex items-center text-xs text-ink-500 px-2">
+                人工模式使用下方"开始分析"
               </span>
             )}
             <button
@@ -1010,402 +692,6 @@ export default function AIPanelPage() {
         )}
       </div>
 
-      <div className="card mb-6">
-        <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
-          <div>
-            <div className="font-semibold text-ink-900 text-sm">别名管理</div>
-            <div className="text-xs text-ink-500 mt-1">
-              处理未命中队名，支持批量批准、导出和导入，批准后立即生效。
-            </div>
-          </div>
-          <div className="flex flex-wrap items-center gap-2">
-            <div className="flex flex-wrap items-center gap-1 rounded-xl bg-ink-50 p-1">
-              {ALIAS_SPORT_TABS.map((tab) => (
-                <button
-                  key={tab.key}
-                  type="button"
-                  onClick={() => setAliasSportFilter(tab.key)}
-                  className={`px-2.5 py-1.5 rounded-lg text-xs font-medium transition-colors ${
-                    aliasSportFilter === tab.key
-                      ? 'bg-white text-brand-700 shadow-sm'
-                      : 'text-ink-500 hover:text-ink-700'
-                  }`}
-                >
-                  {tab.label}
-                </button>
-              ))}
-            </div>
-            <button
-              onClick={() => loadAliasData()}
-              disabled={aliasLoading}
-              className="btn-outline flex items-center gap-2"
-            >
-              {aliasLoading ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />}
-              刷新
-            </button>
-            <button
-              onClick={handleApproveSelectedCandidates}
-              disabled={aliasLoading || !selectedCandidateIds.length}
-              className="btn-outline flex items-center gap-2"
-            >
-              <CheckSquare size={14} />
-              批量批准
-            </button>
-            <button
-              onClick={handleExportOverrides}
-              className="btn-outline flex items-center gap-2"
-            >
-              <Download size={14} />
-              导出正式别名
-            </button>
-            <button
-              onClick={handleDeleteSelectedOverrides}
-              disabled={aliasLoading || !selectedOverrideIds.length}
-              className="btn-outline flex items-center gap-2"
-            >
-              <Trash2 size={14} />
-              批量删除正式别名
-            </button>
-          </div>
-        </div>
-
-        <div className="grid xl:grid-cols-2 gap-4 mt-4">
-          <div className="rounded-2xl border border-ink-100 p-4">
-            <div className="flex items-center justify-between gap-3 mb-3">
-              <div>
-                <div className="font-medium text-sm text-ink-900">候选别名</div>
-                <div className="text-xs text-ink-500">
-                  当前显示 {visibleCandidates.length} 条，已勾选 {selectedVisibleCount} 条
-                </div>
-              </div>
-              <button
-                onClick={toggleSelectAllCandidates}
-                disabled={!visibleCandidates.length}
-                className="text-xs text-brand-700 hover:text-brand-800"
-              >
-                {selectedVisibleCount === visibleCandidates.length && visibleCandidates.length ? '取消全选' : '全选'}
-              </button>
-            </div>
-
-            <div className="grid md:grid-cols-[1fr_auto_auto_auto] gap-2 mb-3">
-              <input
-                value={candidateSearch}
-                onChange={(e) => setCandidateSearch(e.target.value)}
-                className="input"
-                placeholder="搜索原始队名 / 推荐队名"
-              />
-              <select
-                value={candidateSort}
-                onChange={(e) => setCandidateSort(e.target.value)}
-                className="input min-w-[10rem]"
-              >
-                {CANDIDATE_SORTS.map((item) => (
-                  <option key={item.key} value={item.key}>{item.label}</option>
-                ))}
-              </select>
-              <input
-                type="number"
-                min="0"
-                max="1"
-                step="0.01"
-                value={minScoreFilter}
-                onChange={(e) => setMinScoreFilter(e.target.value)}
-                className="input min-w-[7rem]"
-                placeholder="最低分"
-              />
-              <input
-                type="number"
-                min="0"
-                max="1"
-                step="0.01"
-                value={maxScoreFilter}
-                onChange={(e) => setMaxScoreFilter(e.target.value)}
-                className="input min-w-[7rem]"
-                placeholder="最高分"
-              />
-            </div>
-
-            <div className="flex flex-wrap items-center gap-2 mb-3 text-xs">
-              <div className="flex items-center gap-2 rounded-xl border border-ink-100 px-3 py-2 bg-ink-50">
-                <span className="text-xs text-ink-500">高分阈值</span>
-                <input
-                  type="number"
-                  min="0.3"
-                  max="0.99"
-                  step="0.01"
-                  value={highScoreThreshold}
-                  onChange={(e) => setHighScoreThreshold(Number(e.target.value) || 0.6)}
-                  className="w-16 bg-transparent text-sm text-ink-900 outline-none"
-                />
-              </div>
-              {(minCandidateScore != null || maxCandidateScore != null) ? (
-                <span className="rounded-full bg-amber-50 px-2.5 py-1 text-amber-700">
-                  分数区间 {minCandidateScore ?? 0} - {maxCandidateScore ?? 1}
-                </span>
-              ) : null}
-              <span className="rounded-full bg-ink-50 px-2.5 py-1 text-ink-500">
-                高分候选 {highScoreVisibleCount} 条
-              </span>
-              <button
-                onClick={handleSelectHighScoreCandidates}
-                disabled={!visibleCandidates.length}
-                className="text-brand-700 hover:text-brand-800 font-medium"
-              >
-                一键全选高分候选
-              </button>
-            </div>
-
-            <div className="space-y-3 max-h-[28rem] overflow-auto pr-1">
-              {visibleCandidates.length === 0 ? (
-                <div className="rounded-xl bg-ink-50 px-3 py-4 text-sm text-ink-500">
-                  当前筛选下暂无候选别名。
-                </div>
-              ) : visibleCandidates.map((item) => (
-                <label
-                  key={item.id}
-                  className="block rounded-xl border border-ink-100 bg-white px-3 py-3"
-                >
-                  <div className="flex items-start gap-3">
-                    <input
-                      type="checkbox"
-                      checked={selectedCandidateIds.includes(item.id)}
-                      onChange={() => toggleCandidateSelection(item.id)}
-                      className="mt-1 accent-brand-500"
-                    />
-                    <div className="min-w-0 flex-1">
-                      <div className="text-sm font-medium text-ink-900 break-words">
-                        {item.source_home} vs {item.source_away}
-                      </div>
-                      <div className="text-xs text-ink-500 mt-1 break-words">
-                        推荐映射：{item.candidate_home} vs {item.candidate_away}
-                      </div>
-                      <div className="text-xs text-ink-400 mt-1">
-                        分数 {Number(item.best_score || 0).toFixed(3)} · 出现 {item.count || 0} 次
-                      </div>
-                      <div className="text-[11px] text-ink-400 mt-1">
-                        最近出现：{formatDateTime(item.last_seen_at)}
-                      </div>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => handleApproveSingleCandidate(item.id)}
-                      disabled={aliasLoading}
-                      className="btn-outline text-xs px-2.5 py-1.5 shrink-0"
-                    >
-                      批准
-                    </button>
-                  </div>
-                </label>
-              ))}
-            </div>
-          </div>
-
-          <div className="rounded-2xl border border-ink-100 p-4">
-            <div className="flex items-center justify-between gap-3 mb-3">
-              <div>
-                <div className="font-medium text-sm text-ink-900">正式别名</div>
-                <div className="text-xs text-ink-500">
-                  当前显示 {visibleOverrides.length} 条，已勾选 {selectedVisibleOverrideCount} 条
-                </div>
-              </div>
-              <button
-                onClick={toggleSelectAllOverrides}
-                disabled={!visibleOverrides.length}
-                className="text-xs text-brand-700 hover:text-brand-800"
-              >
-                {selectedVisibleOverrideCount === visibleOverrides.length && visibleOverrides.length ? '取消全选' : '全选'}
-              </button>
-            </div>
-
-            <div className="grid md:grid-cols-[1fr_auto] gap-2 mb-3">
-              <input
-                value={overrideSearch}
-                onChange={(e) => setOverrideSearch(e.target.value)}
-                className="input"
-                placeholder="搜索正式别名"
-              />
-              <select
-                value={overrideSort}
-                onChange={(e) => setOverrideSort(e.target.value)}
-                className="input min-w-[10rem]"
-              >
-                {OVERRIDE_SORTS.map((item) => (
-                  <option key={item.key} value={item.key}>{item.label}</option>
-                ))}
-              </select>
-            </div>
-
-            <div className="space-y-3 max-h-[18rem] overflow-auto pr-1">
-              {visibleOverrides.length === 0 ? (
-                <div className="rounded-xl bg-ink-50 px-3 py-4 text-sm text-ink-500">
-                  当前筛选下暂无正式别名。
-                </div>
-              ) : visibleOverrides.map((item) => (
-                <label
-                  key={item.id}
-                  className="block rounded-xl border border-ink-100 bg-white px-3 py-3"
-                >
-                  <div className="flex items-start justify-between gap-3">
-                    <div className="flex items-start gap-3 min-w-0 flex-1">
-                      <input
-                        type="checkbox"
-                        checked={selectedOverrideIds.includes(item.id)}
-                        onChange={() => toggleOverrideSelection(item.id)}
-                        className="mt-1 accent-brand-500"
-                      />
-                      <div className="min-w-0">
-                        <div className="text-sm font-medium text-ink-900 break-words">
-                          {item.source_home} vs {item.source_away}
-                        </div>
-                        <div className="text-xs text-ink-500 mt-1 break-words">
-                          生效映射：{(item.home_alias_group || []).join(' / ')} ｜ {(item.away_alias_group || []).join(' / ')}
-                        </div>
-                        <div className="text-[11px] text-ink-400 mt-1">
-                          分数 {Number(item.best_score || 0).toFixed(3)} · 批准人：{item.approved_by || '-'} · {formatDateTime(item.approved_at)}
-                        </div>
-                      </div>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => handleDeleteOverride(item.id)}
-                      disabled={aliasLoading}
-                      className="btn-outline text-xs px-2.5 py-1.5 shrink-0"
-                    >
-                      <Trash2 size={12} />
-                    </button>
-                  </div>
-                </label>
-              ))}
-            </div>
-
-            <div className="mt-4 pt-4 border-t border-ink-100">
-              <div className="flex items-center justify-between gap-3 mb-2">
-                <div className="text-sm font-medium text-ink-900">导入正式别名</div>
-                <label className="btn-outline flex items-center gap-2 cursor-pointer">
-                  <Upload size={14} />
-                  选择文件
-                  <input
-                    type="file"
-                    accept="application/json,.json"
-                    onChange={handleImportFile}
-                    className="hidden"
-                  />
-                </label>
-              </div>
-              <textarea
-                value={importText}
-                onChange={(e) => {
-                  setImportText(e.target.value)
-                  setImportPreview(null)
-                }}
-                className="input min-h-[10rem] font-mono text-xs"
-                placeholder='粘贴导出的 JSON，或先选择 .json 文件'
-              />
-              <div className="mt-2 text-xs">
-                {importText.trim() ? (
-                  importDraftError ? (
-                    <span className="text-rose-600">{importDraftError}</span>
-                  ) : (
-                    <span className="text-brand-700">检测到 {importDraftCount} 条可导入别名</span>
-                  )
-                ) : (
-                  <span className="text-ink-400">支持直接粘贴导出的 JSON，或先选择文件再导入。</span>
-                )}
-              </div>
-              {importPreview ? (
-                <div className="mt-3 rounded-xl border border-ink-100 bg-ink-50 p-3">
-                  <div className="flex flex-wrap items-center gap-2 text-xs">
-                    <span className="rounded-full bg-emerald-50 px-2.5 py-1 text-emerald-700">新增 {importPreviewSummary.create || 0}</span>
-                    <span className="rounded-full bg-amber-50 px-2.5 py-1 text-amber-700">更新 {importPreviewSummary.update || 0}</span>
-                    <span className="rounded-full bg-slate-100 px-2.5 py-1 text-slate-700">不变 {importPreviewSummary.nochange || 0}</span>
-                    <span className="rounded-full bg-rose-50 px-2.5 py-1 text-rose-700">无效 {importPreviewSummary.invalid || 0}</span>
-                  </div>
-                  <div className="mt-3 space-y-2 max-h-48 overflow-auto pr-1">
-                    {importPreviewItems.map((item) => (
-                      <div key={`${item.index}-${item.id || item.action}`} className="rounded-lg bg-white px-3 py-2 text-xs text-ink-600">
-                        <div className="font-medium text-ink-900">
-                          {item.action === 'create' ? '新增' : item.action === 'update' ? '更新' : item.action === 'nochange' ? '不变' : '无效'}
-                          {' · '}
-                          {item.source_home || item.item?.source_home || '-'} vs {item.source_away || item.item?.source_away || '-'}
-                        </div>
-                        {item.after ? (
-                          <div className="mt-1 text-[11px] text-ink-500 break-words">
-                            目标映射：{item.after.candidate_home} vs {item.after.candidate_away}
-                          </div>
-                        ) : null}
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              ) : null}
-              <div className="flex items-center justify-end gap-2 mt-3">
-                <button
-                  onClick={() => {
-                    setImportText('')
-                    setImportPreview(null)
-                  }}
-                  disabled={!importText}
-                  className="btn-outline"
-                >
-                  清空
-                </button>
-                <button
-                  onClick={handlePreviewImportOverrides}
-                  disabled={previewLoading || !importText.trim() || !!importDraftError || importDraftCount <= 0}
-                  className="btn-outline flex items-center gap-2"
-                >
-                  {previewLoading ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />}
-                  预览差异
-                </button>
-                <button
-                  onClick={handleImportOverrides}
-                  disabled={importLoading || !importText.trim() || !!importDraftError || importDraftCount <= 0}
-                  className="btn-success flex items-center gap-2"
-                >
-                  {importLoading ? <Loader2 size={14} className="animate-spin" /> : <Upload size={14} />}
-                  导入并生效
-                </button>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <div className="rounded-2xl border border-ink-100 p-4 mt-4">
-          <div className="flex items-center justify-between gap-3 mb-3">
-            <div>
-              <div className="font-medium text-sm text-ink-900">操作日志</div>
-              <div className="text-xs text-ink-500">
-                最近的批准、删除、导入动作都会记录在这里。
-              </div>
-            </div>
-            <span className="text-xs text-ink-400">最近 {aliasAuditLogs.length} 条</span>
-          </div>
-          <div className="space-y-2 max-h-60 overflow-auto pr-1">
-            {aliasAuditLogs.length === 0 ? (
-              <div className="rounded-xl bg-ink-50 px-3 py-4 text-sm text-ink-500">
-                暂无操作日志。
-              </div>
-            ) : aliasAuditLogs.map((item, index) => (
-              <div key={`${item.time || 'time'}-${index}`} className="rounded-xl border border-ink-100 bg-white px-3 py-3">
-                <div className="flex flex-wrap items-center gap-2 text-xs">
-                  <span className="rounded-full bg-ink-100 px-2.5 py-1 text-ink-700">{item.action || 'unknown'}</span>
-                  <span className="text-ink-500">{item.actor || 'system'}</span>
-                  <span className="text-ink-400">{formatDateTime(item.time)}</span>
-                </div>
-                <div className="mt-2 text-xs text-ink-600 break-words">
-                  {item.payload?.source_home || item.payload?.source_away
-                    ? `${item.payload?.source_home || '-'} vs ${item.payload?.source_away || '-'}`
-                    : '系统级操作'}
-                </div>
-                <div className="mt-1 text-[11px] text-ink-400 break-all">
-                  {JSON.stringify(item.payload || {})}
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-      </div>
-
       {/* 状态横幅 */}
       <div className={`card mb-6 border ${
         badgeTone === 'green'
@@ -1444,7 +730,10 @@ export default function AIPanelPage() {
       {/* 配置面板 */}
       {showSettings && (
         <div className="card mb-6">
-          <h3 className="font-bold mb-4">AI 设置</h3>
+          <h3 className="section-title flex items-center gap-2 mb-4">
+            <Settings size={16} className="text-brand-700" />
+            AI 设置
+          </h3>
 
           <div className="grid md:grid-cols-2 gap-4">
             {/* AI 开关 */}
@@ -1589,7 +878,7 @@ export default function AIPanelPage() {
             </div>
           </div>
 
-          <div className="flex justify-end gap-3 mt-6">
+          <div className="flex justify-end items-center gap-3 mt-6">
             <button onClick={() => setShowSettings(false)} className="btn-outline">
               取消
             </button>
@@ -1603,7 +892,7 @@ export default function AIPanelPage() {
       {/* AI推荐列表 */}
       <div className="card">
         <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
-          <h3 className="font-bold flex items-center gap-2">
+          <h3 className="section-title flex items-center gap-2">
             <Brain size={18} className="text-brand-700" />
             AI 推荐
           </h3>
@@ -1631,14 +920,14 @@ export default function AIPanelPage() {
                 </button>
               )
             ) : (
-              <span className="text-xs text-ink-500 px-2">
+              <span className="flex items-center text-xs text-ink-500 px-2">
                 自动模式下不启用手动分析开关
               </span>
             )}
             <button
               onClick={() => loadRecommendations(false, sportTab, siteTab)}
               disabled={recsLoading}
-              className="text-sm text-brand-700 hover:text-brand-300 disabled:opacity-50 px-2"
+              className="btn-outline flex items-center gap-1.5 px-3 py-1.5 text-sm"
             >
               {recsLoading ? '加载中…' : '刷新'}
             </button>
@@ -1857,7 +1146,7 @@ export default function AIPanelPage() {
 
                   {isManual && (
                     <div className="flex flex-wrap items-center gap-2 pt-2 border-t border-ink-100">
-                      <label className="text-xs text-ink-500">金额</label>
+                      <label className="flex items-center text-xs text-ink-500">金额</label>
                       <input
                         type="number"
                         min={minBetAmount}
@@ -1886,7 +1175,7 @@ export default function AIPanelPage() {
                           `一键投注`
                         )}
                       </button>
-                      <span className="text-xs text-ink-400">
+                      <span className="flex items-center text-xs text-ink-400">
                         {rec_data.selection_label || '-'}
                         {rec_data.line != null && rec_data.line !== '' ? ` ${rec_data.line}` : ''}
                         {' '}@ {Number(rec_data.odds || 0).toFixed(2) || '-'}

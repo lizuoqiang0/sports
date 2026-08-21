@@ -63,7 +63,8 @@ def same_fixture(
 
     ta = getattr(a, "start_time", None)
     tb = getattr(b, "start_time", None)
-    if ta and tb:
+    # start_time 是默认值（早于 2020 年）时跳过时间检查，只靠队名相似度匹配
+    if ta and tb and ta.year > 2020 and tb.year > 2020:
         if ta.tzinfo is None:
             ta = ta.replace(tzinfo=timezone.utc)
         if tb.tzinfo is None:
@@ -139,12 +140,19 @@ async def sibling_match_ids(
     q = select(Match).where(Match.sport == sport, Match.status.in_(st_filter))
     if getattr(match, "start_time", None):
         st = match.start_time
-        if st.tzinfo is None:
-            st = st.replace(tzinfo=timezone.utc)
-        q = q.where(
-            Match.start_time >= st - _START_WINDOW,
-            Match.start_time <= st + _START_WINDOW,
-        )
+        if st.tzinfo is not None:
+            st = st.replace(tzinfo=None)  # 转为 naive，匹配 timestamp without time zone 列
+        # start_time 是默认值（2000-01-01）时跳过时间窗口，避免平博赛事匹配不到
+        if st.year > 2020:
+            # 同时包含默认 start_time 的比赛（平博），same_fixture 会跳过它们的时间检查
+            from sqlalchemy import or_
+            default_cutoff = datetime(2001, 1, 1)  # naive datetime，匹配 timestamp without time zone
+            q = q.where(
+                or_(
+                    (Match.start_time >= st - _START_WINDOW) & (Match.start_time <= st + _START_WINDOW),
+                    Match.start_time <= default_cutoff,
+                )
+            )
     rows = list((await db.execute(q.limit(80))).scalars().all())
     ids = [int(match.id)]
     for m in rows:

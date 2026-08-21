@@ -85,7 +85,11 @@ async def _read_balance_from_page(page) -> Decimal:
 
 
 def _parse_teams_from_external_id(match_external_id: str) -> tuple[str, str]:
-    """pinnacle:dom|sport|league|home|away → (home, away)"""
+    """pinnacle:dom|sport|league|home|away → (home, away)
+    
+    合成格式 pinnacle:home|away 也支持（队名匹配模式）。
+    队名本身含 | 的边缘情况：末两段作为队名。
+    """
     raw = (match_external_id or "").split(":", 1)[-1]
     parts = [p.strip() for p in raw.split("|") if p.strip()]
     if len(parts) >= 5:

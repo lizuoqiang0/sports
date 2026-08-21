@@ -247,7 +247,7 @@ async def execute_bet(
 
     # ── 玩法白名单 ──
     ALLOWED_BET_TYPES = {"total", "first_half_total", "second_half_total"}
-    allowed_sels = {"under", "over"} if bool(getattr(settings, "AI_ENABLE_OVER", False)) else {"under"}
+    allowed_sels = {"under", "over"}
     if bet_type not in ALLOWED_BET_TYPES or sel not in allowed_sels:
         logger.warning(
             "[下单] ❌ 不支持的盘口/方向: match=%s type=%s sel=%s",
@@ -336,11 +336,40 @@ async def execute_bet(
             })
             return BetExecResult(ok=False, message=msg, provider_code=provider_code, provider_label=provider_label)
 
-    # ── 4. 赛事 ID 解析 ──
+    # ── 4. 赛事 ID 解析（支持跨站队名匹配） ──
     ids = dict((match.extra_data or {}).get("ids") or {})
     match_ext = str(ids.get(provider_code) or "")
     if not match_ext and str(match.external_id or "").startswith(f"{provider_code}:"):
         match_ext = str(match.external_id)
+    sib_match = None  # 目标站点的同场赛事（用于获取赔率）
+    if not match_ext:
+        # 通过 sibling_match_ids 查找目标站点的同场赛事 ID
+        try:
+            from app.services.fixture_key import sibling_match_ids as _sib
+            sib_ids = await _sib(db, match)
+            if sib_ids:
+                sib_res = await db.execute(
+                    select(Match).where(
+                        Match.id.in_(sib_ids),
+                        Match.external_id.like(f"{provider_code}:%"),
+                    ).limit(1)
+                )
+                sib_match = sib_res.scalar_one_or_none()
+                if sib_match:
+                    sib_extra = dict((sib_match.extra_data or {}).get("ids") or {})
+                    match_ext = str(sib_extra.get(provider_code) or sib_match.external_id or "")
+                    logger.info("[下单] 通过 sibling 找到 %s 赛事 ID: match=%s -> %s", provider_code, decision.match_id, match_ext)
+        except Exception as e:
+            logger.debug("[下单] sibling 查找赛事 ID 失败: %s", e)
+    if not match_ext:
+        # 跨站队名匹配：用主客队名构造合成 external_id
+        # 平博格式 pinnacle:home|away → site_bet.py 解析队名后在 DOM 上搜索
+        # OB 格式 ob:home|away → OB 下单靠 odds_data._ob 结构化参数，队名仅用于页面搜索
+        home_team = str(match.home_team or "")
+        away_team = str(match.away_team or "")
+        if home_team and away_team:
+            match_ext = f"{provider_code}:{home_team}|{away_team}"
+            logger.info("[下单] 构造合成赛事 ID: match=%s -> %s (队名匹配模式)", decision.match_id, match_ext)
     if not match_ext:
         msg = "缺少对应站点赛事 ID，请先同步该站滚球"
         logger.warning("[下单] 缺少赛事 ID: match=%s site=%s", decision.match_id, provider_code)
@@ -352,12 +381,25 @@ async def execute_bet(
 
     # ── 5. 赔率行 + line 解析 ──
     bt_enum = BetType.TOTAL
+    # 切换站点时优先从 sibling 获取目标站点赔率
+    odds_match_id = decision.match_id
+    if sib_match and sib_match.id != decision.match_id:
+        odds_match_id = sib_match.id
+        logger.info("[下单] 从 sibling 获取赔率: match=%s -> sib=%s", decision.match_id, sib_match.id)
     odds_row = await get_odds_row(
         db,
-        decision.match_id,
+        odds_match_id,
         provider_name_prefer=provider_label,
         bet_type=bt_enum,
     )
+    # sibling 没有赔率时回退到原 match
+    if not odds_row and odds_match_id != decision.match_id:
+        odds_row = await get_odds_row(
+            db,
+            decision.match_id,
+            provider_name_prefer=provider_label,
+            bet_type=bt_enum,
+        )
     odds_payload = dict(odds_row.odds_data or {}) if odds_row else {}
     line_val = None
     row_is_own_site = bool(odds_row and str(odds_row.provider or "") == provider_label)
@@ -432,9 +474,102 @@ async def execute_bet(
         logger.warning("[下单] ❌ 仓位异常 match=%s suggested_stake=%s", decision.match_id, decision.suggested_stake)
         return BetExecResult(ok=False, message="仓位异常", provider_code=provider_code, provider_label=provider_label)
     if float(site_acc.balance or 0) < float(stake):
-        msg = f"{provider_label}余额不足（当前 {float(site_acc.balance or 0):.2f}）"
-        logger.warning("[下单] %s", msg)
-        return BetExecResult(ok=False, message=msg, provider_code=provider_code, provider_label=provider_label)
+        # 余额不足时尝试切换到另一个已连接且有余额的站点
+        alt_res = await db.execute(
+            select(BookmakerAccount).where(
+                BookmakerAccount.user_id == user.id,
+                BookmakerAccount.enabled.is_(True),
+                BookmakerAccount.status == BookmakerStatus.CONNECTED,
+                BookmakerAccount.code != provider_code,
+                BookmakerAccount.code.in_(list(SINGLE_SIDE_PROVIDER_CODES)),
+            )
+        )
+        switched = False
+        for alt_acc in alt_res.scalars().all():
+            logger.info(
+                "[下单] 余额切换检查: alt=%s real=%s balance=%.2f stake=%.2f",
+                alt_acc.code,
+                is_real_live_account(alt_acc.code, alt_acc.base_url or ""),
+                float(alt_acc.balance or 0),
+                float(stake),
+            )
+            if not is_real_live_account(alt_acc.code, alt_acc.base_url or ""):
+                continue
+            if float(alt_acc.balance or 0) < float(stake):
+                continue
+            # 切换到有余额的替代站点
+            alt_code = alt_acc.code
+            # 重新解析赛事 ID：先从当前 match 的 ids 取，再通过 sibling 查找平博同场赛事
+            alt_match_ext = str(ids.get(alt_code) or "")
+            if not alt_match_ext and str(match.external_id or "").startswith(f"{alt_code}:"):
+                alt_match_ext = str(match.external_id)
+            if not alt_match_ext:
+                # 通过 sibling_match_ids 查找平博同场赛事 ID
+                try:
+                    from app.services.fixture_key import sibling_match_ids
+                    sib_ids = await sibling_match_ids(db, match)
+                    if sib_ids:
+                        sib_res = await db.execute(
+                            select(Match).where(
+                                Match.id.in_(sib_ids),
+                                Match.external_id.like(f"{alt_code}:%"),
+                            ).limit(1)
+                        )
+                        sib_match = sib_res.scalar_one_or_none()
+                        if sib_match:
+                            sib_extra = dict((sib_match.extra_data or {}).get("ids") or {})
+                            alt_match_ext = str(sib_extra.get(alt_code) or sib_match.external_id or "")
+                            if alt_match_ext:
+                                logger.info(
+                                    "[下单] 余额切换: 通过 sibling 找到 %s 赛事ID sib_match=%s ext=%s",
+                                    alt_code, sib_match.id, alt_match_ext,
+                                )
+                except Exception as e:
+                    logger.warning("[下单] 余额切换 sibling 查找失败: %s", e)
+            if not alt_match_ext:
+                logger.info("[下单] 余额切换: %s 缺少赛事ID ids=%s ext=%s", alt_code, ids, str(match.external_id or ""))
+                continue
+            alt_odds_row = await get_odds_row(
+                db,
+                decision.match_id,
+                provider_name_prefer=provider_name(alt_code),
+                bet_type=bt_enum,
+            )
+            alt_odds_payload = dict(alt_odds_row.odds_data or {}) if alt_odds_row else {}
+            alt_current_odds = float(alt_odds_payload.get(sel) or decision_odds or current_odds)
+            if alt_current_odds <= 1.0:
+                continue
+            logger.info(
+                "[下单] 余额不足切换: %s(%.2f) -> %s(%.2f) | match=%s sel=%s odds=%.2f",
+                provider_label, float(site_acc.balance or 0),
+                provider_name(alt_code), float(alt_acc.balance or 0),
+                decision.match_id, sel, alt_current_odds,
+            )
+            provider_code = alt_code
+            provider_label = provider_name(provider_code)
+            site_acc = alt_acc
+            match_ext = alt_match_ext
+            odds_row = alt_odds_row
+            odds_payload = alt_odds_payload
+            current_odds = alt_current_odds
+            # 重新解析 line
+            row_is_own_site = bool(odds_row and str(odds_row.provider or "") == provider_label)
+            if bet_type == "total":
+                if row_is_own_site and odds_row.total is not None:
+                    try:
+                        line_val = float(odds_row.total)
+                    except (TypeError, ValueError):
+                        pass
+            switched = True
+            break
+        if not switched:
+            msg = f"{provider_label}余额不足（当前 {float(site_acc.balance or 0):.2f}），无可用替代站点"
+            logger.warning("[下单] %s", msg)
+            await _notify(user.id, "bet_failed", {
+                "match_id": decision.match_id,
+                "message": msg,
+            })
+            return BetExecResult(ok=False, message=msg, provider_code=provider_code, provider_label=provider_label)
 
     # ── 8. connector 创建 ──
     connector = get_connector(
@@ -514,9 +649,11 @@ async def execute_bet(
             odds_data=odds_payload,
         )
         if place.ok:
-            actual_stake = Decimal(str(place.actual_stake or 0))
-            if actual_stake > 0:
-                stake = actual_stake.quantize(Decimal("0.01"))
+            _actual = getattr(place, "actual_stake", None)
+            if _actual:
+                actual_stake = Decimal(str(_actual))
+                if actual_stake > 0:
+                    stake = actual_stake.quantize(Decimal("0.01"))
             if provider_code == "ob" and place.external_bet_id:
                 await mark_bet_pending(
                     user.id,
@@ -594,15 +731,48 @@ async def execute_bet(
     )
     db.add(tx)
 
+    # 提交事务：确保 Bet + Transaction 持久化，防止下一轮 _match_bet_count 查不到导致重复下单
+    commit_ok = True
+    try:
+        await db.commit()
+    except Exception as e:
+        commit_ok = False
+        logger.warning("[下单] Bet 落库 commit 失败: %s", e)
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+        # commit 失败时写 Redis 防止下一轮重复下单（覆盖所有 provider）
+        try:
+            await cache.set_json(
+                f"ai:bet:pending:{user.id}:{decision.match_id}",
+                {
+                    "order_no": place.external_bet_id or "",
+                    "time": datetime.now(timezone.utc).isoformat(),
+                    "selection": sel,
+                    "bet_type": bet_type,
+                    "odds": current_odds,
+                    "stake": float(stake),
+                    "line": line_val,
+                    "confidence": float(decision.confidence or 0),
+                    "provider": provider_label,
+                    "commit_failed": True,
+                },
+                ttl=21600,
+            )
+            logger.info("[下单] commit 失败已写 Redis 防重复 match=%s", decision.match_id)
+        except Exception:
+            pass
+
     logger.info(
-        "[下单] ✅ 成功 match=%s | sel=%s line=%s stake=%.2f odds=%.2f conf=%.2f ext=%s | 预计赔付=%.2f",
+        "[下单] ✅ 成功 match=%s | sel=%s line=%s stake=%.2f odds=%.2f conf=%.2f ext=%s | 预计赔付=%.2f | commit=%s",
         decision.match_id, sel, line_val, float(stake), current_odds,
         float(decision.confidence or 0), place.external_bet_id,
-        float(potential_payout),
+        float(potential_payout), "ok" if commit_ok else "FAIL",
     )
 
     await _notify(user.id, "bet_placed", {
-        "bet_id": bet.id,
+        "bet_id": bet.id if commit_ok else None,
         "match_id": decision.match_id,
         "selection": sel,
         "bet_type": bet_type,
@@ -615,11 +785,12 @@ async def execute_bet(
         "provider": provider_label,
     })
 
-    # 清除 Redis 待定标记
-    try:
-        await cache.delete(f"ai:bet:pending:{user.id}:{decision.match_id}")
-    except Exception:
-        pass
+    # 清除 Redis 待定标记（仅在 commit 成功时清除）
+    if commit_ok:
+        try:
+            await cache.delete(f"ai:bet:pending:{user.id}:{decision.match_id}")
+        except Exception:
+            pass
 
     if _resume_fn:
         _resume_fn()

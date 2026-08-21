@@ -35,21 +35,21 @@ BET_TYPE_ENUM = {
 }
 
 SPORT_MARKETS: dict[str, list[dict[str, Any]]] = {
-    # 仅投全场小球（total/under）。
+    # 全场大小球（total under/over 双向）。
     "football": [
         {
             "key": "ft_ou",
             "bet_type": "total",
-            "label": "全场小球",
-            "selections": ("under",),
+            "label": "全场大小球",
+            "selections": ("under", "over"),
         },
     ],
     "basketball": [
         {
             "key": "ft_ou",
             "bet_type": "total",
-            "label": "全场小球",
-            "selections": ("under",),
+            "label": "全场大小球",
+            "selections": ("under", "over"),
         },
     ],
 }
@@ -86,6 +86,10 @@ def normalize_prediction(raw: Any, *, bet_type: str = "") -> str:
         "u": "under",
         "小": "under",
         "小球": "under",
+        "over": "over",
+        "o": "over",
+        "大": "over",
+        "大球": "over",
         "home": "home",
         "away": "away",
         "draw": "draw",
@@ -108,6 +112,8 @@ def normalize_prediction(raw: Any, *, bet_type: str = "") -> str:
         pred = aliases[s]
     elif "小球" in s or s == "小" or "under" in s:
         pred = "under"
+    elif "大球" in s or s == "大" or "over" in s:
+        pred = "over"
     elif "主胜" in s or s in ("主", "home"):
         pred = "home"
     elif "客胜" in s or s in ("客", "away"):
@@ -119,7 +125,7 @@ def normalize_prediction(raw: Any, *, bet_type: str = "") -> str:
 
     if not pred:
         return ""
-    if bt == "total" and pred != "under":
+    if bt == "total" and pred not in ("under", "over"):
         return ""
     if bt == "moneyline" and pred not in ("home", "away", "draw"):
         return ""

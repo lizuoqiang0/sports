@@ -38,57 +38,54 @@ AI_MIN_STAKE = 1.0
 # ── 运动类型风控参数（单一配置源：闸门2.7 双向风控 + 闸门2.9 under余量）──
 SPORT_RISK: dict[str, dict] = {
     "basketball": {
-        "under_min_conf": 0.58,            # 篮球小分波动更大：有基本面也需更高置信度
-        "under_min_conf_no_fund": 0.62,    # 无基本面时再加严
+        # ── under 小球链（高赢单率配置）──
+        "under_min_conf": 0.58,            # 统一最低置信度
+        "under_min_conf_no_fund": 0.58,    # 统一最低置信度
         "under_min_line": 120.0,           # 篮球小球盘线区间下限（低于此线不投）
         "under_max_line": 208.0,           # 高线小分容错极低，提前拦截
         "under_min_played_mins": 14.0,     # 首节/次节早段样本太小，不做小分
         "under_late_block_mins": 44.0,     # 末节最后 4 分钟犯规/罚球波动极大
         # under 余量（全场48分钟按盘口线等比折算剩余期望）
-        "margin_min_mins": 24.0,           # 中盘后才看余量
+        "margin_min_mins": 14.0,           # 与 B1 早段衔接，14' 起即检查余量
         "margin_full_mins": 48.0,
         "margin_avg_goals": None,          # None=按盘口线折算
-        "margin_factor": 1.45,
+        "margin_factor": 1.20,             # 1.45→1.20：原值过严，半场时几乎全拒
         "late_margin_floor": 4.0,          # 末节/加时余量过薄时一波罚球就破盘
         "ev_conf_edge": 0.04,              # 小分必须明显高于盈亏平衡概率
         # ═══ 大球 over 组（独立闸门参数，与小球互不参与）═══
-        "over_min_conf": 0.62,             # 大分时间风险更高：门槛严于 under
-        "over_min_conf_no_fund": 0.65,
+        "over_min_conf": 0.58,             # 统一最低置信度
+        "over_min_conf_no_fund": 0.58,     # 统一最低置信度
         "over_min_line": 130.0,            # 低线=市场极度看小，别硬刚
         "over_max_line": 200.0,            # 高线大分残余空间不足
         "over_min_played_mins": 14.0,      # 早段样本小（独立于 under 配置）
         "over_late_block_mins": 40.0,      # 末节后段时间不够追分，经典送钱场景
-        "over_pace_factor": 1.20,          # 进球速率安全系数：预期产出须超过所需
-        "over_min_remaining_goals": 8.0,   # 剩余所需分差≥8分时无任何节奏能保证
+        "over_pace_factor": 1.05,          # 1.20→1.05：线性 pace 低估后段得分，放宽
+        "over_min_remaining_goals": 80.0,  # 55→80：半场 needed 普遍 80-90，原值全拒
     },
     "football": {
-        # ── under 小球链（数据驱动 2026-08-20：2597 条实时分析日志）──
-        # 日志画像：conf 双峰（0.24-0.30 弱数据 / 0.52 充分信号），16%≥0.55；
-        # A3 放行 515 单后 D1 余量拦截 252 单是最大漏斗（46'/49' 余量1.50
-        # < 线性期望1.34×1.30=1.74）。线性折算高估前段期望（进球集中在
-        # 65' 后），margin_factor 1.30→1.05，并压低 margin_avg_goals 基准。
-        "under_min_conf": 0.55,            # under 最低置信度（与 conf 双峰高峰对齐）
-        "under_min_conf_no_fund": 0.58,  # under 无基本面加严
+        # ── under 小球链（高赢单率配置）──
+        "under_min_conf": 0.58,            # 统一最低置信度
+        "under_min_conf_no_fund": 0.58,    # 统一最低置信度
         "under_min_line": 2.0,             # 足球低线 under 1球破盘
         "under_max_line": 6.5,             # 足球 under 高线限制
         "under_min_played_mins": 20.0,
         "under_late_block_mins": 90.0,
         # under 余量（全场90分钟折算剩余期望）
-        "margin_min_mins": 40.0,
+        "margin_min_mins": 20.0,           # 40→20：与 B1 早段衔接，消除 20'-40' 保护盲区
         "margin_full_mins": 90.0,
-        "margin_avg_goals": 2.55,          # 2.75→2.55：联赛均值偏高估，压低基准
-        "margin_factor": 1.05,             # 1.30→1.05：线性折算高估前段，放宽中段
+        "margin_avg_goals": 2.55,          # 联赛均值偏高估，压低基准
+        "margin_factor": 1.05,             # 线性折算高估前段，放宽中段
         "late_margin_floor": 0.5,
         "ev_conf_edge": 0.0,
         # ═══ 大球 over 组（独立闸门参数，与小球互不参与）═══
-        "over_min_conf": 0.62,             # 大球随时间趋近破线，时间风险天然更大
-        "over_min_conf_no_fund": 0.65,
+        "over_min_conf": 0.58,             # 统一最低置信度
+        "over_min_conf_no_fund": 0.58,     # 统一最低置信度
         "over_min_line": 2.0,              # 低线=市场极度看小
         "over_max_line": 4.5,              # 高线残余进球空间不足
         "over_min_played_mins": 20.0,
         "over_late_block_mins": 85.0,      # 85'后追大球时间不够
-        "over_pace_factor": 1.15,          # 1.20→1.15：与 under 余量放宽对称
-        "over_min_remaining_goals": 2.0,   # 还差≥2球时基本无解，直接拒
+        "over_pace_factor": 1.05,          # 与 under margin_factor 对称，不过度要求速率
+        "over_min_remaining_goals": 3.5,   # 还差≥3.5球时基本无解；2.5球以内(如0:0追3球)仍可下单
     },
 }
 # 兜底：未知运动按足球参数处理（注意：深拷贝避免 default 与 football 同对象互改）
@@ -331,15 +328,7 @@ class StrategyEngine:
             )
             return self._reject(match_info, analysis, f"不支持的玩法: {raw_bet_type}（仅全场/半场大小球）")
 
-        # ── A1：方向检查（双闸门链分派：under/over 互不参与）──
-        # over 灰度开关：默认关闭（影子模式）。开启后 over 走独立闸门链下单；
-        # 关闭时 over 仅作为分析结果展示，A1 直接拦截，不进入任何后续闸门。
-        if prediction == "over" and not bool(getattr(settings, "AI_ENABLE_OVER", False)):
-            logger.info(
-                "[A1/方向] ❌ 拒绝 match=%s | AI方向='over' 大球未启用(影子模式，AI_ENABLE_OVER=false)",
-                mid,
-            )
-            return self._reject(match_info, analysis, "大球方向未启用（影子模式）")
+        # ── A1：方向检查（under/over 均可参与闸门评估）──
         if prediction not in ("under", "over"):
             logger.info(
                 "[A1/方向] ❌ 拒绝 match=%s | AI方向='%s' 不是大小球",
@@ -444,6 +433,18 @@ class StrategyEngine:
             logger.warning("[A3/胜率自适应] 统计加载失败(跳过): %s", e)
 
         required_conf = base_req + adaptive_bump
+
+        # 时间维度：后半段 under 风险递增（进球集中在后段），提高置信度要求
+        if prediction == "under" and played_mins is not None:
+            full_mins_a3 = float(RISK.get("margin_full_mins", 90.0))
+            if played_mins >= full_mins_a3 * 0.65:  # 足球≥58'/篮球≥31'
+                time_bump = 0.03
+                required_conf += time_bump
+                logger.info(
+                    "[A3/时间维度] match=%s | %s under 后半段(%.0f'≥%.0f'×65%%) 门槛+%.2f→%.2f",
+                    mid, sport_l, played_mins, full_mins_a3, time_bump, required_conf,
+                )
+
         if conf_f < required_conf:
             logger.info(
                 "[A3/置信度] ❌ 拒绝 match=%s | conf=%.4f < 要求=%.4f (用户配置=%.2f fundamentals=%s 自适应+%.2f)",
@@ -553,6 +554,22 @@ class StrategyEngine:
             if sport_l == "football" and total_line is not None and total_line <= RISK.get("under_min_line", 1.5):
                     logger.info("[B1/under风控] ❌ 拒绝 match=%s | 足球低线under line=%.2f，1球即破盘", mid, total_line)
                     return self._reject(match_info, analysis, f"足球低线under（line={total_line:.2f}）1球即破盘，风险过高")
+            if sport_l == "football" and total_line is not None and RISK.get("under_max_line") and total_line >= RISK["under_max_line"]:
+                    logger.info(
+                        "[B1/under风控] ❌ 拒绝 match=%s | 足球高线under line=%.2f>=%.2f 容错极低",
+                        mid, total_line, RISK["under_max_line"],
+                    )
+                    return self._reject(match_info, analysis, f"足球高线under（line={total_line:.2f}）残余进球空间不足")
+            if sport_l == "football" and played_mins is not None and played_mins >= float(RISK.get("under_late_block_mins", 90.0)):
+                    logger.info(
+                        "[B1/under风控] ❌ 拒绝 match=%s | 足球under末段不下 mins=%.1f≥%.1f",
+                        mid, played_mins, float(RISK.get("under_late_block_mins", 90.0)),
+                    )
+                    return self._reject(
+                        match_info,
+                        analysis,
+                        f"足球under进入补时/加时段（{played_mins:.0f}'），保护性跳过",
+                    )
             if sport_l == "basketball" and played_mins is not None and played_mins < float(RISK.get("under_min_played_mins", 14.0)):
                     logger.info(
                         "[B1/under风控] ❌ 拒绝 match=%s | 篮球under早段不下 mins=%.1f<%.1f",
@@ -580,6 +597,22 @@ class StrategyEngine:
                         f"篮球under进入末节高犯规时段（{played_mins:.0f}'），保护性跳过",
                     )
 
+        # ── B1b：under 余量接近度保护（任何时段，余量过薄一击破盘）──
+        if prediction == "under" and total_line is not None:
+            margin = total_line - current_total
+            if sport_l == "football" and margin <= 1.0:
+                logger.info(
+                    "[B1b/余量接近度] ❌ 拒绝 match=%s | 足球under余量%.2f≤1.0 一球即破盘",
+                    mid, margin,
+                )
+                return self._reject(match_info, analysis, f"足球under余量过薄（{margin:.2f}球，一球即破盘）")
+            if sport_l == "basketball" and margin <= 3.0:
+                logger.info(
+                    "[B1b/余量接近度] ❌ 拒绝 match=%s | 篮球under余量%.2f≤3.0 一波进攻即破盘",
+                    mid, margin,
+                )
+                return self._reject(match_info, analysis, f"篮球under余量过薄（{margin:.2f}分，一波进攻即破盘）")
+
         # ── B2：联赛质量闸门（关键词见模块级 LEAGUE_BLACKLIST_KEYWORDS，扫描层已前置过滤，此处兜底）──
         league = str(match_info.get("league") or analysis.get("league") or "")
         if league_is_blacklisted(league):
@@ -592,7 +625,7 @@ class StrategyEngine:
                 f"联赛类型风控（{league}：青少年/女子赛事进球波动大）",
             )
 
-        # ── B3：高赔率风险（under 正常水位≤1.95；over 同理镜像）──
+        # ── B3：高赔率风险（under/over 正常水位≤1.95，≥2.0 拒绝）──
         try:
             sel_odds_f = float(odds_data.get(prediction) or analysis.get("odds") or 0)
         except (TypeError, ValueError):
@@ -615,6 +648,20 @@ class StrategyEngine:
                 match_info, analysis,
                 f"小球赔率过高（{sel_odds_f:.2f}，不符合风险要求）",
             )
+
+        # ── B3b：赔率-置信度一致性校验（高赔率=市场不确定性高，要求更强信号）──
+        if sel_odds_f >= 1.90:
+            odds_conf_penalty = 0.03
+            if conf_f < required_conf + odds_conf_penalty:
+                logger.info(
+                    "[B3b/赔率一致性] ❌ 拒绝 match=%s | odds=%.2f≥1.90 要求conf≥%.2f+%.2f=%.2f 实际=%.2f",
+                    mid, sel_odds_f, required_conf, odds_conf_penalty,
+                    required_conf + odds_conf_penalty, conf_f,
+                )
+                return self._reject(
+                    match_info, analysis,
+                    f"高赔率({sel_odds_f:.2f})要求更高置信度({required_conf + odds_conf_penalty:.2f})，当前{conf_f:.2f}",
+                )
 
         # ══════════════════════════════════════════════════════════
         # 阶段C：市场一致性（盘口变化方向）
@@ -690,10 +737,12 @@ class StrategyEngine:
                     f"{sport_l} over所需进球过多（还差{needed:.2f}，剩余时间无法保证）",
                 )
             # 当前进球速率（球/分钟）× 剩余时间 = 预期产出
+            # 篮球后段得分加速（末节犯规/罚球），线性 pace 低估后段产出，加 10% 加速因子
             pace = current_total / played_mins
             full_mins = float(RISK.get("margin_full_mins", 90.0))
             remain_mins = max(0.0, full_mins - played_mins)
-            expected_output = pace * remain_mins
+            sport_boost = 1.10 if sport_l == "basketball" else 1.05
+            expected_output = pace * remain_mins * sport_boost
             pace_factor = float(RISK.get("over_pace_factor", 1.2))
             if expected_output < needed * pace_factor:
                 logger.info(
@@ -784,11 +833,12 @@ class StrategyEngine:
             mid, odds, min_odds_cfg, max_odds_cfg, odds_source,
         )
 
-        # ── E2：小球 EV 盈亏平衡闸门 ──
+        # ── E2：EV 盈亏平衡闸门（按方向区分 edge）──
         # 置信度必须覆盖赔率隐含的盈亏平衡概率（1/odds），否则长期必输。
-        # 例：odds=1.65 需 conf≥0.606；odds=1.90 需 conf≥0.526；odds=2.50 需 conf≥0.40。
-        # 修复前：conf=0.47 + odds=1.9 的 under 单 EV=-0.107 照常放行。
+        # over 方向不确定性更高，加 0.02 安全垫；under 保持运动特定 edge。
         ev_conf_edge = float(RISK.get("ev_conf_edge", 0.0) or 0.0)
+        if prediction == "over":
+            ev_conf_edge = max(ev_conf_edge, 0.02)
         breakeven_conf = 1.0 / odds
         required_ev_conf = breakeven_conf + ev_conf_edge
         if conf_f < required_ev_conf:
@@ -823,8 +873,8 @@ class StrategyEngine:
         if prediction == "under":
             conf_scale = min(conf_scale * 1.10, 0.95)
         else:
-            # over 观察期：无方向加成，且整体按 0.6 折跑（用小额验证新闸门链）
-            conf_scale = min(conf_scale, 0.95) * 0.6
+            # over 方向：高门槛（0.60）已过滤弱信号，折扣 0.6→0.8 提升仓位效率
+            conf_scale = min(conf_scale, 0.95) * 0.8
         risk_factor = 1.0 - min(max(risk_score, 0.0), 1.0) * 0.30
         suggested_stake = (
             max_amt * Decimal(str(round(conf_scale * risk_factor, 3)))
@@ -868,8 +918,8 @@ class StrategyEngine:
                 prov_key = provider_name(prov_code)
                 pb = (self._cached_stats.get("by_provider") or {}).get(prov_key) or {}
                 f_site, why_site = _bucket_factor(pb, "站点")
-                # 站点×小球方向细分
-                sel_l = "under"
+                # 站点×方向细分：按实际投注方向查询统计，over 查 over、under 查 under
+                sel_l = prediction
                 psb = (pb.get("by_selection") or {}).get(sel_l) if sel_l else None
                 f_dir, why_dir = (
                     _bucket_factor(psb, f"{sel_l}")

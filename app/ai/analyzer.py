@@ -268,9 +268,37 @@ class MatchAnalyzer:
             content = raw.get("content", "")
             parsed = self._parse_analysis_result(content)
 
-            # 单市场模式：大小球双向，bet_type 恒 total。
-            pred = normalize_prediction(parsed.get("prediction"), bet_type="total")
+            # ── 双向置信度提取 ──
+            # GPT 同时输出 under_confidence 和 over_confidence，取更强方向作为最终 prediction。
+            # 这确保每场比赛都分析了大小球两个方向，而非只看一个方向。
+            under_conf_raw = parsed.get("under_confidence")
+            over_conf_raw = parsed.get("over_confidence")
+
+            try:
+                under_conf = float(under_conf_raw) if under_conf_raw is not None else None
+            except (TypeError, ValueError):
+                under_conf = None
+            try:
+                over_conf = float(over_conf_raw) if over_conf_raw is not None else None
+            except (TypeError, ValueError):
+                over_conf = None
+
             bt = "total"
+
+            # 如果 GPT 提供了双向置信度，取更强方向
+            if under_conf is not None and over_conf is not None:
+                if under_conf < 0.30 and over_conf < 0.30:
+                    pred = "skip"
+                elif under_conf >= over_conf:
+                    pred = "under"
+                else:
+                    pred = "over"
+                # 记录双向置信度到 parsed，供后续日志和分析使用
+                parsed["_under_conf"] = under_conf
+                parsed["_over_conf"] = over_conf
+            else:
+                # 向后兼容：GPT 未提供双向置信度时，回退到 prediction 字段
+                pred = normalize_prediction(parsed.get("prediction"), bet_type="total")
 
             if pred not in ("under", "over", "skip"):
                 logger.warning(
@@ -310,10 +338,16 @@ class MatchAnalyzer:
                     pass
                 return skip_result
 
-            try:
-                conf = float(parsed.get("confidence", settings.LLM_DEFAULT_CONFIDENCE))
-            except (TypeError, ValueError):
-                conf = settings.LLM_DEFAULT_CONFIDENCE
+            # ── 置信度提取：优先取双向置信度中更强方向的值 ──
+            if pred == "under" and under_conf is not None:
+                conf = under_conf
+            elif pred == "over" and over_conf is not None:
+                conf = over_conf
+            else:
+                try:
+                    conf = float(parsed.get("confidence", settings.LLM_DEFAULT_CONFIDENCE))
+                except (TypeError, ValueError):
+                    conf = settings.LLM_DEFAULT_CONFIDENCE
             conf = max(0.0, min(conf, 1.0))
 
             line = parsed.get("line")
@@ -326,14 +360,18 @@ class MatchAnalyzer:
 
             latency_ms = float((raw.get("_meta") or {}).get("latency_ms") or 0)
 
-            # 单模型模式：GPT 返回小球即视为共识达成。
-            consensus_reached = pred == "under"
+            # 单模型模式：GPT 返回 under/over 即视为共识达成
+            consensus_reached = pred in ("under", "over")
 
             analysis = {
                 "prediction": pred,
                 "bet_type": bt,
                 "line": line_f,
                 "confidence": round(conf, 4),
+                "under_confidence": round(float(under_conf), 4) if under_conf is not None else None,
+                "over_confidence": round(float(over_conf), 4) if over_conf is not None else None,
+                "under_reasoning": (parsed.get("under_reasoning") or "")[:500],
+                "over_reasoning": (parsed.get("over_reasoning") or "")[:500],
                 "reasoning": (parsed.get("reasoning") or "")[:800],
                 "market_analysis": (parsed.get("market_analysis") or "")[:800],
                 "fundamental_analysis": (parsed.get("fundamental_analysis") or "")[:800],
@@ -361,36 +399,43 @@ class MatchAnalyzer:
             )
             # 单模型模式：GPT 返回小球即为最终共识。
 
-            # 维度分析日志：核心维度逐项 + 盘口解读
+            # 简洁单行分析日志
             _hd = historical_data if isinstance(historical_data, dict) else {}
             _core_n = sum(1 for k in ("h2h", "home_form", "away_form", "standings", "trend") if _hd.get(k))
             _aux_n = sum(1 for k in ("analysis",) if _hd.get(k))
             _aux_n += 2 if isinstance(market_odds, dict) and market_odds.get("markets") else 1 if isinstance(market_odds, dict) and market_odds else 0
             _aux_n += 1 if isinstance(market_odds, dict) and market_odds.get("line_movements") else 0
-            _ca = analysis.get("core_analysis") or {}
+            _sport = str(match_info.get("sport") or "?")
+            _line = match_info.get("total_line") or match_info.get("line") or "?"
+            _hs = match_info.get("home_score")
+            _as = match_info.get("away_score")
+            _score = f"{_hs}:{_as}" if _hs is not None else "?"
+            _clock = str(match_info.get("clock") or "?")
+            _uc = float(under_conf) if under_conf is not None else 0.0
+            _oc = float(over_conf) if over_conf is not None else 0.0
+            _odds_str = ""
+            try:
+                _od = float(analysis.get("odds") or 0)
+                if _od > 1:
+                    _odds_str = f" odds={_od:.2f}"
+            except (TypeError, ValueError):
+                pass
             logger.info(
-                "[AI分析] 维度解读 match=%s %s vs %s | pred=%s conf=%.2f | 核心%d/5+辅助%d/4\n"
-                "  [历史交锋] %s\n"
-                "  [主队近况] %s\n"
-                "  [客队近况] %s\n"
-                "  [积分排名] %s\n"
-                "  [走势页] %s\n"
-                "  [盘口解读] %s\n"
-                "  [综合结论] %s",
+                "[AI分析] match=%s %s vs %s | %s line=%s %s %s' | pred=%s conf=%.2f | under=%.2f over=%.2f%s | 核心%d/5+辅助%d/4",
                 match_info.get("id"),
                 match_info.get("home_team", "?"),
                 match_info.get("away_team", "?"),
+                _sport,
+                _line,
+                _score,
+                _clock,
                 analysis.get("prediction"),
                 float(analysis.get("confidence") or 0),
+                _uc,
+                _oc,
+                _odds_str,
                 _core_n,
                 min(_aux_n, 4),
-                str(_ca.get("h2h", ""))[:150],
-                str(_ca.get("home_form", ""))[:150],
-                str(_ca.get("away_form", ""))[:150],
-                str(_ca.get("standings", ""))[:150],
-                str(_ca.get("trend", ""))[:150],
-                str(analysis.get("market_analysis", ""))[:200],
-                str(analysis.get("fundamental_summary", ""))[:200],
             )
 
             if analysis.get("models_used"):
@@ -1550,6 +1595,10 @@ class MatchAnalyzer:
     "prediction": "under | over | skip",
     "line": null,
     "confidence": 0.0-1.0,
+    "under_confidence": 0.0-1.0,
+    "over_confidence": 0.0-1.0,
+    "under_reasoning": "小球方向的量化分析（盘口信号+节奏+基本面）",
+    "over_reasoning": "大球方向的量化分析（盘口信号+节奏+基本面）",
     "reasoning": "1.盘口:初盘X->即时X,水位变化X% 2.实时比分:当前X球,节奏X球/分钟,盘口预期X球/分钟 3.综合:量化信号+置信度理由",
     "key_factors": ["因素1", "因素2", "因素3"],
     "risk_level": "low/medium/high",
@@ -1558,7 +1607,11 @@ class MatchAnalyzer:
     ]
 }}
 
-注意：prediction只能是under/over/skip；skip时confidence=0.0；bet_type只能是total/first_half_total/second_half_total；reasoning必须包含具体数字；只输出JSON。
+注意：
+- 必须同时给出 under_confidence 和 over_confidence（0.0-1.0），分别量化两个方向的信号强度
+- prediction 取 under_confidence 和 over_confidence 中更高的一方（都不足0.30则 skip）
+- skip 时 confidence=0.0；bet_type 只能是 total/first_half_total/second_half_total
+- reasoning 必须包含具体数字；只输出JSON。
 """
         # 小球严格分析规则（按运动类型分离）
         if sport == "basketball":
