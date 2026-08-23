@@ -170,7 +170,8 @@ async def _keep_sessions_refresh_loop() -> None:
                             )
 
                             blank_ok = await recover_pinnacle_blank_page(
-                                sess.page, attempts=2
+                                sess.page, attempts=2,
+                                venue_url=sess.venue_url or (sess.page.url if sess.page else ""),
                             )
                             if not blank_ok:
                                 logger.error(
@@ -500,14 +501,20 @@ async def login(req: LoginRequest):
             )
 
     # 只等本站锁：其它站 odds-sync-live 不再挡住验证
-    deadline = time.time() + 6.0
+    # 登录优先级已在上方 set_login_priority(50) 设置，odds-sync 的 _fetch_and_yield
+    # 会在 ≤3s 内检测到 want_login 并主动放弃锁。这里等足够长时间让它让出。
+    deadline = time.time() + 30.0
     acquired = False
     while time.time() < deadline:
+        # 如果 odds-sync 正在持锁但已检测到 login_priority，
+        # 它会 cancel 任务并 release — 短轮询快速拿到
         try:
-            await asyncio.wait_for(lane.lock.acquire(), timeout=0.35)
+            await asyncio.wait_for(lane.lock.acquire(), timeout=0.5)
             acquired = True
             break
         except asyncio.TimeoutError:
+            # 再次刷新优先级（防止超时后优先级过期）
+            lane.set_login_priority(30)
             continue
     if not acquired:
         lane.clear_login_priority()
@@ -695,20 +702,20 @@ async def _run_odds_sync(req: OddsSyncRequest):
                     "lane": lane.key,
                 }
 
-        if sess:
-            # 软保活：已在盘口不 reload；掉线才恢复 venue（禁止 force 硬刷新闪烁）
-            refreshed = await site_sessions.refresh(req.base_url, force=False, site_code=site_code)
-
         async def _fetch_and_yield():
             """采集包裹：等待期间若下单/登录到来，主动放弃让路。"""
             task = asyncio.create_task(_fetch_with_session(sess.page if sess else None))
             while True:
-                done, _ = await asyncio.wait({task}, timeout=3.0)
+                done, _ = await asyncio.wait({task}, timeout=1.0)
                 if done:
                     return task.result()
                 if lane.want_login() or lane.want_bet():
                     task.cancel()
                     raise asyncio.CancelledError("bet/login priority, odds-sync yield")
+
+        if sess:
+            # 软保活：已在盘口不 reload；掉线才恢复 venue（禁止 force 硬刷新闪烁）
+            refreshed = await site_sessions.refresh(req.base_url, force=False, site_code=site_code)
 
         matches = await asyncio.wait_for(
             _fetch_and_yield(),
@@ -727,7 +734,7 @@ async def _run_odds_sync(req: OddsSyncRequest):
             if recovered:
                 try:
                     matches = await asyncio.wait_for(
-                        _fetch_with_session(sess.page),
+                        _fetch_and_yield(),
                         timeout=odds_timeout,
                     )
                 except Exception as e:
@@ -748,7 +755,7 @@ async def _run_odds_sync(req: OddsSyncRequest):
                         or refreshed
                     )
                 matches = await asyncio.wait_for(
-                    _fetch_with_session(sess.page if sess else None),
+                    _fetch_and_yield(),
                     timeout=odds_timeout,
                 )
             else:
@@ -823,7 +830,7 @@ async def _run_odds_sync(req: OddsSyncRequest):
                 venue_url=(req.venue_url or "").strip(),
             )
             matches = await asyncio.wait_for(
-                _fetch_with_session(sess.page if sess else None),
+                _fetch_and_yield(),
                 timeout=odds_timeout,
             )
         except Exception:
@@ -1918,7 +1925,8 @@ async def fetch_balance(req: BalanceRequest):
             )
 
             if await pinnacle_page_is_blank(sess.page):
-                await recover_pinnacle_blank_page(sess.page, attempts=1)
+                await recover_pinnacle_blank_page(sess.page, attempts=1,
+                    venue_url=sess.venue_url or (sess.page.url if sess.page else ""))
                 cached = float(sess.last_balance or 0)
                 return {
                     "ok": cached > 0,

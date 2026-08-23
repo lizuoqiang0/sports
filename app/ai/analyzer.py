@@ -227,18 +227,66 @@ class MatchAnalyzer:
             line_tag = round(float(raw_line) * 2) / 2 if raw_line else ""
         except (TypeError, ValueError):
             line_tag = str(raw_line)
-        cache_key = f"ai:gpt:v1:{fk}:{sport}:{line_tag}"
+        # 加入当前总进球数：滚球比分变化（0-0→1-0）必须触发重新分析
+        _hs = match_info.get("home_score")
+        _as = match_info.get("away_score")
+        _total_goals = int((_hs or 0) + (_as or 0)) if _hs is not None or _as is not None else "x"
+        cache_key = f"ai:gpt:v2:{fk}:{sport}:{line_tag}:g{_total_goals}"
+        # 缓存策略：滚球（有比分）禁用缓存强制实时分析，赛前（无比分）允许缓存
+        # 滚球比分/盘口变化快，旧缓存的 reasoning 会过时；赛前数据稳定可复用
+        is_live = _hs is not None or _as is not None
         try:
-            cached = await cache.get_json(cache_key)
+            cached = await cache.get_json(cache_key) if not is_live else None
             if cached and cached.get("models_used") and not cached.get("error"):
-                if cached.get("consensus_reached") and str(cached.get("prediction") or "") in VALID_PREDICTIONS:
+                # ── 缓存校验：比分/盘口/时间变化超过阈值则不使用缓存 ──
+                # 缓存 key 按 line_tag(0.5档) + total_goals 量化，
+                # 但同一 key 下盘口可能从 3.0 漂移到 3.25（同量化为 3.0），
+                # 比分从 0-1 变成 1-0（同 g1）— reasoning 中的盘口/比分描述会过时。
+                cached_line = cached.get("line")
+                cached_conf = cached.get("confidence", 0)
+                current_line_f = None
+                try:
+                    current_line_f = float(raw_line) if raw_line else None
+                except (TypeError, ValueError):
+                    pass
+                # 盘口线漂移 >0.3 球 → 缓存失效（需重新分析）
+                line_stale = (
+                    cached_line is not None
+                    and current_line_f is not None
+                    and abs(float(cached_line) - current_line_f) > 0.3
+                )
+                # 缓存中的比对快照 vs 当前实际比分
+                cached_hs = cached.get("_cached_home_score")
+                cached_as = cached.get("_cached_away_score")
+                score_changed = (
+                    cached_hs is not None and cached_hs != _hs
+                    or cached_as is not None and cached_as != _as
+                )
+                # 半场切换 → 缓存失效（上下半场节奏分布完全不同）
+                cached_period = cached.get("_cached_period", "")
+                current_period = str(match_info.get("period") or "")
+                period_changed = bool(cached_period) and bool(current_period) and cached_period != current_period
+
+                if line_stale or score_changed or period_changed:
+                    why = (
+                        f"盘口漂移({cached_line}→{current_line_f})" if line_stale
+                        else f"比分变化({cached_hs}-{cached_as}→{_hs}-{_as})" if score_changed
+                        else f"半场切换({cached_period}→{current_period})"
+                    )
+                    logger.info(
+                        "[AI分析] 缓存失效 match=%s %s vs %s | 原因: %s | 重新调 LLM",
+                        match_info.get("id"), match_info.get("home_team"), match_info.get("away_team"),
+                        why,
+                    )
+                    # 不 return，继续走 LLM 重新分析
+                elif cached.get("consensus_reached") and str(cached.get("prediction") or "") in VALID_PREDICTIONS:
                     logger.info(
                         "[AI分析] 缓存命中 match=%s %s vs %s | pred=%s conf=%.2f",
                         match_info.get("id"), match_info.get("home_team"), match_info.get("away_team"),
                         cached.get("prediction"), float(cached.get("confidence") or 0),
                     )
                     return cached
-                if cached.get("neg_cached"):
+                elif cached.get("neg_cached"):
                     logger.info(
                         "[AI分析] 负缓存命中（跳过 LLM）match=%s %s vs %s",
                         match_info.get("id"), match_info.get("home_team"), match_info.get("away_team"),
@@ -397,6 +445,14 @@ class MatchAnalyzer:
                 historical_data=historical_data,
                 market_odds=market_odds,
             )
+            # P1 市场赔率约束：在 signal_review/floor 之后生效
+            analysis = self._apply_market_odds_constraint(analysis, match_info)
+            # 升盘型 over 约束：数学调整型升盘 → over conf 封顶 0.62
+            analysis = self._apply_line_up_constraint(analysis, match_info, market_odds)
+
+            # ── 历史结果校准：基于实际投注胜率校准 GPT 置信度 ──
+            analysis = await self._apply_historical_calibration(analysis, match_info)
+
             # 单模型模式：GPT 返回小球即为最终共识。
 
             # 简洁单行分析日志
@@ -442,6 +498,10 @@ class MatchAnalyzer:
                 try:
                     if analysis.get("consensus_reached"):
                         # 滚球场景比分变化快，正缓存缩短到 3 分钟（跨 1 轮 120s 轮询）
+                        # 写入缓存时保存分析时刻快照，供下次缓存校验
+                        analysis["_cached_home_score"] = _hs
+                        analysis["_cached_away_score"] = _as
+                        analysis["_cached_period"] = str(match_info.get("period") or "")
                         await cache.set_json(cache_key, analysis, ttl=180)
                     else:
                         analysis["neg_cached"] = True
@@ -480,7 +540,24 @@ class MatchAnalyzer:
         if not self.client or not self.model:
             raise RuntimeError("GPT 模型未配置")
         messages = [
-            {"role": "system", "content": "你是专业体育赛事分析师。只输出JSON。"},
+            {
+                "role": "system",
+                "content": (
+                    "你是专业体育赛事滚球大小球分析师。只输出JSON。\n"
+                    "## 核心原则\n"
+                    "1. 量化优先：每个判断必须有具体数字支撑（盘口变化幅度、进球节奏、余量）\n"
+                    "2. 信号区分：必须区分「资金推动型」和「数学调整型」盘口变化\n"
+                    "3. 节奏校准：0球时不能用pace=0推演全场，改用联赛均值（足球约2.5球/场）\n"
+                    "4. 反向风险：高置信度(≥0.73)存在反向相关，over/under均封顶0.72\n"
+                    "5. 下半场爆发：0-0或1球不代表安全，弱队对强队时下半场可能集中爆发\n\n"
+                    "## 常见错误（必须避免）\n"
+                    "- 把数学调整型升盘当资金推动型升盘（当前进球≥原盘口线时的升盘是数学调整）\n"
+                    "- 0-0时用pace=0线性外推全场0球（概率仅8%）\n"
+                    "- 忽略杯赛强弱悬殊的历史数据失真\n"
+                    "- 对高线(≥3.0)0-0场景给出高under置信度（市场看大但暂未爆发）\n"
+                    "- 对0-0+30分钟以上的比赛仍用当前0球推算（后段进球概率上升）"
+                ),
+            },
             {"role": "user", "content": prompt},
         ]
         started = time.perf_counter()
@@ -493,6 +570,7 @@ class MatchAnalyzer:
                     messages=messages,
                     temperature=settings.LLM_TEMPERATURE,
                     max_tokens=settings.LLM_MAX_TOKENS,
+                    response_format={"type": "json_object"},
                 )
                 if not response.choices:
                     raise RuntimeError("GPT 返回空 choices（内容可能被安全过滤）")
@@ -596,6 +674,213 @@ class MatchAnalyzer:
         summary = str(review.get("summary") or "").strip()
         if summary:
             analysis["reasoning"] = f"[结构化复核] {summary} | {str(analysis.get('reasoning') or '')}"[:900]
+        return analysis
+
+    @staticmethod
+    def _apply_market_odds_constraint(analysis: dict, match_info: dict) -> dict:
+        """P1 市场赔率约束：市场强烈看小时限制 over 置信度。
+
+        当 over 赔率 >= 3.0 且 under 赔率 <= 1.35 时，市场强烈看小，
+        over 置信度上限 0.45（在 signal_review/floor 之后生效，覆盖 floor）。
+        """
+        prediction = str(analysis.get("prediction") or "").lower()
+        if prediction != "over":
+            return analysis
+
+        odds_data = match_info.get("odds") or {}
+        try:
+            over_odds = float(odds_data.get("over") or 0)
+            under_odds = float(odds_data.get("under") or 0)
+        except (TypeError, ValueError):
+            return analysis
+
+        if over_odds <= 0 or under_odds <= 0:
+            return analysis
+
+        if over_odds >= 3.0 and under_odds <= 1.35:
+            conf = float(analysis.get("confidence") or 0)
+            if conf > 0.45:
+                analysis["confidence_before_market_constraint"] = round(conf, 4)
+                analysis["confidence"] = 0.45
+                analysis["market_odds_constraint"] = (
+                    f"over赔率{over_odds:.2f}≥3.0 且 under赔率{under_odds:.2f}≤1.35，"
+                    f"市场强烈看小，over置信度封顶0.45"
+                )
+                analysis["reasoning"] = (
+                    f"[市场约束] over赔率{over_odds:.2f}≥3.0 under赔率{under_odds:.2f}≤1.35 → "
+                    f"市场强烈看小，over置信度封顶0.45 | "
+                    + str(analysis.get("reasoning") or "")
+                )[:900]
+                logger.info(
+                    "[P1/市场约束] over conf %.2f → 0.45 (over_odds=%.2f under_odds=%.2f)",
+                    conf, over_odds, under_odds,
+                )
+        return analysis
+
+    @staticmethod
+    def _apply_line_up_constraint(
+        analysis: dict, match_info: dict, market_odds: Optional[dict],
+    ) -> dict:
+        """升盘型 over 约束：当升盘是数学调整（非资金推动）时，over 置信度封顶 0.62。
+
+        数学调整型升盘的判定条件（满足任一即可）：
+        1. 升盘 + 当前总分 >= 盘口线 - 1.0（已进球导致盘口自动上调）
+        2. 升盘 + over 水位上升（市场不买 over，庄家被动调线）
+
+        实际数据：conf 0.73 的 over 全部有"升盘"关键词，0% 胜率（1输1走）。
+        封顶 0.62 确保数学调整型升盘的 over 低于 A3 门槛 0.65，被正确过滤。
+        """
+        prediction = str(analysis.get("prediction") or "").lower()
+        if prediction != "over":
+            return analysis
+
+        # 提取盘口变化数据
+        line_moves = None
+        if isinstance(market_odds, dict):
+            lm = market_odds.get("line_movements")
+            if isinstance(lm, dict):
+                line_moves = lm.get("total") or {}
+            elif isinstance(lm, list) and lm and isinstance(lm[-1], dict):
+                line_moves = lm[-1]
+
+        if not isinstance(line_moves, dict) or not line_moves:
+            # 从 match_info 的 odds 中提取
+            odds_data = match_info.get("odds") or {}
+            line_moves = odds_data.get("line_movement") or {}
+
+        if not isinstance(line_moves, dict) or not line_moves:
+            return analysis
+
+        line_delta = line_moves.get("line_delta")
+        if line_delta is None:
+            return analysis
+
+        try:
+            ld = float(line_delta)
+        except (TypeError, ValueError):
+            return analysis
+
+        # 只处理升盘（line_delta >= 0.25）
+        if ld < 0.25:
+            return analysis
+
+        # 条件1：当前总分接近盘口线 → 数学调整
+        total_line = None
+        if match_info.get("total_line"):
+            try:
+                total_line = float(match_info["total_line"])
+            except (TypeError, ValueError):
+                pass
+        if total_line is None and match_info.get("line"):
+            try:
+                total_line = float(match_info["line"])
+            except (TypeError, ValueError):
+                pass
+        if total_line is None and analysis.get("line"):
+            try:
+                total_line = float(analysis["line"])
+            except (TypeError, ValueError):
+                pass
+
+        hs = match_info.get("home_score")
+        as_ = match_info.get("away_score")
+        current_total = None
+        if hs is not None and as_ is not None:
+            try:
+                current_total = int(hs) + int(as_)
+            except (TypeError, ValueError):
+                pass
+
+        is_math_adjustment = False
+        reason_parts = []
+
+        if total_line is not None and current_total is not None:
+            margin = total_line - current_total
+            if margin <= 1.0:
+                is_math_adjustment = True
+                reason_parts.append(
+                    f"数学调整型升盘（当前{current_total}球，线{total_line:.2f}，余量仅{margin:.2f}球）"
+                )
+
+        # 条件2：over 水位上升 → 市场不买 over
+        odds_delta = line_moves.get("odds_delta")
+        if odds_delta is not None:
+            try:
+                if isinstance(odds_delta, dict):
+                    o_od = odds_delta.get("over")
+                    o_f = float(o_od) if o_od is not None else None
+                    if o_f is not None and o_f > 0:
+                        is_math_adjustment = True
+                        reason_parts.append(f"升盘但over水位上升{o_f:+.3f}（市场不买over）")
+                else:
+                    o_f = float(odds_delta)
+                    if o_f > 0.08:
+                        is_math_adjustment = True
+                        reason_parts.append(f"升盘但水位上升{o_f:+.3f}（市场不买over）")
+            except (TypeError, ValueError):
+                pass
+
+        if not is_math_adjustment:
+            return analysis
+
+        conf = float(analysis.get("confidence") or 0)
+        if conf > 0.62:
+            analysis["confidence_before_line_up_constraint"] = round(conf, 4)
+            analysis["confidence"] = 0.62
+            analysis["line_up_constraint"] = (
+                f"升盘Δ{ld:+.2f} + {'; '.join(reason_parts)}，"
+                f"判定为数学调整型升盘，over置信度封顶0.62"
+            )
+            analysis["reasoning"] = (
+                f"[升盘约束] {'; '.join(reason_parts)} → "
+                f"over置信度封顶0.62 | "
+                + str(analysis.get("reasoning") or "")
+            )[:900]
+            logger.info(
+                "[升盘约束] over conf %.2f → 0.62 (line_delta=%+.2f, %s)",
+                conf, ld, "; ".join(reason_parts),
+            )
+        return analysis
+
+    async def _apply_historical_calibration(self, analysis: dict, match_info: dict) -> dict:
+        """基于历史投注结果校准 GPT 置信度。
+
+        在所有静态约束（context_cap / signal_review / market_constraint / line_up_constraint）
+        之后生效，用实际胜率数据做最后一层校准。
+
+        校准策略：
+        - 从 Redis 加载近14天置信度分桶 → 实际胜率映射
+        - 将当前 confidence 映射到对应桶的实际胜率
+        - 限制单次校准幅度 ±0.15，避免极端样本导致跳变
+        - 样本不足时保持原始值
+        """
+        prediction = str(analysis.get("prediction") or "").lower()
+        if prediction not in ("under", "over"):
+            return analysis
+        try:
+            conf = float(analysis.get("confidence") or 0)
+        except (TypeError, ValueError):
+            return analysis
+        if conf <= 0:
+            return analysis
+
+        try:
+            from app.ai.calibration import calibrate_confidence, load_calibration_table
+
+            cal_table = await load_calibration_table()
+            calibrated, explanation = calibrate_confidence(conf, prediction, cal_table)
+
+            if abs(calibrated - conf) > 0.001:
+                analysis["confidence_before_calibration"] = round(conf, 4)
+                analysis["confidence"] = round(calibrated, 4)
+                analysis["calibration_note"] = explanation
+                logger.info(
+                    "[历史校准] match=%s %s conf %.2f → %.2f | %s",
+                    match_info.get("id"), prediction, conf, calibrated, explanation,
+                )
+        except Exception as e:
+            logger.debug("[历史校准] 跳过(异常): %s", e)
+
         return analysis
 
     @staticmethod
@@ -961,19 +1246,30 @@ class MatchAnalyzer:
         confidence_floor = None
         triad_ready = bool(triad_status.get("triad_ready"))
         edge_score = market_points + fundamental_points - conflict_points
+        # triad 部分就绪判定：2/3 信号齐（开盘+实时盘口）但缺基本面
+        has_opening = triad_status.get("has_opening")
+        has_live_market = triad_status.get("has_live_market")
+        has_fundamentals = triad_status.get("has_fundamentals")
+        triad_partial = (not triad_ready) and has_opening and has_live_market and (not has_fundamentals)
         if sport == "basketball" and selection == "under":
             if not triad_ready:
-                confidence_delta -= 0.22
-                confidence_cap = 0.44
-                missing_bits = []
-                if not triad_status.get("has_opening"):
-                    missing_bits.append("初指")
-                if not triad_status.get("has_live_market"):
-                    missing_bits.append("实时盘口")
-                if not triad_status.get("has_fundamentals"):
-                    missing_bits.append("基本面")
-                if missing_bits:
-                    conflict_reasons.append("篮球三重门禁缺失:" + "/".join(missing_bits))
+                if triad_partial:
+                    # P1: 有开盘+实时盘口但缺基本面 → 放宽（-0.22→-0.10, cap 0.44→0.55）
+                    confidence_delta -= 0.10
+                    confidence_cap = 0.55
+                    conflict_reasons.append("篮球三重门禁缺失:基本面（盘口双信号就绪）")
+                else:
+                    confidence_delta -= 0.22
+                    confidence_cap = 0.44
+                    missing_bits = []
+                    if not has_opening:
+                        missing_bits.append("初指")
+                    if not has_live_market:
+                        missing_bits.append("实时盘口")
+                    if not has_fundamentals:
+                        missing_bits.append("基本面")
+                    if missing_bits:
+                        conflict_reasons.append("篮球三重门禁缺失:" + "/".join(missing_bits))
             elif conflict_points >= 2:
                 confidence_delta -= 0.14
                 confidence_cap = 0.50
@@ -982,22 +1278,31 @@ class MatchAnalyzer:
                 confidence_cap = 0.56
             elif market_points >= 5 and fundamental_points >= 4 and conflict_points == 0 and edge_score >= 8:
                 confidence_delta += 0.03
-                confidence_floor = max(confidence, 0.60)
+                # P2: 强信号 floor 从 0.60 提到 0.65，让 triad 齐全+强信号能跨过 A3 门槛
+                confidence_floor = max(confidence, 0.65)
         elif not triad_ready:
-            confidence_delta -= 0.18
-            confidence_cap = 0.49
-            missing_bits = []
-            if not triad_status.get("has_opening"):
-                missing_bits.append("初指")
-            if not triad_status.get("has_live_market"):
-                missing_bits.append("实时盘口")
-            if not triad_status.get("has_fundamentals"):
-                missing_bits.append("基本面")
-            if missing_bits:
-                conflict_reasons.append("三重门禁缺失:" + "/".join(missing_bits))
-        elif market_points >= 5 and fundamental_points >= 5 and conflict_points == 0 and edge_score >= 10:
+            if triad_partial:
+                # P1: 有开盘+实时盘口但缺基本面 → 放宽（-0.18→-0.10, cap 0.49→0.55）
+                confidence_delta -= 0.10
+                confidence_cap = 0.55
+                conflict_reasons.append("三重门禁缺失:基本面（盘口双信号就绪）")
+            else:
+                confidence_delta -= 0.18
+                confidence_cap = 0.49
+                missing_bits = []
+                if not has_opening:
+                    missing_bits.append("初指")
+                if not has_live_market:
+                    missing_bits.append("实时盘口")
+                if not has_fundamentals:
+                    missing_bits.append("基本面")
+                if missing_bits:
+                    conflict_reasons.append("三重门禁缺失:" + "/".join(missing_bits))
+        # 配置 B: edge_score 门槛从 10 降到 8（与篮球对齐），market/fund 从 5 降到 4
+        elif market_points >= 4 and fundamental_points >= 4 and conflict_points == 0 and edge_score >= 8:
             confidence_delta += 0.05
-            confidence_floor = max(confidence, 0.62)
+            # P2: 强信号 floor 0.65，让 triad 齐全+强信号能跨过 A3 门槛
+            confidence_floor = max(confidence, 0.65)
         elif market_points >= 4 and fundamental_points >= 4 and conflict_points <= 1 and edge_score >= 7:
             confidence_delta += 0.02
         elif conflict_points >= 3:
@@ -1478,6 +1783,14 @@ class MatchAnalyzer:
             f"{score_hint}\n"
         )
         flat = _flatten_market_odds(market_odds)
+        # 分析时刻快照：明确声明当前比分和盘口线，防止 GPT 使用历史中间版本
+        hs_val = match_info.get("home_score")
+        as_val = match_info.get("away_score")
+        total_goals_now = int((hs_val or 0) + (as_val or 0)) if hs_val is not None or as_val is not None else None
+        prompt += (
+            f"\n> 【分析时刻快照】当前比分: {hs_val}-{as_val} (总进球{total_goals_now})，"
+            f"即时盘口线: {total_line}。reasoning 中的数字必须与此快照一致。\n"
+        )
         if markets_block and "total" in markets_block:
             # markets_block['total'] 已含 opening 初指与变盘明细（over/under 双向水位），不再重复展开独立摘要
             prompt += f"- 当前大小球盘口（含 opening/变盘）: {json.dumps(markets_block['total'], ensure_ascii=False, separators=(',', ':'))}\n"
@@ -1497,21 +1810,83 @@ class MatchAnalyzer:
 - 大球视角：还需 {goals_needed_over} 分大球赢
 
 """
-            clock_str = str(match_info.get("clock") or "")
-            mins_match = re.search(r"(\d+)", clock_str)
-            if mins_match:
-                elapsed = int(mins_match.group(1))
-                if elapsed > 0 and current_goals > 0:
-                    pace = round(current_goals / elapsed, 3)
-                    full_mins = 48 if sport == "basketball" else 90
-                    score_analysis += f"得分节奏: {current_goals}分/{elapsed}分钟 = {pace}分/分钟。若维持此节奏，全场预计 {round(pace * full_mins, 1)} 分。\n"
-                    # 大球可达性：当前节奏 × 剩余时间 vs 所需
+            # 精确计算已进行分钟和剩余分钟
+            played_mins_calc = None
+            try:
+                from app.services.bookmakers.match_live import match_elapsed_seconds
+                elapsed_secs = match_elapsed_seconds(
+                    sport=sport,
+                    period=str(match_info.get("period") or ""),
+                    clock=str(match_info.get("clock") or "").strip(),
+                )
+                if elapsed_secs is not None:
+                    played_mins_calc = elapsed_secs / 60.0
+                else:
+                    from app.services.bookmakers.match_live import parse_match_clock_minutes
+                    played_mins_calc = parse_match_clock_minutes(
+                        str(match_info.get("clock") or "").strip(), allow_countdown=False
+                    )
+            except Exception:
+                pass
+
+            if played_mins_calc and played_mins_calc > 0:
+                full_mins_calc = 48 if sport == "basketball" else 90
+                remain_mins_calc = max(0, full_mins_calc - played_mins_calc)
+                if current_goals > 0:
+                    pace = current_goals / played_mins_calc
+                    linear_proj = pace * full_mins_calc
+                    score_analysis += (
+                        f"得分节奏: {current_goals}分/{played_mins_calc:.1f}分钟 = {pace:.4f}分/分钟。"
+                        f"线性外推全场 {linear_proj:.1f} 分。剩余 {remain_mins_calc:.1f} 分钟。\n"
+                    )
+                    # 加权投影（基于时间分布模型）
                     if total_line:
-                        remain_mins = max(0, full_mins - elapsed)
-                        projected = pace * full_mins
+                        # 大球可达性分析
+                        needed_over = max(0, total_line + 0.5 - current_goals)
+                        # 足球后段衰减
+                        if sport != "basketball" and played_mins_calc > 50 and (total_line - current_goals) <= 1.0:
+                            late_factor = 0.7 if played_mins_calc < 60 else (0.5 if played_mins_calc < 75 else 0.3)
+                            decayed_remaining = pace * remain_mins_calc * late_factor
+                            score_analysis += (
+                                f"- 大球衰减分析: 余量薄({total_line - current_goals:.1f})+{played_mins_calc:.0f}'后段，"
+                                f"后段节奏衰减至{late_factor:.0%}，预期剩余{decayed_remaining:.1f}分，"
+                                f"需{needed_over:.1f}分（{'可达' if decayed_remaining >= needed_over else '不足'}）\n"
+                            )
+                        else:
+                            expected_remaining = pace * remain_mins_calc
+                            score_analysis += (
+                                f"- 大球按当前节奏预期剩余 {expected_remaining:.1f} 分，"
+                                f"需 {needed_over:.1f} 分（{'可达' if expected_remaining >= needed_over else '不足'}），"
+                                f"线性外推全场 {linear_proj:.1f} 分（{'达到' if linear_proj >= total_line + 0.5 else '未达到'}盘口线 {total_line}）\n"
+                            )
+                        # 小球余量分析
+                        margin_under = total_line - current_goals
+                        if sport != "basketball":
+                            # 足球后段进球概率分布
+                            if remain_mins_calc > 0:
+                                # 60-75' 高发期进球概率更高
+                                high_risk_window = max(0, min(15, 75 - played_mins_calc))  # 落在60-75'窗口的剩余分钟
+                                if high_risk_window > 0:
+                                    score_analysis += (
+                                        f"- 小球余量风险: {margin_under:.1f}球余量，"
+                                        f"60-75'进球高发期剩余{high_risk_window:.0f}分钟（进球权重22%）\n"
+                                    )
                         score_analysis += (
-                            f"- 大球按当前节奏预计全场 {projected:.1f} 分（{'达到' if projected >= total_line + 0.5 else '未达到'}盘口线 {total_line}），"
-                            f"剩余 {remain_mins} 分钟还需 {max(0, total_line + 0.5 - current_goals):.1f} 分\n"
+                            f"- 小球余量: {margin_under:.1f}球，"
+                            f"剩余{remain_mins_calc:.0f}分钟内进{margin_under + 0.5:.0f}球即破盘\n"
+                        )
+                else:
+                    # 0球场景
+                    league_avg = 2.5 if sport != "basketball" else 150.0
+                    score_analysis += (
+                        f"0球@{played_mins_calc:.0f}'，pace=0不可用于外推。"
+                        f"联赛均值{league_avg}球/场，剩余{remain_mins_calc:.0f}分钟预期"
+                        f"约{league_avg * remain_mins_calc / full_mins_calc:.1f}球。\n"
+                    )
+                    if total_line:
+                        score_analysis += (
+                            f"- 小球余量: {total_line:.1f}球全量，0球@{played_mins_calc:.0f}'仍较安全"
+                            f"（但下半场爆发风险存在）\n"
                         )
 
         # 确定分析模式
@@ -1599,7 +1974,7 @@ class MatchAnalyzer:
     "over_confidence": 0.0-1.0,
     "under_reasoning": "小球方向的量化分析（盘口信号+节奏+基本面）",
     "over_reasoning": "大球方向的量化分析（盘口信号+节奏+基本面）",
-    "reasoning": "1.盘口:初盘X->即时X,水位变化X% 2.实时比分:当前X球,节奏X球/分钟,盘口预期X球/分钟 3.综合:量化信号+置信度理由",
+    "reasoning": "【强制声明】当前比分: X-X (总进球X球)，即时盘口线: X.XX，初盘: X.XX，盘口变化: 升/降X.XX → 然后写分析理由",
     "key_factors": ["因素1", "因素2", "因素3"],
     "risk_level": "low/medium/high",
     "value_bets": [
@@ -1611,6 +1986,7 @@ class MatchAnalyzer:
 - 必须同时给出 under_confidence 和 over_confidence（0.0-1.0），分别量化两个方向的信号强度
 - prediction 取 under_confidence 和 over_confidence 中更高的一方（都不足0.30则 skip）
 - skip 时 confidence=0.0；bet_type 只能是 total/first_half_total/second_half_total
+- **reasoning 必须以「当前比分: X-X (总进球X球)，即时盘口线: X.XX」开头**，数字必须与上方提供的「当前总得分」「盘口线 total_line」完全一致，禁止使用盘口历史中的中间版本值
 - reasoning 必须包含具体数字；只输出JSON。
 """
         # 小球严格分析规则（按运动类型分离）
@@ -1640,13 +2016,47 @@ class MatchAnalyzer:
                 "### 小球方向\n"
                 "选 under 需要形成同向证据链（盘口/节奏/基本面至少2项同向，其中必须含盘口或基本面）：\n"
                 "1) 盘口方向支持 under（满足其一即算支持）：\n"
-                "   - 降盘≥0.25球（明显小分信号）\n"
+                "   - 降盘≥0.25球且 under 水位未大幅上升（涨幅<2%即算支持）\n"
                 "   - 小球水位下降>2%（滚球水位波动小，2%即为有效信号）\n"
+                "   注意：降盘+under水位上升=庄家平衡资金，不作为under支持信号\n"
                 "2) 实时进球节奏慢于盘口预期（偏差>20%）\n"
+                "   **关键规则：如果按当前进球节奏推算全场进球≥盘口线（pace×90≥line），under必须skip**\n"
+                "   这表示当前比赛节奏已超过盘口线，押under是逆势操作，实盘0%胜率\n"
                 "3) 基本面支持 under（交锋场均<1.5球/近况进球少/防守型球队）\n"
                 "当前比分远低于盘口线（余量≥2球）也构成有利证据\n"
                 "仅满足1项且无节奏配合 -> skip\n"
-                "4) 注意：75分钟后进球概率上升，under 需更谨慎\n\n"
+                "4) 注意：75分钟后进球概率上升，under 需更谨慎\n"
+                "5) 0球比赛特判：前30分钟0-0不代表全场0球，足球全场0-0概率仅约8%。\n"
+                "   不能用0球/N分钟推演全场0球。0球时under信号需用联赛均值进球率作为后段基准，\n"
+                "   而非当前pace=0。\n"
+                "   **0-0高线陷阱**：当盘口线≥3.0且当前0-0时，市场预期多进球但暂未爆发，\n"
+                "   这种情况under风险极高（实盘0-0@23'/line=3.5→终场5球）。0-0+高线时under conf上限0.45。\n"
+                "6) **under置信度上限0.72**：高conf under存在反向风险（conf≥0.74实盘0%胜率），\n"
+                "   不得给出≥0.74的under置信度。信号再强也封顶0.72。\n"
+                "7) **下半场爆发风险**：半场0-1或1球不代表安全，弱队对强队时强队可能在下半场集中爆发。\n"
+                "   杯赛/联赛差异大的对阵（如德国杯韦恩vs勒沃库森），弱队防守在下半场体能下降后崩溃风险高。\n"
+                "   此类对阵即使上半场节奏慢，under conf也不应超过0.65。\n\n"
+                "### 进球速率衰减规则\n"
+                "线性外推会高估后段进球，但仅在特定高风险场景需修正：\n"
+                "- 仅当线性外推全场总球仅比盘口线高0-0.5球（余量薄）且比赛>50分钟时，才应用衰减：\n"
+                "  60-75分钟：后段预期 = pace × 0.7；75-90分钟：后段预期 = pace × 0.5\n"
+                "- 当线性外推全场总球比盘口线高>1球（余量充足）时，无需衰减，pace保持原值\n"
+                "- 0球特判：pace=0时不能用0推演，改用联赛均值（足球约2.5球/场）\n\n"
+                "### 联赛波动性分级\n"
+                "- 黑名单联赛（冰岛/澳大利亚NPL/新南威尔士/威尔士/北欧低级/东欧低级/青少年/女子/友谊赛）：\n"
+                "  已完全禁止下注，AI不需要分析此类联赛\n"
+                "- 正常联赛（五大联赛次级/主流联赛）：正常评估\n"
+                "- 低波动联赛（防守型联赛）：under可适当提升\n\n"
+                "### 历史数据可靠性\n"
+                "- 历史交锋来自第三方源，可能存在队名匹配偏差\n"
+                "- 历史交锋仅作参考，权重低于实时盘口和比分节奏\n"
+                "- 交锋均值与当前盘口线差异>30%时，数据可能不可靠，不作为方向依据\n"
+                "- **低级联赛（丙级/丁级/地区联赛）历史数据样本量小、可靠性低**\n"
+                "  近5场场均进球等统计可能因对手差异极大而失真，不应作为高置信度的主要依据\n"
+                "  实盘教训：威尔士联赛历史交锋均4.5球→实际3球输over，波兰丙级近5场均失0.8→实际3球输under\n"
+                "- **杯赛强弱悬殊对阵**：杯赛中不同级别球队对阵时，历史数据可比性极低\n"
+                "  弱队近5场在低级联赛的进球/失球数据对强队比赛无参考价值\n"
+                "  实盘教训：德国杯韦恩(低级)vs勒沃库森(德甲)，韦恩近5场均失0.8→实际被灌4球\n\n"
                 "### 通用规则\n"
                 "- 无基本面数据时，小球需 conf>=0.40 且双信号一致\n"
                 "- 三类信号（初指/实时盘口/基本面）全矛盾 -> 必须 skip\n"
@@ -1660,14 +2070,18 @@ class MatchAnalyzer:
                 "### 大球方向\n"
                 "选 over 需要形成同向证据链（盘口/节奏/基本面至少2项同向，其中必须含盘口或基本面）：\n"
                 "1) 盘口方向支持 over（满足其一即算强支持）：\n"
-                "   - 升盘≥5分（强烈大分信号，水位无反向大幅上升即成立）\n"
-                "   - 升盘2-5分 且 大分水位未大幅上升（涨幅<2%即算中性偏支持）\n"
+                "   - 升盘≥5分 且 大分水位下降或持平（资金推动型升盘）\n"
+                "   - 升盘2-5分 且 大分水位下降>2%\n"
                 "   - 大分水位下降>2%（滚球水位波动小，2%即为有效信号）\n"
+                "   注意：升盘+大分水位上升=庄家因已得分做数学调整，不是市场看大，不作为over信号\n"
                 "2) 实时得分节奏快于盘口预期（偏差>20%）\n"
                 "3) 基本面支持 over（交锋场均>170/近况得分高/进攻型球队）\n"
                 "4) 高分走势占优\n"
-                "盘口强信号（升盘≥5分）+任一其他同向证据 -> 可给 conf 0.55-0.65\n"
+                "盘口强信号（资金推动型升盘≥5分+水位下降）+任一其他同向证据 -> 可给 conf 0.55-0.65\n"
                 "5) 注意：Q4后段若落后方犯规战术+罚球更利刷分，但领先方控节奏压时间利小分；44分钟后 over 默认更谨慎，弱信号必须 skip\n\n"
+                "### 进球速率衰减规则\n"
+                "- 篮球Q4后段：pace波动大，领先方控节奏压时间→得分减速；落后方犯规罚球→可能加速\n"
+                "- 不能线性外推Q1-Q3的pace到Q4\n\n"
                 "### 通用规则\n"
                 "- 无基本面数据时，篮球大球不能给高置信度；弱信号直接 skip\n"
                 "- 若初指、实时盘口、基本面三者未形成同向支持，over 优先 skip\n"
@@ -1679,19 +2093,64 @@ class MatchAnalyzer:
                 "\n## 大球严格分析规则 - 足球\n"
                 "### 大球方向\n"
                 "选 over 需要形成同向证据链（盘口/节奏/基本面至少2项同向，其中必须含盘口或基本面）：\n"
-                "1) 盘口方向支持 over（满足其一即算支持）：\n"
-                "   - 升盘≥0.25球（明显大分信号）\n"
-                "   - 大球水位下降>2%（滚球水位波动小，2%即为有效信号）\n"
+                "1) 盘口方向支持 over（必须区分升盘类型！）：\n"
+                "   ### 升盘类型判断（关键！）\n"
+                "   升盘不一定代表市场看大，必须区分：\n"
+                "   a) **数学调整型升盘**：盘口线跟随当前已进球数自动上调\n"
+                "      - 特征：当前总球≥原盘口线，盘口随进球上调\n"
+                "      - 例：原盘口3.0，当前3-0，盘口升到3.5 → 这是数学调整，不是市场看大\n"
+                "      - 处理：不作为over支持信号，conf不提升\n"
+                "   b) **资金推动型升盘**：盘口线上升但当前进球数远低于新盘口线\n"
+                "      - 特征：当前总球<原盘口线，盘口仍然上升 且 over水位下降\n"
+                "      - 例：原盘口2.5，当前0-0，盘口升到3.0，over水位下降 → 可能是资金看大\n"
+                "      - 处理：可作为over支持信号\n"
+                "   c) 水位验证：升盘后over水位下降才是真看大；over水位上升则是数学调整\n"
+                "   - 升盘≥0.25球 且 over水位下降>2%（资金推动型）\n"
+                "   - over水位下降>2%（滚球水位波动小，2%即为有效信号）\n"
                 "2) 实时进球节奏快于盘口预期（偏差>20%）\n"
                 "3) 基本面支持 over（交锋场均>2.8球/近况大球率高/进攻型球队）\n"
+                "   注意：历史交锋来自第三方源可能匹配偏差，交锋均值与盘口线差异>30%时不作为依据\n"
                 "当前比分已接近盘口线（line-当前球数≤1）也构成有利证据\n"
                 "仅满足1项且无节奏配合 -> skip\n"
                 "4) 注意：75分钟后时间所剩无几，需当前已进 X 球使 line-X<=1 才考虑 over；差2球及以上必须 skip\n\n"
+                "### 进球速率衰减规则\n"
+                "线性外推会高估后段进球，但仅在特定高风险场景需修正：\n"
+                "- 仅当线性外推全场总球仅比盘口线高0-0.5球（余量薄）且比赛>50分钟时，才应用衰减：\n"
+                "  60-75分钟：后段预期 = pace × 0.7；75-90分钟：后段预期 = pace × 0.5\n"
+                "- 当线性外推全场总球比盘口线高>1球（余量充足）时，无需衰减，pace保持原值\n"
+                "- 当前比分已接近盘口线（line-当前球数≤1）时，剩余需1球即达线，衰减影响小，正常评估\n"
+                "- 例：当前2球/50分钟，pace=0.04，线3.25，外推3.6球（余量0.35薄）→ 衰减后3.1球（<线）→ over信号减弱\n"
+                "  但当前3球/50分钟，pace=0.06，线3.5，外推5.4球（余量1.9充足）→ 无需衰减，over信号保留\n\n"
                 "### 通用规则\n"
                 "- 无基本面数据时，大球需 conf>=0.40 且双信号一致\n"
                 "- 三类信号（初指/实时盘口/基本面）全矛盾 -> 必须 skip\n"
                 "- confidence 必须与信号强度匹配，不得虚高\n"
+                "- **over置信度上限0.72**：高conf over存在反向风险（conf≥0.73实盘仅33%胜率），\n"
+                "  升盘+快节奏三项同向时容易过度自信，但足球后段进球不确定性高。\n"
+                "  不得给出≥0.73的over置信度。信号再强也封顶0.72。\n\n"
             )
+
+        # Few-shot 示例：正确分析 vs 错误分析对比
+        prompt += (
+            "\n## 分析示例（学习正确判断模式，避免常见错误）\n"
+            "### ✅ 正确分析示例1：under pace投影超标 → skip\n"
+            "场景：足球 54分钟 3-1（4球），盘口线5.75，降盘5.75→5.75无变化\n"
+            "判断：pace=4/54×90=6.7>线5.75，当前节奏已超线，under逆势→skip\n"
+            "关键：不用降盘信号盖过pace事实，pace投影≥线时under必须skip\n\n"
+            "### ✅ 正确分析示例2：over资金推动型升盘 + 节奏快 → over conf 0.65\n"
+            "场景：足球 26分钟 1-0（1球），盘口2.25→2.75升盘0.5，over水位降7.3%\n"
+            "判断：当前1球<原盘口2.25，升盘非数学调整；pace=1/26×90=3.46>线2.75（+26%）；\n"
+            "三项同向（升盘+水位降+节奏快）→ over conf 0.65（不超0.72）\n\n"
+            "### ❌ 错误分析示例1：数学调整型升盘误判为资金推动\n"
+            "场景：足球 74分钟 3-0（3球），盘口3.0→3.5升盘0.5，over水位降3%\n"
+            "错误判断：升盘+水位降→over conf 0.65\n"
+            "正确判断：当前3球≥原盘口3.0，升盘是数学调整非资金推动；74分钟差0.5球→over conf 0.55\n\n"
+            "### ❌ 错误分析示例2：0-0高线under过度自信\n"
+            "场景：足球 23分钟 0-0，盘口线3.5（市场看大），降盘4.0→3.5\n"
+            "错误判断：降盘0.5+0球→under conf 0.68\n"
+            "正确判断：盘口≥3.0且0-0，市场预期多进球但暂未爆发；0球时pace=0不能用，\n"
+            "改用联赛均值2.5球/场推算后段预期≈2.0球，总预期≈2.0<3.5线有支持但风险高→under conf 0.45\n\n"
+        )
 
         try:
             from app.services.sports_data import confidence_cap_for_quality, compute_quality
@@ -1947,6 +2406,164 @@ class MatchAnalyzer:
                 "clock": clock,
                 "stage_weight": stage_weight,
             }
+
+        # --- 5. 实时节奏量化（pace投影 + 联赛基准对比） ---
+        hs = match_info.get("home_score")
+        aws = match_info.get("away_score")
+        if hs is not None or aws is not None:
+            current_total = int((hs or 0) + (aws or 0))
+            total_line_val = match_info.get("total_line") or match_info.get("line")
+            if total_line_val:
+                try:
+                    tl = float(total_line_val)
+                    # 尝试从 clock 解析已进行分钟数
+                    played_mins = None
+                    try:
+                        from app.services.bookmakers.match_live import (
+                            match_elapsed_seconds,
+                            parse_match_clock_minutes,
+                        )
+                        elapsed_secs = match_elapsed_seconds(
+                            sport=sport,
+                            period=str(match_info.get("period") or ""),
+                            clock=clock,
+                        )
+                        if elapsed_secs is not None:
+                            played_mins = elapsed_secs / 60.0
+                        else:
+                            played_mins = parse_match_clock_minutes(clock, allow_countdown=False)
+                    except Exception:
+                        pass
+
+                    pace_signal: dict[str, Any] = {
+                        "current_total": current_total,
+                        "line": tl,
+                        "margin": round(tl - current_total, 2),
+                    }
+                    if played_mins and played_mins > 0:
+                        full_mins = 90.0 if sport != "basketball" else 48.0
+                        remain_mins = max(0.0, full_mins - played_mins)
+                        pace = current_total / played_mins
+                        projection = pace * full_mins
+
+                        # ── 精细化节奏分析：基于时间分布的进球概率模型 ──
+                        # 足球进球时间分布（经验统计）：
+                        #   0-15': 12%  15-30': 15%  30-45': 18%  45-60': 17%
+                        #   60-75': 22%  75-90': 16%
+                        # 篮球得分分布：
+                        #   Q1: 22%  Q2: 23%  Q3: 25%  Q4: 30%（犯规+罚球加速）
+                        if sport == "basketball":
+                            # 篮球四节得分权重
+                            quarter_weights = [0.22, 0.23, 0.25, 0.30]
+                            quarter_mins = full_mins / 4  # 12分钟/节
+                            # 已完成节的权重总和
+                            completed_quarters = int(played_mins / quarter_mins)
+                            completed_weight = sum(quarter_weights[:completed_quarters])
+                            # 剩余时间的权重
+                            remain_weight = sum(quarter_weights[completed_quarters:])
+                            # 当前节内已完成比例
+                            intra_q_progress = (played_mins % quarter_mins) / quarter_mins
+                            if completed_quarters < 4:
+                                current_q_partial = quarter_weights[completed_quarters] * intra_q_progress
+                                completed_weight += current_q_partial
+                                remain_weight = sum(quarter_weights[completed_quarters:]) - current_q_partial
+                            # 按权重分布推算全场进球
+                            if completed_weight > 0:
+                                weighted_projection = current_total / completed_weight
+                                # 剩余时间预期进球 = 全场预期 × 剩余权重
+                                expected_remaining = weighted_projection * remain_weight
+                                # 篮球后段加速：Q4 得分权重 0.30 > Q1 的 0.22
+                                # 线性外推低估后段，加权模型更准确
+                                pace_signal["weighted_projection"] = round(weighted_projection, 2)
+                                pace_signal["weighted_expected_remaining"] = round(expected_remaining, 2)
+                                pace_signal["quarter_weights"] = quarter_weights
+                                pace_signal["completed_weight"] = round(completed_weight, 3)
+                                pace_signal["remain_weight"] = round(remain_weight, 3)
+                        else:
+                            # 足球15分钟段进球权重
+                            segment_weights = [0.12, 0.15, 0.18, 0.17, 0.22, 0.16]  # 6段×15分钟
+                            segment_mins = 15.0
+                            completed_segs = int(played_mins / segment_mins)
+                            completed_weight = sum(segment_weights[:completed_segs])
+                            # 当前段内已完成比例
+                            intra_seg_progress = (played_mins % segment_mins) / segment_mins
+                            if completed_segs < 6:
+                                current_seg_partial = segment_weights[completed_segs] * intra_seg_progress
+                                completed_weight += current_seg_partial
+                                remain_weight = sum(segment_weights[completed_segs:]) - current_seg_partial
+                            else:
+                                remain_weight = 0.0
+                            # 按权重分布推算全场进球
+                            if completed_weight > 0:
+                                weighted_projection = current_total / completed_weight
+                                expected_remaining = weighted_projection * remain_weight
+                                # 60-75' 是进球高发期（权重0.22），线性外推会低估这段
+                                # 75-90' 权重0.16略低于均值，线性外推略高估
+                                pace_signal["weighted_projection"] = round(weighted_projection, 2)
+                                pace_signal["weighted_expected_remaining"] = round(expected_remaining, 2)
+                                pace_signal["segment_weights"] = segment_weights
+                                pace_signal["completed_weight"] = round(completed_weight, 3)
+                                pace_signal["remain_weight"] = round(remain_weight, 3)
+
+                            # 足球后段进球衰减规则（仅余量薄时生效）
+                            # 线性外推高估后段进球，但仅在特定场景需修正
+                            margin = tl - current_total
+                            if played_mins > 50 and margin <= 1.0:
+                                # 余量薄+后半段：后段进球概率衰减
+                                # 60-75': 保留 70% pace；75-90': 保留 50% pace
+                                if remain_mins > 0:
+                                    late_factor = 0.7 if played_mins < 60 else (0.5 if played_mins < 75 else 0.3)
+                                    decayed_remaining = pace * remain_mins * late_factor
+                                    pace_signal["decayed_expected_remaining"] = round(decayed_remaining, 2)
+                                    pace_signal["decay_factor"] = late_factor
+                                    pace_signal["decay_note"] = (
+                                        f"余量薄({margin:.1f})+{played_mins:.0f}'后段，"
+                                        f"后段节奏衰减至{late_factor:.0%}"
+                                    )
+
+                        # 0球特判：pace=0 不能用于推演
+                        if current_total == 0:
+                            league_avg = 2.5 if sport != "basketball" else 150.0
+                            # 按时间权重计算剩余预期进球
+                            if sport != "basketball" and remain_weight > 0:
+                                expected_remaining_by_avg = league_avg * remain_weight
+                            else:
+                                expected_remaining_by_avg = league_avg * remain_mins / full_mins
+                            pace_signal["league_avg_baseline"] = league_avg
+                            pace_signal["expected_remaining_by_avg"] = round(expected_remaining_by_avg, 2)
+                            pace_signal["zero_zero_warning"] = True
+                            pace_signal["zero_zero_note"] = (
+                                f"0球@{played_mins:.0f}'，pace=0不可用，"
+                                f"按联赛均值{league_avg}×剩余权重={expected_remaining_by_avg:.1f}球"
+                            )
+
+                        pace_signal["played_mins"] = round(played_mins, 1)
+                        pace_signal["remain_mins"] = round(remain_mins, 1)
+                        pace_signal["pace"] = round(pace, 4)
+                        pace_signal["pace_projection"] = round(projection, 2)
+                        pace_signal["pace_vs_line"] = round(projection - tl, 2)
+                        pace_signal["pace_above_line"] = projection >= tl
+                    signals["live_pace_analysis"] = pace_signal
+                except (TypeError, ValueError):
+                    pass
+
+        # --- 6. 盘口线 vs 历史交锋均值偏差 ---
+        h2h_avg = (signals.get("h2h_baseline") or {}).get("avg_total_goals", 0)
+        form_avg = signals.get("form_combined_expected_goals", 0)
+        total_line_val2 = match_info.get("total_line") or match_info.get("line")
+        if total_line_val2 and (h2h_avg or form_avg):
+            try:
+                tl2 = float(total_line_val2)
+                deviations = {}
+                if h2h_avg:
+                    deviations["h2h_vs_line_pct"] = round((h2h_avg - tl2) / tl2 * 100, 1)
+                    deviations["h2h_reliable"] = abs(h2h_avg - tl2) / tl2 < 0.3
+                if form_avg:
+                    deviations["form_vs_line_pct"] = round((form_avg - tl2) / tl2 * 100, 1)
+                if deviations:
+                    signals["line_vs_history"] = deviations
+            except (TypeError, ValueError):
+                pass
 
         return signals
 

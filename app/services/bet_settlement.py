@@ -27,7 +27,7 @@ _SETTLED_CACHE_TTL = 300  # 5 分钟
 
 
 def _decide_total_outcome(*, selection: str, line: Optional[float], total: float) -> str:
-    """判定小球单输赢；遗留的非小球方向安全返回 unknown。"""
+    """判定大小球单输赢（under/over 双向）。"""
     if line is None:
         return "unknown"
     sel = str(selection or "").strip().lower()
@@ -36,6 +36,11 @@ def _decide_total_outcome(*, selection: str, line: Optional[float], total: float
             return "lost"
         if total < line:
             return "won"
+    elif sel == "over":
+        if total > line:
+            return "won"
+        if total < line:
+            return "lost"
     else:
         return "unknown"
     return "push"  # 整数线平总得分：走水退本金
@@ -168,6 +173,12 @@ async def settle_finished_bets(*, limit: int = 200) -> int:
             touched_users = {b.user_id for b, _ in rows if getattr(b, "user_id", None)}
             for uid in touched_users:
                 await cache.delete(f"{_SETTLED_CACHE_KEY}:{uid}")
+            # 同时清掉校准 / 模式 / 风控调优缓存，下一轮重新加载
+            for uid in (touched_users or {None}):
+                for prefix in ("ai:calibration:v1", "ai:patterns:v1", "ai:risk_tuning:v1"):
+                    if uid is not None:
+                        await cache.delete(f"{prefix}:{uid}")
+                    await cache.delete(prefix)
         except Exception:
             pass
     return settled
@@ -223,6 +234,10 @@ async def recent_betting_stats(
         "by_sport": {},
         "by_selection": {},
         "by_provider": {},
+        # 置信度分桶统计：{selection: {bucket: {settled, won, win_rate}}}
+        "by_confidence": {},
+        # 盘口线区间统计：{sport_selection: {range: {settled, won, win_rate}}}
+        "by_line_range": {},
         # by_provider 需要按结算时间排序算连败，先攒 (provider, payout, stake, settled_at)
         "_provider_seq": [],
     }
@@ -285,6 +300,59 @@ async def recent_betting_stats(
             psb["lost"] += 1
         stats["_provider_seq"].append((prov, sel_l, payout, stake, bet.settled_at))
 
+        # 置信度分桶统计（仅 AI 注单有 ai_confidence）
+        if getattr(bet, "ai_confidence", None) is not None:
+            try:
+                conf_val = float(bet.ai_confidence)
+                if conf_val > 0:
+                    conf_lo = int(conf_val / 0.05) * 0.05
+                    conf_bk = f"{conf_lo:.2f}-{conf_lo + 0.05:.2f}"
+                    conf_store = stats["by_confidence"].setdefault(sel_l, {})
+                    cb = _bucket(conf_store, conf_bk)
+                    if payout > stake + 1e-9:
+                        cb["won"] += 1
+                    elif payout < stake - 1e-9:
+                        cb["lost"] += 1
+            except (TypeError, ValueError):
+                pass
+
+        # 盘口线区间统计
+        if bet.line is not None:
+            try:
+                line_val = float(bet.line)
+                if line_val > 0:
+                    lr_key = f"{sport}_{sel_l}"
+                    lr_store = stats["by_line_range"].setdefault(lr_key, {})
+                    if sport == "basketball":
+                        if line_val < 140:
+                            lr = "<140"
+                        elif line_val < 160:
+                            lr = "140-160"
+                        elif line_val < 180:
+                            lr = "160-180"
+                        elif line_val < 200:
+                            lr = "180-200"
+                        else:
+                            lr = "≥200"
+                    else:
+                        if line_val < 2.5:
+                            lr = "<2.5"
+                        elif line_val < 3.0:
+                            lr = "2.5-3.0"
+                        elif line_val < 3.5:
+                            lr = "3.0-3.5"
+                        elif line_val < 4.5:
+                            lr = "3.5-4.5"
+                        else:
+                            lr = "≥4.5"
+                    lb = _bucket(lr_store, lr)
+                    if payout > stake + 1e-9:
+                        lb["won"] += 1
+                    elif payout < stake - 1e-9:
+                        lb["lost"] += 1
+            except (TypeError, ValueError):
+                pass
+
     decided = stats["won"] + stats["lost"]
     if decided:
         stats["win_rate"] = round(stats["won"] / decided, 4)
@@ -292,6 +360,16 @@ async def recent_betting_stats(
         stats["roi"] = round((stats["payout"] - stats["stake"]) / stats["stake"], 4)
     for store in (stats["by_sport"], stats["by_selection"]):
         for v in store.values():
+            d = v["won"] + v["lost"]
+            v["win_rate"] = round(v["won"] / d, 4) if d else None
+
+    # 置信度分桶 + 线距分桶胜率
+    for conf_store in stats["by_confidence"].values():
+        for v in conf_store.values():
+            d = v["won"] + v["lost"]
+            v["win_rate"] = round(v["won"] / d, 4) if d else None
+    for lr_store in stats["by_line_range"].values():
+        for v in lr_store.values():
             d = v["won"] + v["lost"]
             v["win_rate"] = round(v["won"] / d, 4) if d else None
 

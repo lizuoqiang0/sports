@@ -39,10 +39,10 @@ AI_MIN_STAKE = 1.0
 SPORT_RISK: dict[str, dict] = {
     "basketball": {
         # ── under 小球链（高赢单率配置）──
-        "under_min_conf": 0.58,            # 统一最低置信度
-        "under_min_conf_no_fund": 0.58,    # 统一最低置信度
-        "under_min_line": 120.0,           # 篮球小球盘线区间下限（低于此线不投）
-        "under_max_line": 208.0,           # 高线小分容错极低，提前拦截
+        "under_min_conf": 0.65,            # 0.58→0.65：与足球对齐，提高胜率
+        "under_min_conf_no_fund": 0.68,    # 无基本面时加严
+        "under_min_line": 130.0,           # 篮球小球盘线区间下限（低于此线不投）
+        "under_max_line": 205.0,           # 208→205：高线小分容错极低
         "under_min_played_mins": 14.0,     # 首节/次节早段样本太小，不做小分
         "under_late_block_mins": 44.0,     # 末节最后 4 分钟犯规/罚球波动极大
         # under 余量（全场48分钟按盘口线等比折算剩余期望）
@@ -53,10 +53,10 @@ SPORT_RISK: dict[str, dict] = {
         "late_margin_floor": 4.0,          # 末节/加时余量过薄时一波罚球就破盘
         "ev_conf_edge": 0.04,              # 小分必须明显高于盈亏平衡概率
         # ═══ 大球 over 组（独立闸门参数，与小球互不参与）═══
-        "over_min_conf": 0.58,             # 统一最低置信度
-        "over_min_conf_no_fund": 0.58,     # 统一最低置信度
-        "over_min_line": 130.0,            # 低线=市场极度看小，别硬刚
-        "over_max_line": 200.0,            # 高线大分残余空间不足
+        "over_min_conf": 0.65,             # 0.58→0.65：与 under 对等
+        "over_min_conf_no_fund": 0.68,     # 无基本面时加严
+        "over_min_line": 140.0,            # 130→140：低线=市场极度看小，别硬刚
+        "over_max_line": 165.0,            # 190→165：高线大分残余空间不足（194.5线/177球输单教训）
         "over_min_played_mins": 14.0,      # 早段样本小（独立于 under 配置）
         "over_late_block_mins": 40.0,      # 末节后段时间不够追分，经典送钱场景
         "over_pace_factor": 1.05,          # 1.20→1.05：线性 pace 低估后段得分，放宽
@@ -64,10 +64,10 @@ SPORT_RISK: dict[str, dict] = {
     },
     "football": {
         # ── under 小球链（高赢单率配置）──
-        "under_min_conf": 0.58,            # 统一最低置信度
-        "under_min_conf_no_fund": 0.58,    # 统一最低置信度
-        "under_min_line": 2.0,             # 足球低线 under 1球破盘
-        "under_max_line": 6.5,             # 足球 under 高线限制
+        "under_min_conf": 0.65,            # 0.58→0.65：实盘 5 单 3 负，低 conf 注单亏损严重
+        "under_min_conf_no_fund": 0.68,    # 无基本面时进一步加严
+        "under_min_line": 2.5,             # 2.0→2.5：line≤2.0 一球即破盘，0.5 线风险极高
+        "under_max_line": 5.0,             # 6.5→5.0：低级联赛高线（8.5）波动极大，8球破盘
         "under_min_played_mins": 20.0,
         "under_late_block_mins": 90.0,
         # under 余量（全场90分钟折算剩余期望）
@@ -78,10 +78,10 @@ SPORT_RISK: dict[str, dict] = {
         "late_margin_floor": 0.5,
         "ev_conf_edge": 0.0,
         # ═══ 大球 over 组（独立闸门参数，与小球互不参与）═══
-        "over_min_conf": 0.58,             # 统一最低置信度
-        "over_min_conf_no_fund": 0.58,     # 统一最低置信度
-        "over_min_line": 2.0,              # 低线=市场极度看小
-        "over_max_line": 4.5,              # 高线残余进球空间不足
+        "over_min_conf": 0.65,             # 0.58→0.65：与 under 对等
+        "over_min_conf_no_fund": 0.68,     # 无基本面时加严
+        "over_min_line": 2.5,              # 2.0→2.5：低线=市场极度看小
+        "over_max_line": 4.0,              # 4.5→4.0：高线残余进球空间不足
         "over_min_played_mins": 20.0,
         "over_late_block_mins": 85.0,      # 85'后追大球时间不够
         "over_pace_factor": 1.05,          # 与 under margin_factor 对称，不过度要求速率
@@ -93,15 +93,20 @@ SPORT_RISK["default"] = {k: dict(v) if isinstance(v, dict) else v for k, v in SP
 
 # 联赛黑名单关键词（实盘教训：青少年/女子联赛进球极不稳定，2026-08-14 该类5注仅1胜）
 # 同时用于：B2 下单闸门（strategy.evaluate_bet）+ 扫描层前置过滤（analysis_filters.skip_reason_for_match）
+# 高波动联赛（冰岛/威尔士/澳洲NSW）实盘0%胜率，2026-08-22 纳入黑名单完全禁止
 LEAGUE_BLACKLIST_KEYWORDS: tuple[str, ...] = (
     "u19", "u21", "u18", "u20", "u17", "u16",
     "青年", "青少年", "后备队", "女子", "(女)", "women", "女篮",
     "友谊赛", "表演赛",
+    # 高波动联赛：进球数极不稳定，under/over实盘0%胜率
+    "冰岛", "iceland",
+    "新南威尔士", "nsw",
+    "威尔士", "wales",
 )
 
 
 def league_is_blacklisted(league: str) -> bool:
-    """联赛名是否命中黑名单（青少年/女子等进球不稳定赛事）。"""
+    """联赛名是否命中黑名单（青少年/女子/高波动赛事进球不稳定）。"""
     if not league:
         return False
     league_l = str(league).lower()
@@ -434,6 +439,22 @@ class StrategyEngine:
 
         required_conf = base_req + adaptive_bump
 
+        # ── 动态风控参数调优：基于近7天结算结果自动加严门槛 ──
+        # （近7天某方向胜率<35% → conf_bump+0.08；<45% → +0.04）
+        try:
+            from app.ai.calibration import get_dynamic_conf_bump, load_risk_tuning
+
+            risk_tuning = await load_risk_tuning(user_id=self.user_id)
+            dyn_bump = get_dynamic_conf_bump(sport_l, prediction, risk_tuning)
+            if dyn_bump > 0:
+                required_conf += dyn_bump
+                logger.info(
+                    "[A3/动态调优] match=%s | %s %s 近7天低胜率 门槛+%.2f→%.2f",
+                    mid, sport_l, prediction, dyn_bump, required_conf,
+                )
+        except Exception as e:
+            logger.debug("[A3/动态调优] 跳过(异常): %s", e)
+
         # 时间维度：后半段 under 风险递增（进球集中在后段），提高置信度要求
         if prediction == "under" and played_mins is not None:
             full_mins_a3 = float(RISK.get("margin_full_mins", 90.0))
@@ -453,6 +474,26 @@ class StrategyEngine:
             return self._reject(
                 match_info, analysis,
                 f"{prediction}置信度不足（当前{conf_f:.2f}，要求{required_conf:.2f}）",
+            )
+        # ── P7：under 过高置信度反向风险（实盘 conf≥0.74 的 under 0%胜率）──
+        if prediction == "under" and conf_f >= 0.74:
+            logger.info(
+                "[A3/P7] ❌ 拒绝 match=%s | under conf=%.2f≥0.74 过高置信度反向风险（实盘0%%胜率）",
+                mid, conf_f,
+            )
+            return self._reject(
+                match_info, analysis,
+                f"under置信度过高（{conf_f:.2f}≥0.74），存在反向风险（高conf under实盘0%胜率）",
+            )
+        # ── P9：over 过高置信度反向风险（实盘 conf≥0.73 的 over 仅33%胜率）──
+        if prediction == "over" and conf_f >= 0.73:
+            logger.info(
+                "[A3/P9] ❌ 拒绝 match=%s | over conf=%.2f≥0.73 过高置信度反向风险（实盘仅33%%胜率）",
+                mid, conf_f,
+            )
+            return self._reject(
+                match_info, analysis,
+                f"over置信度过高（{conf_f:.2f}≥0.73），存在反向风险（高conf over实盘仅33%胜率）",
             )
         logger.info(
             "[A3/置信度] ✅ 通过 match=%s | conf=%.2f ≥ 要求=%.2f | 方向=%s fundamentals=%s",
@@ -487,6 +528,37 @@ class StrategyEngine:
             )
 
         # ══════════════════════════════════════════════════════════
+        # A5：历史模式检测（基于近14天结算结果的多维度高风险模式拦截）
+        #   维度：sport×selection×line_range / time_range / odds_range / conf_range
+        #   命中 action=reject 的模式直接拒绝（近≥5注亏损率≥70%）
+        # ══════════════════════════════════════════════════════════
+        try:
+            from app.ai.calibration import check_risk_patterns, load_risk_patterns
+
+            patterns = await load_risk_patterns(user_id=self.user_id)
+            if patterns:
+                pattern_hit = check_risk_patterns(
+                    sport=sport_l,
+                    selection=prediction,
+                    line=total_line,
+                    played_mins=played_mins,
+                    odds=float(odds_data.get(prediction) or analysis.get("odds") or 0),
+                    confidence=conf_f,
+                    patterns=patterns,
+                )
+                if pattern_hit:
+                    logger.info(
+                        "[A5/历史模式] ❌ 拒绝 match=%s | %s", mid, pattern_hit,
+                    )
+                    return self._reject(match_info, analysis, pattern_hit)
+                logger.info(
+                    "[A5/历史模式] ✅ 通过 match=%s | 已检查%d条高风险模式，未命中",
+                    mid, len(patterns),
+                )
+        except Exception as e:
+            logger.debug("[A5/历史模式] 跳过(异常): %s", e)
+
+        # ══════════════════════════════════════════════════════════
         # 阶段B：结构性风控（盘口线本身的下注价值）
         #   B1 盘线区间 / 早段 / 末段 —— under 与 over 两套独立参数，互不参与
         # ══════════════════════════════════════════════════════════
@@ -517,6 +589,17 @@ class StrategyEngine:
             if total_line is not None:
                 over_min_line = float(RISK.get("over_min_line", 2.0))
                 over_max_line = float(RISK.get("over_max_line", 4.5))
+                # 动态线距调整：基于近期亏损注单的盘口线分布
+                try:
+                    from app.ai.calibration import get_dynamic_line_adjustment, load_risk_tuning
+                    _rt = await load_risk_tuning(user_id=self.user_id)
+                    _adj = get_dynamic_line_adjustment(sport_l, "over", _rt)
+                    if "min_line_bump" in _adj:
+                        over_min_line += float(_adj["min_line_bump"])
+                    if "max_line_shrink" in _adj:
+                        over_max_line -= float(_adj["max_line_shrink"])
+                except Exception:
+                    pass
                 if total_line <= over_min_line:
                     logger.info(
                         "[B1/over风控] ❌ 拒绝 match=%s | %s 低线over line=%.2f≤%.2f 市场极度看小",
@@ -535,8 +618,67 @@ class StrategyEngine:
                         match_info, analysis,
                         f"{sport_l} 高线over（line={total_line:.2f}）残余进球空间不足",
                     )
+                # ── P1：足球低进球高线over拒绝（0:0/1:0追3.25+线，实盘2注全输）──
+                if sport_l == "football" and current_total <= 1 and total_line >= 3.25:
+                    logger.info(
+                        "[B1/over风控/P1] ❌ 拒绝 match=%s | 足球over低进球高线 total=%d line=%.2f 追球数过多",
+                        mid, current_total, total_line,
+                    )
+                    return self._reject(
+                        match_info, analysis,
+                        f"足球over低进球高线（{current_total}球追{total_line:.2f}线），追球数过多风险极高",
+                    )
+                # ── P4：高置信+大差距over拒绝（conf≥0.70但当前总分远低于线，AI过度自信）──
+                if conf_f >= 0.70 and current_total < total_line - 1.5:
+                    logger.info(
+                        "[B1/over风控/P4] ❌ 拒绝 match=%s | 高置信大差距over conf=%.2f total=%d line=%.2f gap=%.2f",
+                        mid, conf_f, current_total, total_line, total_line - current_total,
+                    )
+                    return self._reject(
+                        match_info, analysis,
+                        f"高置信大差距over（conf={conf_f:.2f}，差{total_line - current_total:.1f}球），AI过度自信风险",
+                    )
+                # ── P10：半场线性外推陷阱（实盘over输单核心根因）──
+                # 半场2球/45分钟 → 线性外推4球 → GPT给0.65 conf → 下半场0进球 → 输
+                # 规则：足球 over 在半场附近(40-55')，当前进球≥2但 pace_projection 与 line 差距≤1球时
+                #       线性外推高估后段产出，要求额外 0.05 置信度门槛
+                if (sport_l == "football" and played_mins is not None
+                        and 40.0 <= played_mins <= 55.0
+                        and current_total >= 2
+                        and total_line - current_total <= 1.5):
+                    pace_proj = (current_total / played_mins) * 90.0
+                    if pace_proj >= total_line and pace_proj - total_line <= 1.0:
+                        logger.info(
+                            "[B1/over风控/P10] ⚠️ 半场线性外推陷阱 match=%s | %.0f' %d球 pace_proj=%.1f line=%.2f 差%.1f",
+                            mid, played_mins, current_total, pace_proj, total_line, pace_proj - total_line,
+                        )
+                        # 不直接拒绝，但在 A3 已通过的 conf 上额外加严 0.05
+                        # （由 D1 衰减模型最终决定是否拦截）
+                        if conf_f < 0.70:
+                            logger.info(
+                                "[B1/over风控/P10] ❌ 拒绝 match=%s | 半场外推陷阱 conf=%.2f<0.70 pace_proj仅高%.1f球",
+                                mid, conf_f, pace_proj - total_line,
+                            )
+                            return self._reject(
+                                match_info, analysis,
+                                f"半场线性外推陷阱（{current_total}球@{played_mins:.0f}'外推{pace_proj:.1f}球，"
+                                f"仅超线{pace_proj - total_line:.1f}球，下半场衰减风险高）",
+                            )
         else:
             # ── B1-under 链（现状原样保留）──
+            # 动态线距调整：基于近期亏损注单的盘口线分布
+            _under_min_line_dyn = float(RISK.get("under_min_line", 1.5))
+            _under_max_line_dyn = float(RISK.get("under_max_line", 5.0))
+            try:
+                from app.ai.calibration import get_dynamic_line_adjustment, load_risk_tuning
+                _rt = await load_risk_tuning(user_id=self.user_id)
+                _adj_u = get_dynamic_line_adjustment(sport_l, "under", _rt)
+                if "min_line_bump" in _adj_u:
+                    _under_min_line_dyn += float(_adj_u["min_line_bump"])
+                if "max_line_shrink" in _adj_u:
+                    _under_max_line_dyn -= float(_adj_u["max_line_shrink"])
+            except Exception:
+                pass
             if sport_l == "football" and played_mins is not None and played_mins < float(RISK.get("under_min_played_mins", 20.0)):
                     # 近7天本地已结算样本（2026-08-10~2026-08-17）：
                     # - 足球 under 全样本 13胜11负，WR 54.2%
@@ -551,13 +693,13 @@ class StrategyEngine:
                         analysis,
                         f"足球under前20分钟样本过小（{played_mins:.0f}'），保护性跳过",
                     )
-            if sport_l == "football" and total_line is not None and total_line <= RISK.get("under_min_line", 1.5):
+            if sport_l == "football" and total_line is not None and total_line <= _under_min_line_dyn:
                     logger.info("[B1/under风控] ❌ 拒绝 match=%s | 足球低线under line=%.2f，1球即破盘", mid, total_line)
                     return self._reject(match_info, analysis, f"足球低线under（line={total_line:.2f}）1球即破盘，风险过高")
-            if sport_l == "football" and total_line is not None and RISK.get("under_max_line") and total_line >= RISK["under_max_line"]:
+            if sport_l == "football" and total_line is not None and total_line >= _under_max_line_dyn:
                     logger.info(
                         "[B1/under风控] ❌ 拒绝 match=%s | 足球高线under line=%.2f>=%.2f 容错极低",
-                        mid, total_line, RISK["under_max_line"],
+                        mid, total_line, _under_max_line_dyn,
                     )
                     return self._reject(match_info, analysis, f"足球高线under（line={total_line:.2f}）残余进球空间不足")
             if sport_l == "football" and played_mins is not None and played_mins >= float(RISK.get("under_late_block_mins", 90.0)):
@@ -580,10 +722,10 @@ class StrategyEngine:
                         analysis,
                         f"篮球under前{int(float(RISK.get('under_min_played_mins', 14.0)))}分钟样本过小，保护性跳过",
                     )
-            if sport_l == "basketball" and total_line is not None and RISK.get("under_max_line") and total_line >= RISK["under_max_line"]:
+            if sport_l == "basketball" and total_line is not None and total_line >= _under_max_line_dyn:
                     logger.info(
                         "[B1/under风控] ❌ 拒绝 match=%s | 篮球高线under line=%.1f>=%.1f，变数大",
-                        mid, total_line, RISK["under_max_line"],
+                        mid, total_line, _under_max_line_dyn,
                     )
                     return self._reject(match_info, analysis, f"篮球高线under（line={total_line:.1f}）加时/罚球变数大")
             if sport_l == "basketball" and played_mins is not None and played_mins >= float(RISK.get("under_late_block_mins", 44.0)):
@@ -613,16 +755,49 @@ class StrategyEngine:
                 )
                 return self._reject(match_info, analysis, f"篮球under余量过薄（{margin:.2f}分，一波进攻即破盘）")
 
-        # ── B2：联赛质量闸门（关键词见模块级 LEAGUE_BLACKLIST_KEYWORDS，扫描层已前置过滤，此处兜底）──
+        # 联赛名（B2/P6 共用）
         league = str(match_info.get("league") or analysis.get("league") or "")
+
+        # ── P5：under pace投影守卫（当前节奏推算全场进球≥盘口线时，不应押under）──
+        #   实盘教训：#1 黑镇斯巴达 4球/54' pace投影6.7>5.8线，AI仍押under→终场8球惨输
+        if prediction == "under" and total_line is not None and played_mins is not None and played_mins > 0:
+            full_mins_p5 = float(RISK.get("margin_full_mins", 90.0))
+            pace_projection = (current_total / played_mins) * full_mins_p5
+            if pace_projection >= total_line:
+                logger.info(
+                    "[B1b/P5] ❌ 拒绝 match=%s | under pace投影%.2f≥线%.2f 节奏已超线不该押under",
+                    mid, pace_projection, total_line,
+                )
+                return self._reject(
+                    match_info, analysis,
+                    f"under pace投影超标（当前节奏推算{pace_projection:.1f}球≥线{total_line:.1f}，不应押under）",
+                )
+
+        # ── P8：under 0-0高线陷阱（市场看大但暂未进球，后续可能爆发）──
+        #   实盘教训：#45 卡莱尔 0-0@23' line=3.5 conf=0.60 → 终场5球惨输
+        #   市场设高线(≥3.0)说明预期多进球，0-0只是暂未爆发，不该逆势押under
+        if (prediction == "under" and total_line is not None
+                and current_total == 0 and total_line >= 3.0
+                and played_mins is not None and played_mins < 30):
+            logger.info(
+                "[B1b/P8] ❌ 拒绝 match=%s | under 0-0高线陷阱 0球@%.0f' line=%.2f≥3.0 市场看大不该逆势押under",
+                mid, played_mins, total_line,
+            )
+            return self._reject(
+                match_info, analysis,
+                f"under 0-0高线陷阱（0球@{played_mins:.0f}' line={total_line:.1f}≥3.0，市场看大后续可能爆发）",
+            )
+
+        # ── B2：联赛质量闸门（关键词见模块级 LEAGUE_BLACKLIST_KEYWORDS，扫描层已前置过滤，此处兜底）──
+        # 高波动联赛（冰岛/威尔士/澳洲NSW）已纳入黑名单，完全禁止下注
         if league_is_blacklisted(league):
             logger.info(
-                "[B2/联赛质量] ❌ 拒绝 match=%s | 青少年/女子联赛进球不稳定 league=%s",
+                "[B2/联赛质量] ❌ 拒绝 match=%s | 黑名单联赛 league=%s",
                 mid, league,
             )
             return self._reject(
                 match_info, analysis,
-                f"联赛类型风控（{league}：青少年/女子赛事进球波动大）",
+                f"联赛类型风控（{league}：青少年/女子/高波动赛事进球不稳定）",
             )
 
         # ── B3：高赔率风险（under/over 正常水位≤1.95，≥2.0 拒绝）──
@@ -737,12 +912,57 @@ class StrategyEngine:
                     f"{sport_l} over所需进球过多（还差{needed:.2f}，剩余时间无法保证）",
                 )
             # 当前进球速率（球/分钟）× 剩余时间 = 预期产出
-            # 篮球后段得分加速（末节犯规/罚球），线性 pace 低估后段产出，加 10% 加速因子
+            # 使用时间分布加权模型替代纯线性外推（实盘教训：半场2球线性外推4球，下半场0进球）
             pace = current_total / played_mins
             full_mins = float(RISK.get("margin_full_mins", 90.0))
             remain_mins = max(0.0, full_mins - played_mins)
             sport_boost = 1.10 if sport_l == "basketball" else 1.05
-            expected_output = pace * remain_mins * sport_boost
+            linear_expected = pace * remain_mins * sport_boost
+
+            # ── 时间分布加权预期产出 ──
+            # 足球进球时间权重：0-15'(12%) 15-30'(15%) 30-45'(18%) 45-60'(17%) 60-75'(22%) 75-90'(16%)
+            # 篮球四节权重：Q1(22%) Q2(23%) Q3(25%) Q4(30%)
+            if sport_l == "basketball":
+                quarter_weights = [0.22, 0.23, 0.25, 0.30]
+                quarter_mins = full_mins / 4
+                completed_q = int(played_mins / quarter_mins)
+                completed_w = sum(quarter_weights[:completed_q])
+                intra_q = (played_mins % quarter_mins) / quarter_mins if completed_q < 4 else 1.0
+                if completed_q < 4:
+                    completed_w += quarter_weights[completed_q] * intra_q
+                    remain_w = sum(quarter_weights[completed_q:]) - quarter_weights[completed_q] * intra_q
+                else:
+                    remain_w = 0.0
+                if completed_w > 0 and remain_w > 0:
+                    # 加权投影 = 当前进球 / 已完成权重 × 剩余权重
+                    weighted_expected = (current_total / completed_w) * remain_w
+                else:
+                    weighted_expected = linear_expected
+            else:
+                seg_weights = [0.12, 0.15, 0.18, 0.17, 0.22, 0.16]
+                seg_mins = 15.0
+                completed_s = int(played_mins / seg_mins)
+                completed_w = sum(seg_weights[:completed_s])
+                intra_s = (played_mins % seg_mins) / seg_mins if completed_s < 6 else 1.0
+                if completed_s < 6:
+                    completed_w += seg_weights[completed_s] * intra_s
+                    remain_w = sum(seg_weights[completed_s:]) - seg_weights[completed_s] * intra_s
+                else:
+                    remain_w = 0.0
+                if completed_w > 0 and remain_w > 0:
+                    weighted_expected = (current_total / completed_w) * remain_w
+                else:
+                    weighted_expected = linear_expected
+                # 足球后段衰减：余量薄+后半段时进一步压缩预期
+                margin_over = total_line - current_total
+                if played_mins > 50 and margin_over <= 1.0 and remain_mins > 0:
+                    late_factor = 0.7 if played_mins < 60 else (0.5 if played_mins < 75 else 0.3)
+                    decayed_expected = pace * remain_mins * late_factor
+                    # 取加权模型和衰减模型的较小值（更保守）
+                    weighted_expected = min(weighted_expected, decayed_expected)
+
+            # 使用加权预期产出（而非线性）做速率判定
+            expected_output = weighted_expected
             pace_factor = float(RISK.get("over_pace_factor", 1.2))
             if expected_output < needed * pace_factor:
                 logger.info(
@@ -791,6 +1011,32 @@ class StrategyEngine:
                 mid, sport_l, total_line, current_total, played_mins,
                 round(total_line - current_total, 2) if total_line is not None else None,
             )
+
+        # ══════════════════════════════════════════════════════════
+        # D1b：under 已进球接近度检查
+        #   实盘教训：黑镇斯巴达 6-2 (8球) under 被打穿
+        #   当已进球数接近盘口线（差 ≤ 1.5 球）时，1 次得分即破盘，
+        #   提高 under 门槛 0.05，过滤高风险近线场景。
+        # ══════════════════════════════════════════════════════════
+        if prediction == "under" and total_line is not None:
+            proximity_threshold = 1.5
+            margin_to_line = total_line - current_total
+            if margin_to_line <= proximity_threshold:
+                proximity_bump = 0.05
+                if conf_f < required_conf + proximity_bump:
+                    logger.info(
+                        "[D1b/under接近度] ❌ 拒绝 match=%s | %s 已进球%d 线%.2f 余量%.2f≤%.1f 门槛+%.2f→%.2f 实际%.2f",
+                        mid, sport_l, current_total, total_line, margin_to_line,
+                        proximity_threshold, proximity_bump, required_conf + proximity_bump, conf_f,
+                    )
+                    return self._reject(
+                        match_info, analysis,
+                        f"{sport_l} under近线风险（已{current_total}球，线{total_line:.2f}，余量仅{margin_to_line:.2f}球，一击破盘）",
+                    )
+                logger.info(
+                    "[D1b/under接近度] ⚠️ 近线但置信度达标 match=%s | 已%d球 线%.2f 余量%.2f conf=%.2f≥%.2f",
+                    mid, current_total, total_line, margin_to_line, conf_f, required_conf + proximity_bump,
+                )
 
         # ══════════════════════════════════════════════════════════
         # 阶段E：赔率有效性（区间检查 + 来源回显）

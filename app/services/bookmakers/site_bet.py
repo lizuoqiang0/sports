@@ -452,7 +452,7 @@ async def place_site_bet(
                 policy_dynamic, policy_cap, policy_balance = stake, stake, Decimal("0")
             # 页面读取到的余额优先于请求时的缓存余额。
             available_balance = bal_before if bal_before > 0 else policy_balance
-            ui_ok, ui_detail, actual_stake = await _ui_place_pinnacle_total(
+            ui_ok, ui_detail, actual_stake, bet_ref = await _ui_place_pinnacle_total(
                 page,
                 home=home,
                 away=away,
@@ -465,7 +465,7 @@ async def place_site_bet(
                 stake_cap=policy_cap,
                 available_balance=available_balance if available_balance > 0 else None,
             )
-            logger.info("pinnacle ui place ok=%s detail=%s bt=%s", ui_ok, ui_detail, bt)
+            logger.info("pinnacle ui place ok=%s detail=%s bet_ref=%s bt=%s", ui_ok, ui_detail, bet_ref, bt)
             # 赔率变动策略拒绝：直接返回可读原因（≥1.7 接受 / <1.7 放弃）
             if (not ui_ok) and ui_detail and "odds_change_reject" in str(ui_detail):
                 reason = str(ui_detail).split("|", 1)[-1] if "|" in str(ui_detail) else str(ui_detail)
@@ -544,10 +544,12 @@ async def place_site_bet(
                 and bal_after <= bal_before - (effective_stake * Decimal("0.5"))
             )
             if debited:
+                # 优先使用从确认弹窗中提取到的真实订单号
+                ext_id = bet_ref if bet_ref else f"{code}:ui:{selection}:{home or 'x'}"
                 return PlaceBetResult(
                     ok=True,
-                    message=f"{name} 下单成功（余额 {bal_before}→{bal_after}）",
-                    external_bet_id=f"{code}:ui:{selection}:{home or 'x'}",
+                    message=f"{name} 下单成功（余额 {bal_before}→{bal_after}{'·订单号' if bet_ref else '·余额确认'}）",
+                    external_bet_id=ext_id,
                     balance_after=bal_after,
                     actual_stake=effective_stake,
                 )

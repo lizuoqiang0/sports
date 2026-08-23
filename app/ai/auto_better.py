@@ -92,9 +92,9 @@ _SKIP_COOLDOWN_SEC = max(
     60, int(getattr(settings, "AI_SKIP_COOLDOWN_SEC", 300) or 300)
 )
 
-# 同一场比赛最多投注次数（跨站点择优，允许 2 次）
+# 同一场比赛最多投注次数（P2优化：2→1，防止同场重复下注双输）
 MAX_BETS_PER_FIXTURE = max(
-    1, int(getattr(settings, "AI_MAX_BETS_PER_FIXTURE", 2) or 2)
+    1, int(getattr(settings, "AI_MAX_BETS_PER_FIXTURE", 1) or 1)
 )
 
 
@@ -293,21 +293,30 @@ class AIBettingEngine:
             groups = group_matches_by_fixture([_C(c) for c in candidates])
             fixture_groups = [[int(m.id) for m in g] for g in groups]
 
-            # skip 冷却过滤：冷却中的同场分组跳过 LLM 调用（省 token 省时延）。
-            # 冷却键用分组内最小 match_id（同场多站 id 稳定映射到同一场）。
+            # skip 冷却：仅对赛前比赛（无比分）生效，滚球比赛每轮都重新分析
+            # 滚球比分/盘口变化快，旧 skip 结果不再有效；赛前数据稳定可冷却
             now_ts = asyncio.get_event_loop().time()
             if self._skip_cooldown:
-                # 顺手清理过期项，防 dict 无界增长
+                # 清理过期项
                 self._skip_cooldown = {
                     k: ts for k, ts in self._skip_cooldown.items()
                     if now_ts - ts < _SKIP_COOLDOWN_SEC
                 }
             cooled_out = 0
             active_groups: list[list[int]] = []
+            # 构建 match_id → 是否有比分 的映射
+            live_match_ids = {
+                c["id"] for c in candidates
+                if c.get("home_score") is not None or c.get("away_score") is not None
+            }
             for g in fixture_groups:
                 key = str(min(g))
                 ts = self._skip_cooldown.get(key)
                 if ts is not None and now_ts - ts < _SKIP_COOLDOWN_SEC:
+                    # 滚球比赛（有比分）不应用冷却：比分/盘口可能已变化
+                    if any(mid in live_match_ids for mid in g):
+                        active_groups.append(g)
+                        continue
                     cooled_out += 1
                     continue
                 active_groups.append(g)
@@ -362,6 +371,16 @@ class AIBettingEngine:
         async def _analyze_and_place(ids: list[int]) -> Optional[dict]:
             """单个同场分组：分析 → 策略闸门 → 立即下单（流式）。"""
             async with sem:
+                # 流式分析中定期续期引擎锁（禁用缓存后 120 场全调 LLM，单轮可能 >15 分钟）
+                try:
+                    from app.core.cache import cache as _cache
+                    _token = getattr(self, "_engine_lock_token", "")
+                    if _token:
+                        await _cache.extend_lock_if_owned(
+                            f"ai:engine:lock:{self.user_id}", _token, ttl_sec=_ENGINE_LOCK_TTL
+                        )
+                except Exception:
+                    pass
                 # 1. LLM 分析
                 try:
                     recs = await analyze_fixture_group(ids, uid, strat_override=strat_cfg)
@@ -863,6 +882,8 @@ class AIBettingEngine:
                 "odds": {"markets": markets_odds, "line_movements": odds_pack.get("line_movements") or {}, **odds},
                 "site_code": site,
                 "total_line": total_line,
+                "home_score": getattr(m, "home_score", None),
+                "away_score": getattr(m, "away_score", None),
             })
 
         # 扫描上限按「同场」计；保持刚开赛优先顺序取组
