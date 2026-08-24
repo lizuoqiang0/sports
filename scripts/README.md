@@ -1,5 +1,16 @@
 # Scripts
 
+## 一键部署
+
+- `quick.sh`: **一键部署脚本**，集成语法检查→镜像构建→容器重建→缓存清理→健康检查。
+  - `bash scripts/quick.sh` — 完整部署
+  - `bash scripts/quick.sh --no-build` — 跳过构建，仅重建容器
+  - `bash scripts/quick.sh --with-ai` — 同时启动 AI 引擎
+  - `bash scripts/quick.sh --logs` — 部署后跟踪日志
+  - `bash scripts/quick.sh --status` — 查看状态
+  - `bash scripts/quick.sh --stop` — 停止所有服务
+  - `bash scripts/quick.sh --restart` — 重启容器（不重建镜像）
+
 ## 生产与运维
 
 - `prod_up.sh`: 本机 GUI 生产栈启动，可选 `--build`、`--with-ai`。

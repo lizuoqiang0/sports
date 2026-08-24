@@ -1,0 +1,525 @@
+# OB Sports 投注平台 — 技术文档
+
+> **版本**：v2.1.0  
+> **更新日期**：2026-08-24  
+> **技术栈**：FastAPI + React + PostgreSQL + Redis + Playwright  
+
+---
+
+## 一、项目概述
+
+OB Sports 是一个**体育赔率监控与 AI 自动投注平台**，支持 OB 体育和平博（Pinnacle）双站滚球赛事的实时盘口监控、AI 分析和自动/手动下单。
+
+### 核心能力
+
+| 能力 | 说明 |
+|------|------|
+| 双站盘口监控 | OB 体育 + 平博（Pinnacle）实时滚球赔率，通过 Browser Gate 长连接 Chromium 采集 |
+| AI 智能分析 | GPT 模型分析全场大小球（under/over），结合赛前上下文（交锋/近况/积分/伤停） |
+| 跨站比价择优 | 同一场比赛在 OB 和平博各有一条记录，自动选择赔率最优站点下单 |
+| 同场投注控制 | 同一场比赛最多投注 2 次（`MAX_BETS_PER_FIXTURE=2`，可配置） |
+| 别名自动生效 | 队名匹配失败时自动沉淀候选别名并写入正式别名，无需人工确认 |
+| 双模式切换 | 人工模式（只出推荐，手动下单）/ 自动模式（命中后自动下单） |
+| 严格风控 | 止损/止盈、日注数限制、赔率区间过滤、中国赛事过滤、虚拟盘过滤 |
+
+---
+
+## 二、系统架构
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    宿主机 (Mac/GUI)                       │
+│  ┌──────────────┐    ┌──────────────────────────────┐   │
+│  │ Browser Gate │    │       Docker Compose          │   │
+│  │ (可见Chromium)│    │  ┌────────┐  ┌────────────┐  │   │
+│  │ :9277        │◄──►│  │Backend │  │  Frontend  │  │   │
+│  │ OB + 平博     │    │  │:8000   │  │  :3000     │  │   │
+│  └──────────────┘    │  └───┬────┘  └────────────┘  │   │
+│                      │      │                         │   │
+│                      │  ┌───▼──┐  ┌──────────────┐   │   │
+│                      │  │Redis │  │  PostgreSQL  │   │   │
+│                      │  │:6379 │  │   :5432      │   │   │
+│                      │  └──────┘  └──────────────┘   │   │
+│                      │  ┌────────┐                    │   │
+│                      │  │AI Engine│ (可选, --with-ai)  │   │
+│                      │  └────────┘                    │   │
+│                      └──────────────────────────────┘   │
+└─────────────────────────────────────────────────────────┘
+```
+
+### Docker 服务
+
+| 服务 | 镜像 | 端口 | 说明 |
+|------|------|------|------|
+| postgres | postgres:16-alpine | 5432 | 数据库，max_connections=200 |
+| redis | redis:7-alpine | 6379 | 缓存 + Pub/Sub + 限流 |
+| backend | ob-sports-betting-backend | 8000 | FastAPI，多 worker + uvloop |
+| frontend | ob-sports-betting-frontend | 3000 | Nginx 静态资源 |
+| ai-engine | ob-sports-betting-backend | — | AI 引擎守护进程（可选） |
+
+---
+
+## 三、后端架构
+
+### 3.1 目录结构
+
+```
+app/
+├── main.py              # FastAPI 入口
+├── config.py            # 全局配置（pydantic-settings）
+├── database.py          # 异步 SQLAlchemy 引擎
+├── ai/                  # AI 分析与投注引擎（9 个文件）
+├── api/                 # API 路由（8 个模块）
+├── core/                # 基础设施（缓存/加密/安全/WebSocket/类型转换工具）
+├── models/user.py       # ORM 数据模型（8 张表）
+├── schemas/__init__.py  # Pydantic 请求/响应 Schema
+└── services/            # 业务服务层
+    ├── bookmakers/      # 博彩站点连接器（28 个文件）
+    │   └── plugins/     # OB + Pinnacle 插件
+    └── *.py             # 独立服务（16 个文件）
+```
+
+### 3.2 AI 模块 (`app/ai/`)
+
+| 文件 | 职责 |
+|------|------|
+| `analyzer.py` | GPT 赛事分析：调用 LLM 分析全场大小球(under/over)，输出预测方向+置信度+理由 |
+| `strategy.py` | 策略引擎：`StrategyConfig` 参数模型，五阶段闸门链（A信号→B结构→C市场→D滚球→E赔率），under/over 独立闸门参数，动态仓位计算 |
+| `strategy_gates.py` | 策略门禁：人工/自动共用，最低仓位、仓位上限、站点最低注额协调 |
+| `auto_better.py` | 自动投注主调度器：扫描滚球 → LLM 分析 → 策略评估 → 自动下单 |
+| `bet_executor.py` | 统一下单执行器：跨站比价、provider 四级 fallback、未连接站自动切换、下单重试 |
+| `market_recommend.py` | 盘口推荐：OB/平博单边模式，生成全场大小球推荐 |
+| `analysis_filters.py` | 分析候选过滤：超盘口/即将结束/赔率区间过滤 |
+| `match_context.py` | 赛前上下文采集：交锋/近况/积分/伤停，DB缓存→捷报爬虫→空结构 |
+| `recs_job.py` | 后台预分析任务：赛事页滚球预分析，结果存 Redis |
+
+### 3.3 投注执行链路
+
+```
+AIBettingEngine._run_cycle()
+  │
+  ├─ _scan_candidates()
+  │   ├─ 查 LIVE 赛事（足球/篮球）
+  │   ├─ 过滤：已下注/虚拟/中国赛事/排除球队/未连接站
+  │   ├─ group_matches_by_fixture() ← OB+平博同场分组
+  │   └─ load_all_market_odds_pack() ← 并行加载赔率
+  │
+  ├─ analyze_fixture_group() ← 同组只跑一次 LLM
+  │   └─ pick_canonical_match() ← 选代表场（优先 OB）
+  │
+  ├─ analyze_and_recommend()
+  │   ├─ fetch_match_context() ← 赛前上下文
+  │   ├─ analyzer.analyze_match() ← GPT 分析
+  │   └─ build_match_market_recommendations() ← 跨站比价
+  │
+  ├─ evaluate_bet() ← 策略闸门（风控/止损止盈/共识门禁）
+  │
+  └─ _execute_bet() → bet_executor.execute_bet()
+      ├─ get_best_market_pack() ← 跨站比价选最优站点
+      ├─ provider_code 四级 fallback
+      ├─ 未连接站自动切换
+      ├─ connector.place_bet() ← 真实下单
+      └─ Bet/Transaction 落库 + WS 通知
+```
+
+### 3.4 同场投注控制
+
+| 层级 | 机制 | 说明 |
+|------|------|------|
+| 轮次内 | `placed_fixture_counts` dict | match_id → 已下注次数，≥ MAX_BETS_PER_FIXTURE 跳过 |
+| 跨轮次 | `_match_bet_count()` | DB 今日注单 + sibling 注单 + Redis pending 三重计数 |
+| 执行层 | `_execute_bet` sibling 检查 | 同场 SUCCESS 注单计数 ≥ 上限则拦截 |
+
+- `MAX_BETS_PER_FIXTURE = 2`（默认 2 次/场，可通过 `AI_MAX_BETS_PER_FIXTURE` 配置）
+- `sibling_match_ids` 包含自身，计数递增只走 sib 循环，避免双重计数
+
+### 3.5 别名自动生效
+
+```
+匹配失败（best_score ≥ 阈值）
+  ↓
+_record_alias_candidate()
+  ├─ 写入候选别名到 Redis
+  ├─ _build_alias_override_record() ← 构建正式别名
+  ├─ 写入正式别名到 Redis
+  ├─ _invalidate_alias_override_cache() ← 清空内存缓存
+  ├─ logger.info("alias auto-approved & effective")
+  └─ _emit_alias_audit_log("auto_approve")
+  ↓
+下一轮匹配（≤60s TTL）
+  ├─ _get_runtime_alias_index() ← 从 Redis 加载正式别名
+  ├─ _team_alias_variants() ← 扩展队名变体
+  └─ 匹配成功
+```
+
+### 3.6 API 路由
+
+| 前缀 | 模块 | 主要端点 |
+|------|------|----------|
+| `/api/v1/auth` | auth.py | 注册/登录/刷新Token |
+| `/api/v1/matches` | matches.py | 赛事列表/详情/搜索 |
+| `/api/v1/matches/{id}/odds` | odds.py | 赔率查询 + WS 实时订阅 |
+| `/api/v1/bets` | bets.py | 下单/撤单/历史 |
+| `/api/v1/ai` | ai_bets.py | AI 配置/启停/推荐/一键投注 |
+| `/api/v1/admin` | admin.py | 数据源开关/预取控制/别名管理 API |
+| `/api/v1/monitoring` | monitoring.py | 监控概览/投注模式 |
+
+### 3.7 数据模型
+
+| 模型 | 表名 | 关键字段 |
+|------|------|----------|
+| User | users | balance, ai_enabled, bet_mode(manual/active), role |
+| AIConfig | ai_configs | max_bet_amount, max_daily_bets, stop_loss, take_profit, min/max_odds |
+| Match | matches | sport, home_team, away_team, external_id(ob:/pinnacle:), extra_data.ids |
+| Odds | odds | bet_type, odds_data(JSON), provider, valid_from/to(版本化) |
+| Bet | bets | selection, odds, stake, status, is_ai_bet, provider, external_bet_id |
+| BookmakerAccount | bookmaker_accounts | code(ob/pinnacle), session_token_encrypted, balance, status |
+| MatchContextRow | match_contexts | fixture_key, payload(JSON), quality |
+| Transaction | transactions | type(bet_place/ai_bet), amount, balance_after |
+
+### 3.8 跨站同场匹配
+
+| 函数 | 位置 | 说明 |
+|------|------|------|
+| `fixture_key()` | fixture_key.py | 稳定键：球类 + 规范化队名（字典序）+ 6h 时间桶 |
+| `same_fixture()` | fixture_key.py | 队名相似度 ≥0.72 + 开球时间差 ≤6h |
+| `group_matches_by_fixture()` | fixture_key.py | 贪心聚类：OB + 平博同场合并 |
+| `sibling_match_ids()` | fixture_key.py | 查同场其他 Match.id（含自身） |
+| `pick_canonical_match()` | fixture_key.py | 选分析代表场：优先 OB > 平博 |
+
+---
+
+## 四、前端架构
+
+### 4.1 技术栈
+
+- React 18 + Vite + Tailwind CSS
+- 蓝白商务风主题（slate 色系 + blue 品牌色）
+- 浅色侧边栏（白底 + 蓝字）
+- lucide-react 图标库
+
+### 4.2 页面
+
+| 路由 | 文件 | 说明 |
+|------|------|------|
+| `/login` | Login.jsx | 登录/注册 |
+| `/` | Dashboard.jsx | 工作台概览 |
+| `/matches` | Matches.jsx | 赛事列表 |
+| `/matches/:id` | MatchDetail.jsx | 赛事详情 + 跨站比价 |
+| `/portfolio` | Portfolio.jsx | 投注记录 |
+| `/ai` | AIPanel.jsx | AI 投注面板 |
+| `/bookmakers` | Bookmakers.jsx | 站点管理 |
+| `/logs` | Logs.jsx | AI 日志 |
+
+### 4.3 主题配置
+
+| 文件 | 说明 |
+|------|------|
+| `tailwind.config.js` | brand 色板（蓝色 9 阶）、ink 色板（slate 10 阶）、语义色 |
+| `src/index.css` | CSS 变量 + 组件类（.card/.btn-*/.input/.badge-*）+ App shell + Login |
+| `src/main.jsx` | Toaster 全局样式 |
+
+---
+
+## 五、配置项
+
+### 5.1 核心配置 (`app/config.py`)
+
+```python
+# AI 分析
+AI_MIN_CONFIDENCE = 0.47        # 下单最低置信度
+AI_MIN_ODDS = 1.65              # 下单最低赔率
+AI_MAX_ODDS = 5.00              # 下单最高赔率
+AI_SCAN_INTERVAL_SEC = 120      # 引擎扫描间隔
+AI_ANALYZE_CONCURRENCY = 8      # GPT 分析并发
+AI_SKIP_COOLDOWN_SEC = 300      # 同场 skip 冷却
+AI_ENABLE_OVER = True           # 大球 over 开关
+AI_MAX_BETS_PER_FIXTURE = 2     # 同场最多投注次数
+
+# 风控
+AI_STOP_LOSS = 500.0            # 日止损
+AI_TAKE_PROFIT = 1000.0         # 日止盈
+AI_STRATEGY_MAX_BET_AMOUNT = 100.0  # 单笔最大金额
+AI_STRATEGY_MAX_DAILY_BETS = 10     # 每日注数
+
+# 下单
+BET_RETRY_COUNT = 2             # 下单重试次数
+BET_RETRY_DELAY = 3.0           # 重试间隔（秒）
+MIN_BET_AMOUNT = 100.0          # 站点最低注额
+
+# 数据保留
+DATA_RETENTION_HOURS = 24       # 自动清理超期数据
+
+# 时区（今日投注统计使用 UTC+8 本地午夜）
+# config.py 提供 today_start_utc() / month_start_utc() 工具函数
+```
+
+### 5.2 环境变量 (`.env`)
+
+从 `.env.example` 复制，关键项：
+
+| 变量 | 说明 |
+|------|------|
+| `SECRET_KEY` | JWT 密钥（启动时校验弱密钥） |
+| `GPT_API_KEY` | GPT API Key |
+| `GPT_BASE_URL` | GPT API 地址 |
+| `GPT_MODEL` | 模型名称 |
+| `BOOKMAKER_BROWSER_GATE_URL` | Browser Gate 地址 |
+| `DEFAULT_BET_MODE` | 默认下单模式（manual/active） |
+| `CORS_ORIGINS` | 跨域白名单 |
+| `POSTGRES_PASSWORD` | 数据库密码 |
+
+---
+
+## 六、部署
+
+### 6.1 一键部署
+
+```bash
+# 完整部署（语法检查 → 镜像构建 → 容器重建 → 缓存清理 → 健康检查）
+bash scripts/quick.sh
+
+# 跳过构建，仅强制重建容器
+bash scripts/quick.sh --no-build
+
+# 同时启动 AI 引擎
+bash scripts/quick.sh --with-ai
+
+# 部署后跟踪日志
+bash scripts/quick.sh --logs
+
+# 查看状态
+bash scripts/quick.sh --status
+
+# 停止所有服务
+bash scripts/quick.sh --stop
+
+# 重启（不重建镜像）
+bash scripts/quick.sh --restart
+```
+
+### 6.2 完整启动（首次部署）
+
+```bash
+# 首次启动（构建镜像 + 启动 Browser Gate + 启动容器）
+bash scripts/prod_up.sh --build --with-ai
+
+# 日常启动（有镜像秒级 up）
+bash scripts/prod_up.sh
+
+# 停止
+bash scripts/prod_down.sh
+
+# 停止 + 清空数据
+bash scripts/prod_down.sh --wipe
+```
+
+### 6.3 Browser Gate
+
+在宿主机运行可见 Chromium，后端经 `host.docker.internal:9277` 调用：
+
+```bash
+# 自动启动（prod_up.sh 内置）
+bash scripts/ensure_browser_gate.sh watch
+
+# 手动管理
+bash scripts/ensure_browser_gate.sh start
+bash scripts/ensure_browser_gate.sh status
+bash scripts/ensure_browser_gate.sh stop
+```
+
+### 6.3 数据库迁移
+
+```bash
+# 容器启动时自动执行
+docker exec ob-backend alembic upgrade head
+
+# 手动执行
+docker exec ob-backend alembic upgrade head
+docker exec ob-backend alembic revision --autogenerate -m "描述"
+```
+
+---
+
+## 七、测试
+
+### 7.1 测试文件
+
+| 文件 | 测试内容 | 用例数 |
+|------|----------|--------|
+| `test_gate_strategy.py` | 闸门策略全阶段（A0-E2 + 仓位 + 流程） | 125 |
+| `test_gate_strategy_supplement.py` | 闸门策略补充（篮球全链路/A5/D1衰减/bucket_factor/risk_score） | 38 |
+| `test_strategy.py` | 策略引擎基础（B1/B2/B3/E1/风险评分/SPORT_RISK参数） | 30 |
+| `test_strategy_gates.py` | 策略门禁（球队排除/球类偏好/仓位截断/日风控） | 15 |
+| `test_p7_p9_reverse_risk.py` | P7/P9 高置信度反向风险封顶 | 20 |
+| `test_stake_protection.py` | 仓位保护（小样本连败/站点降仓/min_stake） | 15 |
+| `test_bet_flow_simulation.py` | 下单全流程模拟 | 21 |
+| `test_fixture_bet_limit.py` | 同场投注次数上限去重 | 16 |
+| `test_alias_backend_active.py` | 别名自动生效全链路 | 20 |
+| `test_bet_executor.py` | 下单执行器（跨站比价/provider fallback/切站/重试） | 16 |
+| `test_analysis_filters.py` | 分析过滤（中国赛事/黑名单/排序） | 10 |
+| `test_analyzer.py` | GPT 分析引擎（时钟解析/信号/缓存/重试） | 10 |
+| `test_odds_parsing.py` | 赔率解析（OB/平博半场大小球） | 16 |
+| `test_venue_recovery.py` | 平博页面状态恢复 | 15 |
+| `test_integration.py` | 集成测试（全链路/竞态/热更新/半场） | 16 |
+| `test_over_gates.py` | 大小球双闸门链（under/over 互不参与） | 12 |
+| `test_one_click_bet.py` | 一键投注端到端 | 12 |
+| `test_handicap_exclusion.py` | 让球盘排除 + 赔率匹配 | 60+ |
+
+### 7.2 运行测试
+
+```bash
+# 运行全部 pytest 测试（313 个）
+python3 -m pytest tests/ai/ -v --tb=short
+
+# 运行特定测试文件
+python3 -m pytest tests/ai/test_gate_strategy.py -v
+
+# 运行闸门策略全量测试（主+补充）
+python3 -m pytest tests/ai/test_gate_strategy.py tests/ai/test_gate_strategy_supplement.py -v
+
+# 运行独立脚本测试
+python3 tests/ai/test_over_gates.py
+python3 tests/ai/test_bet_flow_simulation.py
+```
+
+---
+
+## 八、监控与日志
+
+### 8.1 日志
+
+| 位置 | 说明 |
+|------|------|
+| `./logs/app.log` | 后端应用日志 |
+| `/tmp/browser_gate.log` | Browser Gate 日志 |
+| `docker logs ob-backend` | 容器 stdout |
+| `docker logs ob-ai-engine` | AI 引擎日志 |
+
+### 8.2 关键日志关键词
+
+| 关键词 | 含义 |
+|--------|------|
+| `alias auto-approved & effective` | 别名自动写入正式别名 |
+| `runtime alias index loaded` | 运行时别名索引加载 |
+| `runtime alias expanded` | 别名扩展了队名变体 |
+| `同场注单已达上限` | 同场投注次数达上限被拦截 |
+| `[下单] 站点切换` | 未连接站自动切换 |
+| `[AI主循环]` | 引擎主循环日志 |
+
+### 8.3 WebSocket
+
+前端通过 WS 实时接收：赔率更新、比分更新、AI 引擎状态、投注结果通知。多 worker 通过 Redis Pub/Sub 跨 worker 扇出。
+
+---
+
+## 九、安全
+
+| 机制 | 说明 |
+|------|------|
+| JWT 鉴权 | HS256 + bcrypt(12 rounds)，Access 30min / Refresh 7d |
+| 凭据加密 | Fernet 对称加密存储博彩站点密码/会话 Token |
+| 弱密钥拦截 | 启动时检测默认 SECRET_KEY 并拒绝启动 |
+| 速率限制 | 登录接口限流 |
+| TrustedHost | 中间件校验 AllowedHosts |
+| 实盘门禁 | 禁止演示 URL 和模拟执行 |
+| 中国赛事过滤 | 不分析、不展示、不下注 |
+| 虚拟盘过滤 | EAFC/NBA2K 等虚拟赛事一律排除 |
+
+---
+
+## 十、运维指南
+
+### 10.1 运维脚本一览
+
+| 脚本 | 用途 |
+|------|------|
+| `scripts/quick.sh` | **一键部署**：语法检查→构建→重建→清缓存→健康检查 |
+| `scripts/prod_up.sh` | 完整启动（首次部署/Browser Gate 管理） |
+| `scripts/prod_down.sh` | 停止服务（`--wipe` 清数据） |
+| `scripts/deploy.sh` | 部署新代码（构建+重启+清缓存，与 quick.sh 类似） |
+| `scripts/deploy_prod.sh` | 生产刷新（重建+Browser Gate） |
+| `scripts/ensure_browser_gate.sh` | Browser Gate 启动/守护/停止 |
+| `scripts/clean_prod_env.sh` | 清空业务数据（保留账号） |
+
+### 10.2 日常运维操作
+
+```bash
+# 查看容器状态
+bash scripts/quick.sh --status
+
+# 部署新代码（改了 Python 文件后）
+bash scripts/quick.sh
+
+# 快速重启（不改代码，仅重启容器）
+bash scripts/quick.sh --restart
+
+# 停止所有服务
+bash scripts/quick.sh --stop
+
+# 跟踪后端日志
+docker logs ob-backend --tail 50 -f
+
+# 跟踪 AI 引擎日志
+docker logs ob-ai-engine --tail 50 -f
+
+# 进入后端容器调试
+docker exec -it ob-backend bash
+
+# 查看数据库
+docker exec ob-postgres psql -U ob_user -d ob_sports -c "SELECT * FROM bets ORDER BY id DESC LIMIT 10;"
+
+# 清空 Redis 缓存
+docker exec ob-redis redis-cli FLUSHALL
+
+# 执行数据库迁移
+docker exec ob-backend alembic upgrade head
+```
+
+### 10.3 常见问题排查
+
+| 症状 | 排查 |
+|------|------|
+| 持仓页"今日投注"显示 0 | 检查 `today_start_utc()` 是否使用 UTC+8 本地午夜；查看 `docker logs ob-backend` 中 portfolio 查询日志 |
+| AI 引擎循环重启 | `docker logs ob-ai-engine` 查看异常；通常是导入错误或配置缺失 |
+| 下单失败 | 检查 Browser Gate 健康 `curl http://127.0.0.1:9277/health`；查看 `docker logs ob-backend` 中 `[下单]` 日志 |
+| 赔率不更新 | 检查站点连接状态；`docker exec ob-redis redis-cli KEYS "odds:*"` 查看缓存 |
+| 数据库连接超时 | 检查 `docker compose ps` 中 postgres 状态；`docker exec ob-postgres pg_isready -U ob_user` |
+
+### 10.4 数据备份与恢复
+
+```bash
+# 备份数据库
+docker exec ob-postgres pg_dump -U ob_user ob_sports > backup_$(date +%Y%m%d).sql
+
+# 恢复
+cat backup_YYYYMMDD.sql | docker exec -i ob-postgres psql -U ob_user -d ob_sports
+
+# 备份 Redis
+docker exec ob-redis redis-cli SAVE
+cp data/redis/dump.rdb backup_redis_$(date +%Y%m%d).rdb
+```
+
+### 10.5 核心工具模块
+
+| 模块 | 位置 | 说明 |
+|------|------|------|
+| `app/core/convert.py` | 公共类型转换 | `to_float` / `to_int` / `to_float_or_none`，消除全项目重复定义 |
+| `app/config.py` | 时区工具 | `today_start_utc()` / `month_start_utc()` / `LOCAL_TZ`（UTC+8） |
+| `app/ai/bet_executor.py` | 站点常量 | `SINGLE_SIDE_PROVIDER_NAMES` / `SINGLE_SIDE_PROVIDER_CODES` / `_notify` 唯一定义源 |
+
+### 10.6 闸门策略架构速查
+
+```
+StrategyEngine.evaluate_bet() 五阶段闸门链：
+
+  A 信号有效性    A0玩法白名单 → A1方向 → A2共识 → A3置信度(含P7/P9封顶/EV豁免) → A4篮球三重 → A5历史模式
+  B 结构性风控    B1盘线区间(under/over独立) → B1b余量接近度 → P1/P4/P5/P8/P10 → B2联赛黑名单 → B3高赔率 → B3b赔率一致性
+  C 市场一致性    C1 盘口变化方向 vs 预测方向
+  D 滚球余量      D1-under余量/D1-over速率(加权模型) → D1b已进球接近度
+  E 赔率有效性    E1区间 → E2 EV盈亏平衡
+
+  → 仓位计算: max_bet × conf_scale(under×1.10/over×0.8) × risk_factor × prov_factor × 余额锚定(25%) × 日亏递减
+```
+
+测试覆盖：`test_gate_strategy.py`（125 个）+ `test_gate_strategy_supplement.py`（38 个）= 163 个闸门策略测试。
