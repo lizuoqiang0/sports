@@ -35,7 +35,7 @@ async def _is_enabled() -> bool:
             return str(val) in ("1", "true", "True", "on")
     except Exception:
         pass
-    return bool(getattr(settings, "NOWSCORE_PREFETCH_ENABLED", True))
+    return bool(getattr(settings, "NOWSCORE_PREFETCH_ENABLED", False))
 
 
 async def _get_last_result() -> dict | None:

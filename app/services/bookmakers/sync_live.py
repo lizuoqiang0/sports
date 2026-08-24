@@ -107,10 +107,12 @@ async def sync_live_scores_odds(
     if only_account_id is not None:
         filters.append(BookmakerAccount.id == int(only_account_id))
 
-    result = await db.execute(select(BookmakerAccount).where(and_(*filters)))
-    accounts = [
-        a for a in result.scalars().all() if is_real_live_account(a.code, a.base_url or "")
-    ]
+    # 用独立短会话查询账户，避免请求级 DB 会话与后续写库会话死锁
+    async with AsyncSessionLocal() as qdb:
+        result = await qdb.execute(select(BookmakerAccount).where(and_(*filters)))
+        accounts = [
+            a for a in result.scalars().all() if is_real_live_account(a.code, a.base_url or "")
+        ]
     if not accounts:
         return {"updated": 0, "matches": 0, "message": "无已连接真站"}
 
@@ -129,7 +131,6 @@ async def sync_live_scores_odds(
     total_remote = 0
 
     jobs = [snapshot_account(acc) for acc in unique_accounts]
-    await release_db_session(db)
 
     for job in jobs:
         acc_id = job["id"]
@@ -249,7 +250,16 @@ async def sync_live_scores_odds(
 
                 acc.last_sync_at = now.replace(tzinfo=None) if getattr(now, "tzinfo", None) else now
                 acc.last_error = None
-                await wdb.commit()
+                try:
+                    await wdb.commit()
+                except Exception as commit_err:
+                    # 死锁/连接断开时重试一次
+                    logger.warning("live sync commit retry %s: %s", acc_code, commit_err)
+                    try:
+                        await wdb.rollback()
+                    except Exception:
+                        pass
+                    raise
         except Exception as e:
             err_txt = str(e)
             logger.exception("live sync failed %s", acc_code)

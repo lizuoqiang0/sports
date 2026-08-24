@@ -175,12 +175,9 @@ async def place_bet(
                         break
 
     # 查库用归一化后的小写值，避免客户端大小写不一致导致 PostgreSQL 查询落空。
-    # 校验通过但 PostgreSQL 区分大小写查询落空
-    from app.models.user import BetType as _BTEnum
-
     odds_query = select(Odds).where(
         Odds.match_id == req.match_id,
-        Odds.bet_type == _BTEnum(bt),
+        Odds.bet_type == BetType(bt),
         Odds.valid_to.is_(None),
     )
     if provider_label:

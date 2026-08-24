@@ -6,20 +6,12 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.core.cache import cache
+from app.core.convert import to_float as _to_float
 
 logger = logging.getLogger(__name__)
 
 _PNL_KEY = "pnl:baseline:{user_id}:{date}"
 _BALANCE_SNAPSHOT_KEY = "balance:snapshot:{user_id}"
-
-
-def _to_float(value: Any, default: float = 0.0) -> float:
-    try:
-        if value in (None, ""):
-            return default
-        return float(value)
-    except (TypeError, ValueError):
-        return default
 
 
 async def get_daily_pnl(user_id: int, current_total: float) -> dict:

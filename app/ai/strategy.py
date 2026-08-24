@@ -9,6 +9,8 @@ import logging
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Optional
 
+from app.core.convert import to_float as _as_float, to_int as _as_int
+
 from pydantic import BaseModel
 from app.config import settings
 
@@ -188,20 +190,6 @@ def ai_config_response_payload(ai_config: Any | None) -> dict[str, Any]:
             "stream_bet_mode": True,
         },
     }
-
-
-def _as_float(value: Any, default: Any = 0.0) -> Any:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _as_int(value: Any, default: int = 0) -> int:
-    try:
-        return int(float(value))
-    except (TypeError, ValueError):
-        return default
 
 
 async def load_fresh_strategy(user_id: int):
@@ -1196,10 +1184,18 @@ class StrategyEngine:
 
         def _bucket_factor(pb: dict, label: str) -> tuple[Decimal, str]:
             n_settled = int(pb.get("settled") or 0)
+            streak = int(pb.get("loss_streak") or 0)
             if n_settled < 8:
+                # 小样本连败保护：结算不足8注但连败≥4时降仓
+                # 避免极端连亏场景（如6注全输）风控失效
+                if streak >= 4:
+                    logger.info(
+                        "[仓位/小样本连败] %s n=%d<8 但连败%d → 降仓×0.5",
+                        label, n_settled, streak,
+                    )
+                    return Decimal("0.5"), f"{label}:小样本连败(n={n_settled} streak={streak})"
                 return Decimal("1.0"), f"{label}:样本不足(n={n_settled})"
             roi = pb.get("roi")
-            streak = int(pb.get("loss_streak") or 0)
             f = 1.0
             if isinstance(roi, (int, float)):
                 if roi <= -0.25:
@@ -1245,6 +1241,7 @@ class StrategyEngine:
         # 余额锚定：单笔仓位不超过可用余额的 25%（余额小时自动缩仓，
         # 避免推 90 元仓位但站点只剩 12 元、执行层静默丢弃）
         bal_f = float(user_balance or 0)
+        bal_cap = Decimal("0")
         if bal_f > 0:
             bal_cap = (Decimal(str(bal_f)) * Decimal("0.25")).quantize(
                 Decimal("0.01"), rounding=ROUND_HALF_UP
@@ -1261,8 +1258,11 @@ class StrategyEngine:
             )
 
         suggested_stake = min(suggested_stake, max_amt)
-        # min_stake 兜底不击穿余额锚定：余额低于锚定值时用余额与 min_stake 的较小者
-        if bal_cap > 0 and bal_cap < min_stake:
+        # min_stake 兜底：站点降仓触发时跳过（让保护生效）
+        # 执行层 bet_executor 会拒绝 < 1.0 的仓位，等效于跳过高风险单
+        if prov_factor < Decimal("1.0"):
+            pass  # 降仓保护生效，不强制 min_stake 兜底
+        elif bal_cap > 0 and bal_cap < min_stake:
             suggested_stake = max(Decimal("0"), bal_cap)
         else:
             suggested_stake = max(suggested_stake, min_stake)

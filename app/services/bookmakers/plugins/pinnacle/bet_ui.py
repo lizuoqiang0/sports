@@ -17,6 +17,28 @@ def _to_f(v) -> float:
         return -1.0
 
 
+def _build_line_aliases(line: float | None) -> list[str]:
+    """生成盘口线别名（与 click_js lineAliases 逻辑一致）。
+
+    四分线 3.75 → ["3.75", "3.5-4"]，平博页面显示 3.5-4。
+    """
+    if line is None:
+        return []
+    try:
+        n = float(line)
+    except (TypeError, ValueError):
+        return [str(line)]
+    if n <= 0:
+        return [str(line)]
+    lo = int(n)
+    frac = n - lo
+    if abs(frac - 0.25) < 1e-9:
+        return [str(n), f"{lo}-{lo + 0.5}"]
+    if abs(frac - 0.75) < 1e-9:
+        return [str(n), f"{lo + 0.5}-{lo + 1}"]
+    return [str(n)]
+
+
 async def ui_place_pinnacle_total(
     page,
     *,
@@ -147,7 +169,8 @@ async def ui_place_pinnacle_total(
 
     click_js = """(args) => {
               const { tokens, odds, sideWords, line, homeN, awayN, selDir } = args;
-              const norm = (s) => String(s || '').replace(/\\s+/g, '').toLowerCase();
+              // 清除空白 + U+200E/U+200F（平博 RTL 布局零宽标记），否则 indexOf/includes 失效
+              const norm = (s) => String(s || '').replace(/[\\s\\u200e\\u200f]/g, '').toLowerCase();
               const oddsTextOk = (t) => {
                 const n = Number(String(t || '').replace(/[^0-9.]/g, ''));
                 if (!n || n < 1.01 || n > 50) return false;
@@ -267,6 +290,11 @@ async def ui_place_pinnacle_total(
               // 行内须含目标盘口线，sideLoose 兜底才允许（防点到相邻盘口同方向的赔率）
               const rowTextN = row ? norm(row.innerText || '') : '';
               const rowHasLineTxt = !lineTxt || lineAliases.some((a) => rowTextN.includes(norm(a)));
+              // 让球线预检：行内含负号+小数（如 -0.5/-1.0）时，所有点击路径统一排除
+              // 要求小数位避免误同比分（2-1），增加 Unicode 减号/en-dash 覆盖
+              // lookbehind (?<!\d)：dash 前不能是数字，防止四分线 3.5-4 拼赔率 2.130
+              // 被误匹配为 -42.13（实盘 odds_not_found 根因）
+              const rowHasHandicap = /(?<!\d)[-－−–]\d+\.\d/.test(rowTextN);
               // side 精确判定：赔率格的「紧邻上下文」须含目标方向词。粗父容器同时含
               // 同一格内可能混有多个方向标签，需检查紧邻上下文。
               // 用相邻兄弟/文本左右字窗口判定，且要求不含反方向词。
@@ -279,6 +307,10 @@ async def ui_place_pinnacle_total(
               const isSpreadCtx = (ctx) => spreadWords.some((w) => String(ctx || '').toLowerCase().includes(w));
               const isTotalCtx = (ctx) => totalWords.some((w) => String(ctx || '').toLowerCase().includes(w));
               const sideNear = (el) => {
+                // txt 必须从 el 参数计算：for 循环中的 const txt 是块作用域，
+                // sideNear 定义在循环外无法访问 → parentTxt.indexOf(txt) 抛
+                // ReferenceError 被静默 catch，导致父容器方向词检查失效
+                const txt = String(el.innerText || el.textContent || '').trim();
                 let near = '';
                 try {
                   let sib = el.previousElementSibling;
@@ -311,7 +343,8 @@ async def ui_place_pinnacle_total(
               };
               for (const el of clickables) {
                 const txt = String(el.innerText || el.textContent || '').trim();
-                const pureNum = txt.replace(/\\s/g, '');
+                // 清除 U+200E/U+200F 零宽标记，否则纯赔率正则 ^\d.\d{2,3}$ 匹配失败
+                const pureNum = txt.replace(/[\\s\\u200e\\u200f]/g, '');
                 const isPureOdds = /^\\d{1,2}\\.\\d{2,3}$/.test(pureNum);
                 if (!oddsTextOk(txt) && !isPureOdds) continue;
                 // 纯赔率数字节点（叶子）优先：容器块（\\xa0/换行包裹）点了投注单不开。
@@ -340,12 +373,12 @@ async def ui_place_pinnacle_total(
                     const rowNotSpread2 = !isSpreadCtx(rowTxt2) || isTotalCtx(rowTxt2);
                     const isLeaf = !(el.children && el.children.length);
                     const leafBetter = !pureOdds || (pureOdds.children && pureOdds.children.length && isLeaf);
-                    if (hitSide && hitLine && leafBetter) { pureOdds = el; }
+                    if (hitSide && hitLine && leafBetter && !rowHasHandicap) { pureOdds = el; }
                     // 行级双命中兜底（嵌套布局兼容，排除让球盘）
-                    if (!pureOdds && hitSideRow && hitLineRow && rowNotSpread2 && leafBetter) { pureOdds = el; }
-                    // 漂移兜底：side 命中且线属于本场（行内含线）才收首个
-                    if (hitSide && rowHasLineTxt && !sideLoose) { sideLoose = el; }
-                    if (!sideLoose && hitSideRow && rowHasLineTxt && rowNotSpread2) { sideLoose = el; }
+                    if (!pureOdds && hitSideRow && hitLineRow && rowNotSpread2 && !rowHasHandicap && leafBetter) { pureOdds = el; }
+                    // 漂移兜底：side 命中且线属于本场（行内含线）且非让球盘才收首个
+                    if (hitSide && rowHasLineTxt && !rowHasHandicap && !sideLoose) { sideLoose = el; }
+                    if (!sideLoose && hitSideRow && rowHasLineTxt && rowNotSpread2 && !rowHasHandicap) { sideLoose = el; }
                   }
                 }
                 if (!oddsTextOk(txt)) continue;
@@ -387,14 +420,10 @@ async def ui_place_pinnacle_total(
                 }
                 // 大小球：方向与盘口线双命中才精确点击。
                 // 优先紧邻上下文双命中；未命中时尝试行级双命中（兼容嵌套布局）
-                if (hitSide && hitLine) { target = el; how = (how || 'odds') + '+side+line'; break; }
-                if (hitSideRow && hitLineRow && rowNotSpread) {
-                  // 额外校验：行内不能同时有让球线（特征：负号+数字，如 -0.5/-1.0）
-                  // 平博让球盘显示为主队线-客队线（如 0.5-0.5 或 -0.5/0.5），与大小球线（如 3.5）不同
-                  const hasHandicapLine = /[-－]\d|[-－]0\.5|[-－]1\.0|[-－]1\.5|[-－]2\.0/.test(rowTxt);
-                  if (!hasHandicapLine) {
-                    target = el; how = (how || 'odds') + '+siderow+linerow'; break;
-                  }
+                // 所有路径统一校验 rowHasHandicap：行内含让球线时禁止点击
+                if (hitSide && hitLine && !rowHasHandicap) { target = el; how = (how || 'odds') + '+side+line'; break; }
+                if (hitSideRow && hitLineRow && rowNotSpread && !rowHasHandicap) {
+                  target = el; how = (how || 'odds') + '+siderow+linerow'; break;
                 }
               }
               if (pureOdds) { target = pureOdds; how = (how || 'odds') + '+pure'; }
@@ -405,12 +434,12 @@ async def ui_place_pinnacle_total(
               // 平博中文布局中"大"字可能在独立 header 元素、不包含在行 innerText 里。
               // 此时收集行内所有匹配赔率值（±0.25）的节点，按位置推断方向：
               // over 赔率通常在 under 之前（左/上），取第一个为 over、第二个为 under。
-              if (!target && row && lineTxt && rowHasLineTxt) {
+              if (!target && row && lineTxt && rowHasLineTxt && !rowHasHandicap) {
                 const rowOddsEls = [];
                 for (const el of clickables) {
                   if (!row.contains(el)) continue;
                   const t2 = String(el.innerText || el.textContent || '').trim();
-                  const pn = t2.replace(/\\s/g, '');
+                  const pn = t2.replace(/[\\s\\u200e\\u200f]/g, '');
                   if (!/^\\d{1,2}\\.\\d{2,3}$/.test(pn)) continue;
                   const nv = Number(pn.replace(/[^0-9.]/g, ''));
                   if (nv && Math.abs(nv - Number(odds)) <= 0.25) {
@@ -418,34 +447,56 @@ async def ui_place_pinnacle_total(
                   }
                 }
                 if (rowOddsEls.length >= 1) {
-                  // 如果行内同时有"小"标签但无"大"标签，取不在"小"附近的赔率为 over
                   const rowN2 = norm(row.innerText || '');
                   const hasUnder = rowN2.includes('小');
                   const hasOver = rowN2.includes('大');
+                  // 查找离 fromIdx 最近的 ch 字符位置（同行多盘口时定位各自标签）
+                  const findNearest = (ch, fromIdx) => {
+                    let best = -1, bestDist = 1e9, sf = 0;
+                    while (true) {
+                      const idx = rowN2.indexOf(ch, sf);
+                      if (idx < 0) break;
+                      const d = Math.abs(fromIdx - idx);
+                      if (d < bestDist) { bestDist = d; best = idx; }
+                      sf = idx + 1;
+                    }
+                    return best;
+                  };
+                  // 平博 compact 布局：[线] [over赔率] 小 [under赔率]
+                  // 无"大"标签时 over 在"小"之前，under 在"小"之后
+                  // 同行多盘口（如 2.5-3 和 1.5）取离各自最近标签的前/后赔率，不跨盘口误选
+                  const pickByPos = (label, wantBefore) => {
+                    let bestEl = null, bestDist = 1e9;
+                    for (const oe of rowOddsEls) {
+                      const oeTxt = norm(String(oe.el.innerText || ''));
+                      const oeIdx = rowN2.indexOf(oeTxt);
+                      if (oeIdx < 0) continue;
+                      const labelIdx = findNearest(label, oeIdx);
+                      if (labelIdx < 0) continue;
+                      const isBefore = oeIdx < labelIdx;
+                      if (wantBefore === isBefore) {
+                        const dist = Math.abs(oeIdx - labelIdx);
+                        if (dist < bestDist) { bestDist = dist; bestEl = oe.el; }
+                      }
+                    }
+                    return bestEl;
+                  };
                   if (selDir === 'over' && !hasOver && hasUnder) {
-                    // 找不到"大"标签 → 取离"小"最远的赔率格作为 over
-                    let bestEl = null;
-                    let bestDist = -1;
-                    for (const oe of rowOddsEls) {
-                      const oeTxt = norm(String(oe.el.innerText || ''));
-                      const underIdx = rowN2.indexOf('小');
-                      const oeIdx = rowN2.indexOf(oeTxt);
-                      const dist = (underIdx >= 0 && oeIdx >= 0) ? Math.abs(oeIdx - underIdx) : 999;
-                      if (dist > bestDist) { bestDist = dist; bestEl = oe.el; }
-                    }
-                    if (bestEl) { target = bestEl; how = (how || 'odds') + '+noSideLabelOver'; }
+                    // 无"大"标签 → over 赔率在"小"之前，取最近的一个
+                    const el = pickByPos('小', true);
+                    if (el) { target = el; how = (how || 'odds') + '+noSideLabelOver'; }
                   } else if (selDir === 'under' && !hasUnder && hasOver) {
-                    // 找不到"小"标签 → 取离"大"最远的赔率格作为 under
-                    let bestEl = null;
-                    let bestDist = -1;
-                    for (const oe of rowOddsEls) {
-                      const oeTxt = norm(String(oe.el.innerText || ''));
-                      const overIdx = rowN2.indexOf('大');
-                      const oeIdx = rowN2.indexOf(oeTxt);
-                      const dist = (overIdx >= 0 && oeIdx >= 0) ? Math.abs(oeIdx - overIdx) : 999;
-                      if (dist > bestDist) { bestDist = dist; bestEl = oe.el; }
-                    }
-                    if (bestEl) { target = bestEl; how = (how || 'odds') + '+noSideLabelUnder'; }
+                    // 无"小"标签 → under 赔率在"大"之后，取最近的一个
+                    const el = pickByPos('大', false);
+                    if (el) { target = el; how = (how || 'odds') + '+noSideLabelUnder'; }
+                  } else if (selDir === 'over' && hasOver) {
+                    // 有"大"但 sideNear 失败 → over 在"大"之后
+                    const el = pickByPos('大', false);
+                    if (el) { target = el; how = (how || 'odds') + '+nearDaOver'; }
+                  } else if (selDir === 'under' && hasUnder) {
+                    // 有"小"但 sideNear 失败 → under 在"小"之后
+                    const el = pickByPos('小', false);
+                    if (el) { target = el; how = (how || 'odds') + '+nearXiaoUnder'; }
                   } else if (rowOddsEls.length === 1) {
                     // 行内仅一个匹配赔率 → 直接点击（已通过行/线/赔率值三重校验）
                     target = rowOddsEls[0].el;
@@ -591,7 +642,8 @@ async def ui_place_pinnacle_total(
             try:
                 probe = """() => {
                   const t = ((document.body && document.body.innerText) || '');
-                  const scores = (t.match(/\\b\\d{1,2}-\\d{1,2}\\b/g) || []).length;
+                  // 比分格式：数字-数字（如 2-1），排除四分线拼赔率（如 3.5-42.130 中的 5-42）
+                  const scores = (t.match(/(?<![0-9.])\d{1,2}-\d{1,2}(?![0-9.])/g) || []).length;
                   const clocks = (t.match(/(?:^|\\s)(?:\\d{1,3}'|1H|2H|HT|Q[1-4]|P[1-4])(?:$|\\s)/gm) || []).length;
                   const odds = (t.match(/(?<![0-9])[1-9]\\.\\d{2,3}(?![0-9])/g) || []).length;
                   return scores + clocks + (odds >= 3 ? 10 : 0);
@@ -886,7 +938,7 @@ async def ui_place_pinnacle_total(
                 # 用 JS 精确定位：在含队名的行内，找含方向词+盘口线且不含让球标签的赔率格
                 locator_js = """(args) => {
                   const { odds, sideWords, lineTxt, lineAliases, homeN, awayN } = args;
-                  const norm = (s) => String(s || '').replace(/\\s+/g, '').toLowerCase();
+                  const norm = (s) => String(s || '').replace(/[\\s\\u200e\\u200f]/g, '').toLowerCase();
                   const spreadWords = ['让球', '让分', 'spread', 'handicap', '盘口', '亚盘'];
                   const totalWords = ['大小', '总分', 'over/under', 'over-under', 'o/u', 'totals'];
                   const isSpreadCtx = (ctx) => spreadWords.some((w) => String(ctx || '').toLowerCase().includes(w));
@@ -912,6 +964,9 @@ async def ui_place_pinnacle_total(
                       }
                       // 排除让球盘（含让球标签但不含大小标签）
                       if (isSpreadCtx(raw) && !isTotalCtx(raw)) continue;
+                      // 排除含让球线数字的行（-0.5/-1.0 等），与 click_js rowHasHandicap 正则一致
+                      // lookbehind (?<!\d)：防止四分线 3.5-4 拼赔率 2.130 被误匹配为 -42.13
+                      if (/(?<!\d)[-－−–]\d+\.\d/.test(t)) continue;
                       // 找到目标行：在行内找赔率格点击
                       const clickables = Array.from(el.querySelectorAll('button, a, span, div, td, label'));
                       for (const cl of clickables) {
@@ -928,7 +983,7 @@ async def ui_place_pinnacle_total(
                     "odds": float(odds),
                     "sideWords": side_words,
                     "lineTxt": str(line) if line is not None else "",
-                    "lineAliases": (lambda n: [str(n)] if n else [])(line),
+                    "lineAliases": _build_line_aliases(line),
                     "homeN": (home or "").strip(),
                     "awayN": (away or "").strip(),
                 }

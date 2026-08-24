@@ -13,16 +13,31 @@ from app.models.user import Match, MatchStatus, SportType
 logger = logging.getLogger(__name__)
 
 def _norm_team(name: str) -> str:
-    """队名规范化，便于跨站同场合并（去空白/双向标记/常见后缀）。"""
+    """队名规范化，便于跨站同场合并（去空白/双向标记/常见后缀/繁简转换）。"""
     import re
 
     s = (name or "").strip().lower()
     s = s.replace("\u200e", "").replace("\u200f", "").replace("\xa0", " ")
     s = re.sub(r"\s+", "", s)
+    # 繁体→简体转换（覆盖体育队名常见繁体字）
+    s = _trad_to_simp(s)
     # 去括号内容：(女) -> 空（后续用 suffix 统一处理）
     s = re.sub(r"[\(（][^\)）]*[\)）]", "", s)
+    # 去掉开头的乱码前缀（非中文非拉丁字符，如"的群"）
+    s = re.sub(r"^[^\u4e00-\u9fffa-z0-9]+", "", s)
+    # 如果中文后跟拉丁文（如"乌利亚尼克Dragovoljac"），取较长的部分
+    cjk_match = re.search(r"[\u4e00-\u9fff]", s)
+    lat_match = re.search(r"[a-z]", s)
+    if cjk_match and lat_match:
+        cjk_start = cjk_match.start()
+        lat_start = lat_match.start()
+        if cjk_start < lat_start:
+            # CJK 在前，Latin 在后 → 取 CJK 部分
+            cjk_part = re.match(r"[\u4e00-\u9fff]+", s[cjk_start:])
+            if cjk_part and len(cjk_part.group()) >= 2:
+                s = cjk_part.group()
     # 统一女足/男足/青年后缀 -> 去掉（两队可能一个带"女足"一个带"(女)"）
-    for suf in ("女足", "男足", "青年", "后备", "预备队", "二队"):
+    for suf in ("女足", "男足", "青年", "后备", "预备队", "二队", "学院", "学苑", "竞技"):
         if s.endswith(suf) and len(s) > len(suf) + 1:
             s = s[: -len(suf)]
     # B队/2队/3队 等编号后缀：B队→去掉，2队→去掉
@@ -46,6 +61,26 @@ def _norm_team(name: str) -> str:
             s = s[len(pref) :]
             break
     return s
+
+
+# 繁体→简体映射表（覆盖体育队名常见繁体字，仅单字符）
+_TRAD_SIMP_TABLE = str.maketrans({
+    "紮": "扎", "隊": "队", "場": "场", "蘭": "兰", "國": "国", "東": "东",
+    "達": "达", "維": "维", "爾": "尔", "華": "华",
+    "倫": "伦", "聯": "联", "賽": "赛", "員": "员", "軍": "军",
+    "運": "运", "動": "动", "學": "学", "樂": "乐",
+    "羅": "罗", "馬": "马", "茲": "兹",
+    "聖": "圣", "納": "纳",
+    "邁": "迈", "頓": "顿", "紐": "纽", "約": "约",
+    "薩": "萨", "熱": "热", "內": "内", "盧": "卢",
+    "亞": "亚", "韋": "韦", "傑": "杰", "萊": "莱", "麥": "麦",
+    "喬": "乔", "魯": "鲁", "賓": "宾", "孫": "孙",
+})
+
+
+def _trad_to_simp(s: str) -> str:
+    """繁体→简体转换（简单查表，覆盖常见体育队名用字）。"""
+    return s.translate(_TRAD_SIMP_TABLE)
 
 
 _UI_JUNK_TEAM_RE = None
@@ -134,13 +169,28 @@ def _team_similarity(a: str, b: str) -> float:
             ov = len(common) / min(len(cx), len(cy))
             if ov >= 0.4:
                 ratio = max(ratio, 0.55)
+    # 同长度中文名仅差1字：译名差异（如"普希特"vs"普西特"、"乌鲁巴"vs"奥鲁巴"）
+    if len(x) == len(y) and len(x) >= 3:
+        diff_count = sum(1 for ca, cb in zip(x, y) if ca != cb)
+        if diff_count == 1:
+            ratio = max(ratio, 0.80)
+    # 尾部共享≥2字（后缀译名差异："塞斯韦特"vs"雷迪塞瓦特"→尾"韦特/瓦特"近似不精确，但尾2字"特"共享时仍给分）
+    if len(x) >= 3 and len(y) >= 3 and x != y and x[-1] == y[-1]:
+        tail_shared = 0
+        for i in range(1, min(len(x), len(y)) + 1):
+            if x[-i] == y[-i]:
+                tail_shared += 1
+            else:
+                break
+        if tail_shared >= 2:
+            ratio = max(ratio, 0.68)
     return ratio
 
 
 def _pair_similarity(home_a: str, away_a: str, home_b: str, away_b: str) -> float:
     """同场两边队名相似度；允许主客对调。
 
-    要求两队各自相似度 >= 0.55，防止单队完美匹配但另一队完全不同时误判。
+    要求两队各自相似度 >= 0.50，防止单队完美匹配但另一队完全不同时误判。
     """
     sa1 = _team_similarity(home_a, home_b)
     sa2 = _team_similarity(away_a, away_b)
@@ -159,7 +209,7 @@ def _pair_similarity(home_a: str, away_a: str, home_b: str, away_b: str) -> floa
         lo = min(sb1, sb2)
     if lo < 0.35:
         best = best * 0.72
-    elif lo < 0.55:
+    elif lo < 0.50:
         best = best * 0.90
     return best
 

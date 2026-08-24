@@ -103,8 +103,8 @@ async def pinnacle_page_is_blank(page) -> bool:
     )
 
 
-async def recover_pinnacle_blank_page(page, *, attempts: int = 3) -> bool:
-    """白屏时重载并复检；本轮失败后保留旧盘口，下轮继续恢复。"""
+async def recover_pinnacle_blank_page(page, *, attempts: int = 3, venue_url: str = "") -> bool:
+    """白屏时重载并复检；reload 失败则 goto 直达场馆 URL 兜底。"""
     if not await pinnacle_page_is_blank(page):
         return True
 
@@ -121,6 +121,14 @@ async def recover_pinnacle_blank_page(page, *, attempts: int = 3) -> bool:
             await page.wait_for_timeout(2500)
         except Exception as e:
             logger.warning("pinnacle blank page reload failed attempt=%s: %s", attempt, e)
+            # reload 失败（ERR_ABORTED/frame detached）→ goto 兜底
+            if venue_url:
+                try:
+                    logger.info("pinnacle blank page goto fallback url=%s", venue_url[:120])
+                    await page.goto(venue_url, wait_until="domcontentloaded", timeout=45000)
+                    await page.wait_for_timeout(3000)
+                except Exception as e2:
+                    logger.warning("pinnacle blank page goto also failed: %s", e2)
         if not await pinnacle_page_is_blank(page):
             logger.info("pinnacle blank page recovered attempt=%s", attempt)
             return True

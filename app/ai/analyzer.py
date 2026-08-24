@@ -14,6 +14,8 @@ import time
 from datetime import datetime, timezone
 from typing import Optional, Any
 
+from app.core.convert import to_float as _to_float
+
 from openai import AsyncOpenAI
 
 from app.config import settings
@@ -140,13 +142,6 @@ def _line_for_pick(market_odds: Optional[dict], match_info: Optional[dict], bet_
     if bet_type == "spread":
         return info.get("spread_line") or info.get("handicap_line")
     return None
-
-
-def _to_float(value: Any, default: float = 0.0) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
 
 
 def _recent_matches(bucket: Optional[dict], limit: int = 6) -> list[dict]:
@@ -1028,7 +1023,7 @@ class MatchAnalyzer:
     async def _build_historical_feedback(self, match_info: dict) -> str:
         """构建历史胜率反馈文本，注入 GPT system prompt。
 
-        从 recent_betting_stats 获取近7天按方向/运动/置信度的实际胜率，
+        从 recent_betting_stats 获取近7天按方向/运动/置信度/盘口线区间的实际胜率，
         让 GPT 知道自己哪些预测区间准确、哪些偏差大，从而自我校正。
         """
         try:
@@ -1044,8 +1039,19 @@ class MatchAnalyzer:
                 parts.append(f"## 历史表现反馈（近7天 {settled} 注结算）")
                 parts.append(f"整体胜率: {wr*100:.1f}%")
 
-            # 按方向
+            # 按运动+方向交叉统计（足球/篮球 under/over 胜率差异大）
+            by_sport = stats.get("by_sport") or {}
             by_sel = stats.get("by_selection") or {}
+            sport_l = str(match_info.get("sport") or "football").lower()
+            # 当前运动的统计
+            cur_sport_stats = by_sport.get(sport_l) or {}
+            cur_n = cur_sport_stats.get("settled", 0)
+            if cur_n >= 3:
+                cur_wr = cur_sport_stats.get("win_rate")
+                if isinstance(cur_wr, (int, float)):
+                    parts.append(f"当前运动({sport_l}): {cur_n}注 胜率{cur_wr*100:.1f}%")
+
+            # 按方向
             for sel in ("under", "over"):
                 sd = by_sel.get(sel) or {}
                 n = sd.get("settled", 0)
@@ -1073,6 +1079,40 @@ class MatchAnalyzer:
                             conf_warnings.append(f"{sel_key} conf {bucket}: {bn}注 胜率仅{bwr*100:.0f}%")
                 if conf_warnings:
                     parts.append("⚠️ 低胜率置信区间: " + "; ".join(conf_warnings))
+
+            # 按盘口线区间高频亏损模式（结构: {sport_selection: {range: {settled, won, lost, win_rate}}}）
+            by_line = stats.get("by_line_range") or {}
+            if by_line:
+                line_warnings: list[str] = []
+                for lr_key, lr_store in by_line.items():
+                    if not isinstance(lr_store, dict):
+                        continue
+                    for lr_range, ld in lr_store.items():
+                        if not isinstance(ld, dict):
+                            continue
+                        ln = ld.get("settled", 0) or (ld.get("won", 0) + ld.get("lost", 0))
+                        if ln < 3:
+                            continue
+                        lwr = ld.get("win_rate")
+                        if isinstance(lwr, (int, float)) and lwr < 0.40:
+                            line_warnings.append(f"{lr_key} 线{lr_range}: {ln}注 胜率{lwr*100:.0f}%")
+                if line_warnings:
+                    parts.append("⚠️ 高频亏损盘口区间: " + "; ".join(line_warnings[:4]))
+
+            # 按方向连败序列（by_provider → by_selection 含 loss_streak）
+            streak_warnings: list[str] = []
+            by_prov = stats.get("by_provider") or {}
+            for prov, pd in by_prov.items():
+                if not isinstance(pd, dict):
+                    continue
+                for sel, sd in (pd.get("by_selection") or {}).items():
+                    if not isinstance(sd, dict):
+                        continue
+                    streak = int(sd.get("loss_streak") or 0)
+                    if streak >= 3:
+                        streak_warnings.append(f"{prov} {sel} 连败{streak}注")
+            if streak_warnings:
+                parts.append("⚠️ 当前连败: " + "; ".join(streak_warnings))
 
             if len(parts) <= 1:
                 return ""

@@ -34,7 +34,6 @@ from app.ai.strategy import (
     effective_strategy_from_ai_config,
     load_fresh_strategy,
 )
-from app.core.websocket import manager
 from app.services.bet_mode import get_user_bet_mode, is_active_mode
 from app.services.bookmakers.china_match import is_china_match
 from app.services.bookmakers.plugins.ob.odds import is_virtual_match
@@ -42,9 +41,8 @@ from app.config import settings, today_start_utc
 
 logger = logging.getLogger(__name__)
 
-# 单边模式可下注站点：平博 + OB
-SINGLE_SIDE_PROVIDER_NAMES = frozenset({"平博", "OB体育"})
-SINGLE_SIDE_PROVIDER_CODES = frozenset({"pinnacle", "ob"})
+# 单边模式可下注站点：平博 + OB（定义在 bet_executor，此处引用避免重复）
+from app.ai.bet_executor import SINGLE_SIDE_PROVIDER_NAMES, SINGLE_SIDE_PROVIDER_CODES
 
 
 async def connected_provider_names(db: AsyncSession, user_id: int) -> set[str]:
@@ -53,14 +51,11 @@ async def connected_provider_names(db: AsyncSession, user_id: int) -> set[str]:
     分析/扫描阶段的赔率只从已连接站点加载 —— 未连接站的赔率若参与分析，
     AI 会选中它（decision.provider=ob），执行层只能失败或被动切站。
     """
-    from sqlalchemy import select as _sa_select
-
-    from app.models.user import BookmakerAccount, BookmakerStatus
     from app.services.bookmakers.catalog import provider_name
     from app.services.bookmakers.registry import is_real_live_account
 
     res = await db.execute(
-        _sa_select(BookmakerAccount).where(
+        select(BookmakerAccount).where(
             BookmakerAccount.user_id == int(user_id),
             BookmakerAccount.enabled.is_(True),
             BookmakerAccount.status == BookmakerStatus.CONNECTED,
@@ -1130,12 +1125,9 @@ class AIBettingEngine:
         return total
 
     async def _notify(self, user_id: int, event_type: str, data: dict):
-        """推送通知"""
-        await manager.broadcast_to_user(user_id, {
-            "type": f"ai_{event_type}",
-            "data": data,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        })
+        """推送通知（委托给 bet_executor._notify 统一实现）"""
+        from app.ai.bet_executor import _notify as _broadcast
+        await _broadcast(user_id, event_type, data)
 
 
 # === 单场即时分析 API ===

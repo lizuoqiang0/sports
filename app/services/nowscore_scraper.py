@@ -1083,7 +1083,7 @@ async def _find_schedule_id(
         if score > best_score:
             best_sid = sid
             best_score = score
-    if best_sid is not None and best_score >= 0.74:
+    if best_sid is not None and best_score >= 0.65:
         logger.info(
             "nowscore: pair matched %s vs %s -> sid=%s score=%.3f",
             home,

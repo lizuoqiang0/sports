@@ -9,6 +9,7 @@ import httpx
 from sqlalchemy import select
 
 from app.core.cache import cache
+from app.core.convert import to_float as _to_float
 from app.core.crypto import decrypt_secret
 from app.database import AsyncSessionLocal
 from app.models.user import AIConfig, Bet, BetStatus, BetType, BookmakerAccount, BookmakerStatus, Match, Transaction, TransactionType, User
@@ -43,13 +44,6 @@ def _bet_type_of(value) -> BetType:
     if raw == BetType.SPREAD.value:
         return BetType.SPREAD
     return BetType.TOTAL
-
-
-def _to_float(value, default: float = 0.0) -> float:
-    try:
-        return float(value)
-    except Exception:
-        return default
 
 
 def _to_decimal(value, default: str = "0") -> Decimal:

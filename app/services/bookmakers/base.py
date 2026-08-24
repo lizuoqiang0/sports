@@ -22,6 +22,7 @@ class PlaceBetResult:
     message: str = ""
     external_bet_id: Optional[str] = None
     balance_after: Decimal = Decimal("0")
+    actual_stake: Decimal = Decimal("0")
 
 
 @dataclass
