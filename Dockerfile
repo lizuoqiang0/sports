@@ -33,7 +33,6 @@ COPY app ./app
 COPY alembic ./alembic
 COPY alembic.ini ./alembic.ini
 COPY scripts ./scripts
-COPY __init__.py ./__init__.py
 
 RUN mkdir -p /app/logs \
     && chmod +x /app/scripts/docker_entrypoint_backend.sh

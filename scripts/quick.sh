@@ -119,7 +119,7 @@ syntax_check() {
 build_images() {
   step "重建 Docker 镜像"
   if [[ "$FORCE_BUILD" == "1" ]]; then
-    docker compose build --no-cache backend 2>&1 | tail -3
+    docker compose build --no-cache backend 2>&1 | grep -E '(DONE|Built|ERROR)' || true
     ok "镜像构建完成"
   else
     info "跳过构建（--no-build）"
