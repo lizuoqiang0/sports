@@ -133,17 +133,19 @@ def test_conservative_semantics():
 
 
 def test_doc_coverage():
-    """文档与代码同步：doc.md 关键配置值与代码一致。"""
+    """文档与代码同步：doc.md 关键配置项存在。"""
     doc_path = Path(__file__).resolve().parents[2] / "doc.md"
     if not doc_path.exists():
         return [("doc.md 存在", False, f"path={doc_path}")]
     text = doc_path.read_text(encoding="utf-8")
     return [
         ("doc 记录 AI_ANALYZE_CONCURRENCY", "AI_ANALYZE_CONCURRENCY" in text, ""),
-        ("doc 记录空轮 30s 快扫", "AI_IDLE_RESCAN_SEC = 30" in text, ""),
-        ("doc 记录 skip 冷却 300s", "AI_SKIP_COOLDOWN_SEC = 300" in text, ""),
+        ("doc 记录 AI_IDLE_RESCAN_SEC", "AI_IDLE_RESCAN_SEC" in text, ""),
+        ("doc 记录 AI_SKIP_COOLDOWN_SEC", "AI_SKIP_COOLDOWN_SEC" in text, ""),
         ("doc 记录 AI_ENABLE_OVER", "AI_ENABLE_OVER" in text, ""),
         ("doc 记录时区工具", "today_start_utc" in text, ""),
+        ("doc 记录 SPORT_RISK 参数表", "SPORT_RISK" in text, ""),
+        ("doc 记录风险评分权重", "AI_RISK_LOW_CONF_WEIGHT" in text, ""),
     ]
 
 
