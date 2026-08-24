@@ -226,36 +226,94 @@ _record_alias_candidate()
 ### 5.1 核心配置 (`app/config.py`)
 
 ```python
-# AI 分析
-AI_MIN_CONFIDENCE = 0.47        # 下单最低置信度
-AI_MIN_ODDS = 1.65              # 下单最低赔率
-AI_MAX_ODDS = 5.00              # 下单最高赔率
-AI_SCAN_INTERVAL_SEC = 120      # 引擎扫描间隔
-AI_IDLE_RESCAN_SEC = 30         # 空轮快扫间隔（无候选时）
-AI_ANALYZE_CONCURRENCY = 8      # GPT 分析并发
-AI_SKIP_COOLDOWN_SEC = 300      # 同场 skip 冷却
-AI_ENABLE_OVER = True           # 大球 over 开关
-AI_MAX_BETS_PER_FIXTURE = 2     # 同场最多投注次数
+# === GPT API ===
+GPT_API_KEY: Optional[str] = None
+GPT_BASE_URL: str = "https://xfastapi.ai/v1"
+GPT_MODEL: str = "gpt-5.6-terra"
+GPT_TIMEOUT_SEC: float = 45.0          # 单次 GPT 分析总超时
+LLM_CLIENT_TIMEOUT_SEC: float = 50.0   # OpenAI 客户端超时（须 ≥ GPT_TIMEOUT_SEC）
+LLM_MAX_TOKENS: int = 3072             # GPT 最大输出 tokens
+LLM_DEFAULT_CONFIDENCE: float = 0.33   # GPT 未返回置信度时的默认值
+LLM_TEMPERATURE: float = 0.35          # GPT 温度（0.2太低导致模板化，0.35平衡）
+LLM_CACHE_TTL: int = 600               # 10分钟正缓存
+AI_SKIP_CACHE_TTL: int = 180           # GPT 判 skip 的负缓存
+LLM_NEG_CACHE_TTL: int = 150            # 无共识结果负缓存
 
-# 风控
-AI_STOP_LOSS = 500.0            # 日止损
-AI_TAKE_PROFIT = 1000.0         # 日止盈
-AI_STRATEGY_MAX_BET_AMOUNT = 100.0  # 单笔最大金额
-AI_STRATEGY_MAX_DAILY_BETS = 10     # 每日注数
+# === AI 分析 ===
+AI_MIN_CONFIDENCE: float = 0.47        # 下单最低置信度（含纯盘口模式）
+AI_MIN_ODDS: float = 1.65              # 下单最低赔率
+AI_MAX_ODDS: float = 5.00              # 下单最高赔率
+LIVE_ODDS_MAX_AGE_SEC: int = 90        # 滚球下单允许的赔率最大年龄
+AI_SCAN_INTERVAL_SEC: int = 120        # 引擎扫描间隔（有候选时）
+AI_IDLE_RESCAN_SEC: int = 30           # 空轮快扫间隔（无候选时）
+AI_RECS_LIMIT: int = 80                # 推荐页分析上限
+AI_LIVE_SCAN_LIMIT: int = 120          # 自动引擎扫描上限
+AI_ANALYZE_CONCURRENCY: int = 8        # GPT 分析并发数
+AI_SKIP_COOLDOWN_SEC: int = 300        # 同场 LLM skip 冷却
+AI_ENABLE_OVER: bool = True            # 大球 over 下单开关（over 与 under 对等参与闸门评估）
 
-# 下单
-BET_RETRY_COUNT = 2             # 下单重试次数
-BET_RETRY_DELAY = 3.0           # 重试间隔（秒）
-MIN_BET_AMOUNT = 100.0          # 站点最低注额
+# === 赛前上下文 ===
+AI_MATCH_CONTEXT_ENABLED: bool = True
+AI_MATCH_CONTEXT_IN_BATCH: bool = True
+AI_MATCH_CONTEXT_TTL_SEC: int = 21600   # 6h
+AI_CONTEXT_NONE_TTL: int = 900           # source=none 时短缓存 TTL
 
-# 数据保留
-DATA_RETENTION_HOURS = 24       # 自动清理超期数据
+# === 风控 ===
+AI_STOP_LOSS: float = 500.0             # 日止损绝对金额
+AI_TAKE_PROFIT: float = 1000.0          # 日止盈绝对金额
+AI_STRATEGY_MAX_BET_AMOUNT: float = 100.0  # 策略单笔最大金额
+AI_STRATEGY_MAX_DAILY_BETS: int = 10       # 策略每日注数
+AI_MIN_BALANCE: float = 10.0            # 最低可用余额阈值
+AI_RETRY_SLEEP_SEC: int = 60            # 引擎异常后重试休眠
 
-# 时区（今日投注统计使用 UTC+8 本地午夜）
+# === 下单 ===
+BET_RETRY_COUNT: int = 2                # 下单失败重试次数
+BET_RETRY_DELAY: float = 3.0            # 重试间隔（秒）
+MIN_BET_AMOUNT: float = 100.0           # 站点最低注额
+MAX_BET_AMOUNT: float = 100000.0        # 站点最高注额
+MAX_DAILY_BETS: int = 50                # 每日投注上限（手动）
+AI_DEFAULT_STAKE: float = 100.0         # 默认下注金额
+
+# === 风险评分权重 ===
+AI_RISK_LOW_CONF_WEIGHT: float = 0.4    # 低置信度风险权重
+AI_RISK_HIGH_ODDS_THRESHOLD: float = 5.0
+AI_RISK_HIGH_ODDS_PENALTY: float = 0.3
+AI_RISK_MID_ODDS_THRESHOLD: float = 3.0
+AI_RISK_MID_ODDS_PENALTY: float = 0.15
+AI_RISK_ACTIVE_PENALTY: float = 0.02    # 每笔持仓风险系数
+AI_RISK_ACTIVE_CAP: float = 0.1         # 持仓风险上限
+
+# === 数据 ===
+DATA_RETENTION_HOURS: int = 24          # 自动清理超期数据
+
+# === 时区（今日投注统计使用 UTC+8 本地午夜）===
 # config.py 提供 today_start_utc() / month_start_utc() 工具函数
 ```
 
-### 5.2 环境变量 (`.env`)
+> **注意**：`docker-compose.yml` 中的环境变量会覆盖上述默认值。生产环境的实际运行值以 `.env` 和 compose 环境变量为准。
+
+### 5.2 闸门风控参数 (`SPORT_RISK` in `app/ai/strategy.py`)
+
+under/over 双向独立闸门参数，足球和篮球各自一套：
+
+| 参数 | 足球 under | 篮球 under | 足球 over | 篮球 over |
+|------|-----------|-----------|----------|----------|
+| min_conf | 0.65 | 0.65 | 0.65 | 0.65 |
+| min_conf_no_fund | 0.68 | 0.68 | 0.68 | 0.68 |
+| min_line | 2.0 | 130.0 | 2.5 | 140.0 |
+| max_line | 5.0 | 205.0 | 4.5 | 165.0 |
+| min_played_mins | 20.0 | 14.0 | 20.0 | 14.0 |
+| late_block_mins | 90.0 | 44.0 | 85.0 | 40.0 |
+| margin_min_mins | 20.0 | 14.0 | — | — |
+| margin_full_mins | 90.0 | 48.0 | — | — |
+| margin_avg_goals | 2.55 | None | — | — |
+| margin_factor | 1.05 | 1.20 | — | — |
+| late_margin_floor | 0.5 | 4.0 | — | — |
+| ev_conf_edge | 0.0 | 0.04 | max(0,0.02) | max(0.04,0.02) |
+| over_pace_factor | — | — | 1.05 | 1.05 |
+| over_min_remaining_goals | — | — | 3.5 | 80.0 |
+
+### 5.3 环境变量 (`.env`)
 
 从 `.env.example` 复制，关键项：
 
