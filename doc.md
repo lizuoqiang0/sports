@@ -312,11 +312,8 @@ bash scripts/quick.sh --pull
 # 停止所有服务（含 Browser Gate）
 bash scripts/quick.sh --stop
 
-# 或使用专用脚本
-bash scripts/prod_down.sh
-
-# 停止 + 清空数据
-bash scripts/prod_down.sh --wipe
+# 停止 + 清空持久化数据（危险）
+bash scripts/quick.sh --stop --wipe
 ```
 
 ### 6.3 Browser Gate
@@ -495,8 +492,7 @@ python3 tests/ai/test_bet_flow_simulation.py
 
 | 脚本 | 用途 |
 |------|------|
-| `scripts/quick.sh` | **唯一部署入口**：`--init` 首次部署，无参数日常部署，`--status/--stop/--restart` 运维 |
-| `scripts/prod_down.sh` | 停止服务（`--wipe` 清数据） |
+| `scripts/quick.sh` | **唯一部署/运维入口**：`--init` 首次部署，无参数日常部署，`--status/--stop/--stop --wipe/--restart` 运维 |
 | `scripts/ensure_browser_gate.sh` | Browser Gate 启动/守护/停止 |
 | `scripts/clean_prod_env.sh` | 清空业务数据（保留账号） |
 

@@ -10,7 +10,8 @@
 #   bash scripts/quick.sh --logs        # 部署后跟踪日志
 #   bash scripts/quick.sh --status      # 仅查看状态
 #   bash scripts/quick.sh --stop        # 停止所有服务（含 Browser Gate）
-#   bash scripts/quick.sh --restart     # 重启容器（不重建镜像）
+#   bash scripts/quick.sh --stop --wipe # 停止 + 清空持久化数据
+#   bash scripts/quick.sh --restart     # 重启（不重建镜像）
 #   bash scripts/quick.sh --pull        # 仅预拉基础镜像
 #   bash scripts/quick.sh -h            # 帮助
 # ============================================================
@@ -37,6 +38,7 @@ WITH_AI=0
 SHOW_LOGS=0
 INIT_MODE=0
 PULL_ONLY=0
+WIPE_DATA=0
 
 for arg in "$@"; do
   case "$arg" in
@@ -46,6 +48,7 @@ for arg in "$@"; do
     --logs)      SHOW_LOGS=1 ;;
     --status)    ACTION="status" ;;
     --stop)      ACTION="stop" ;;
+    --wipe)      WIPE_DATA=1 ;;
     --restart)   ACTION="restart"; FORCE_BUILD=0 ;;
     --pull)      ACTION="pull" ;;
     -h|--help)
@@ -59,6 +62,7 @@ OB Sports 一键部署脚本
   bash scripts/quick.sh --logs         部署后跟踪后端日志
   bash scripts/quick.sh --status       查看容器状态
   bash scripts/quick.sh --stop         停止所有服务（含 Browser Gate）
+  bash scripts/quick.sh --stop --wipe  停止 + 清空持久化数据（危险）
   bash scripts/quick.sh --restart      重启容器（不重建镜像）
   bash scripts/quick.sh --pull         仅预拉基础镜像
 EOF
@@ -176,7 +180,16 @@ stop_all() {
   bash scripts/ensure_browser_gate.sh stop 2>/dev/null || true
   docker compose --profile ai down --remove-orphans 2>/dev/null \
     || docker compose down --remove-orphans
-  ok "已停止"
+  if [[ "$WIPE_DATA" == "1" ]]; then
+    echo -e "  ${RED}⚠️  正在删除持久化数据: $ROOT/data${NC}"
+    rm -rf data/postgres data/redis
+    mkdir -p data/postgres data/redis
+    chown -R 70:70 data/postgres 2>/dev/null || true
+    chown -R 999:999 data/redis 2>/dev/null || true
+    ok "已清空 data/postgres data/redis"
+  else
+    ok "已停止；数据保留在 ./data 与 ./logs"
+  fi
 }
 
 restart_containers() {

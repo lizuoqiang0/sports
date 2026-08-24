@@ -1,8 +1,8 @@
 # Scripts
 
-## 部署（quick.sh — 唯一入口）
+## 部署与运维（quick.sh — 唯一入口）
 
-- `quick.sh`: 集成首次部署、日常部署、状态查看、停止、重启为一体。
+- `quick.sh`: 集成首次部署、日常部署、状态查看、停止、重启、清数据为一体。
   - `bash scripts/quick.sh --init --with-ai` — 首次部署/全量启动（.env+数据目录+Browser Gate+frontend）
   - `bash scripts/quick.sh` — 日常部署（语法检查→构建→重建→清缓存→健康检查）
   - `bash scripts/quick.sh --no-build` — 跳过构建，仅重建容器
@@ -10,12 +10,12 @@
   - `bash scripts/quick.sh --logs` — 部署后跟踪日志
   - `bash scripts/quick.sh --status` — 查看状态
   - `bash scripts/quick.sh --stop` — 停止所有服务（含 Browser Gate）
+  - `bash scripts/quick.sh --stop --wipe` — 停止 + 清空持久化数据（危险）
   - `bash scripts/quick.sh --restart` — 重启容器（不重建镜像）
   - `bash scripts/quick.sh --pull` — 仅预拉基础镜像
 
 ## 运维
 
-- `prod_down.sh`: 停止容器和 Browser Gate；`--wipe` 会清除持久化数据。
 - `clean_prod_env.sh`: 清理线上业务数据，只保留指定账号。
 
 ## 运行时入口
@@ -26,4 +26,4 @@
 - `ensure_browser_gate.sh`: Browser Gate 的启动、守护、检查与停止。
 - `clean_env.py`: 由 `clean_prod_env.sh` 在后端容器内调用。
 
-已合并：`prod_up.sh` 合并到 `quick.sh --init`；`deploy.sh` 被 `quick.sh` 替代；`deploy_prod.sh` 安全检查合并到 `prod_up.sh` 后删除；`live_monitor.py` 被 `app/services/live_monitor.py` 替代。
+已合并：`prod_up.sh` → `quick.sh --init`；`prod_down.sh` → `quick.sh --stop [--wipe]`；`deploy.sh` 被 `quick.sh` 替代；`deploy_prod.sh` 安全检查合并后删除；`live_monitor.py` 被 `app/services/live_monitor.py` 替代。
