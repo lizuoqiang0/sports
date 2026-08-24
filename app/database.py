@@ -36,20 +36,40 @@ class Base(DeclarativeBase):
 
 
 async def get_db() -> AsyncSession:
-    """依赖注入：获取数据库会话"""
+    """依赖注入：获取数据库会话。
+
+    长时间操作（如 nowscore 爬取）期间，PostgreSQL 的
+    idle_in_transaction_session_timeout 可能关闭底层连接。
+    此处对 commit 失败做容错：连接已关闭时静默丢弃该会话，不中断请求。
+    """
     async with AsyncSessionLocal() as session:
         try:
             yield session
             # 路由可在长时间浏览器/AI 操作前自行提交并释放事务。
             # 此处仅提交仍在进行的事务，避免对已被连接池回收的连接重复 commit。
             if session.in_transaction():
-                await session.commit()
+                try:
+                    await session.commit()
+                except Exception as commit_exc:
+                    # 连接已被服务端关闭（idle_in_transaction_session_timeout 等），
+                    # 事务无法提交但不影响已完成的业务逻辑。
+                    logger.debug("get_db commit 容错（连接可能已关闭）: %s", commit_exc)
+                    try:
+                        await session.rollback()
+                    except Exception:
+                        pass  # 连接已关，rollback 也会失败
         except Exception:
-            if session.in_transaction():
-                await session.rollback()
+            try:
+                if session.in_transaction():
+                    await session.rollback()
+            except Exception:
+                pass  # 连接已关，rollback 失败也忽略
             raise
         finally:
-            await session.close()
+            try:
+                await session.close()
+            except Exception:
+                pass  # 连接已关，close 也可能失败
 
 
 async def init_db():
