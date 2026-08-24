@@ -14,7 +14,7 @@ from app.ai.strategy import (
     decision_passes_strategy,
     load_fresh_strategy,
 )
-from app.config import settings
+from app.config import settings, today_start_utc
 from app.models.user import Bet, BetStatus
 
 logger = logging.getLogger(__name__)
@@ -148,8 +148,7 @@ async def calc_daily_pnl(db: AsyncSession, user_id: int) -> Decimal:
 
 async def count_today_bets(db: AsyncSession, user_id: int) -> int:
     """今日 AI 相关注单笔数（与自动引擎一致）。"""
-    today = datetime.now(timezone.utc).date()
-    start = datetime.combine(today, datetime.min.time(), tzinfo=timezone.utc)
+    start = today_start_utc()
     res = await db.execute(
         select(func.count(Bet.id)).where(
             Bet.user_id == int(user_id),

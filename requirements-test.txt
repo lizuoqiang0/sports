@@ -1,0 +1,6 @@
+# 测试依赖（不在生产镜像中，仅本地/CI 使用）
+# 安装方式：pip install -r requirements-test.txt
+# 或：docker exec ob-backend pip install pytest pytest-asyncio
+
+pytest==8.3.3
+pytest-asyncio==0.24.0

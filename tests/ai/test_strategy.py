@@ -242,11 +242,11 @@ class TestSportRisk:
     def test_basketball_has_min_line(self):
         """篮球有 under_min_line。"""
         assert "under_min_line" in SPORT_RISK["basketball"]
-        assert SPORT_RISK["basketball"]["under_min_line"] == 120.0
+        assert SPORT_RISK["basketball"]["under_min_line"] == 130.0
 
     def test_basketball_has_max_line(self):
         """篮球有 under_max_line。"""
-        assert SPORT_RISK["basketball"]["under_max_line"] == 208.0
+        assert SPORT_RISK["basketball"]["under_max_line"] == 205.0
 
     def test_football_has_min_line(self):
         """足球有 under_min_line。"""
@@ -255,7 +255,7 @@ class TestSportRisk:
 
     def test_football_has_max_line(self):
         """足球有 under_max_line。"""
-        assert SPORT_RISK["football"]["under_max_line"] == 6.5
+        assert SPORT_RISK["football"]["under_max_line"] == 5.0
 
     def test_basketball_ev_edge(self):
         """篮球 EV edge = 0.04。"""

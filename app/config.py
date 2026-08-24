@@ -2,9 +2,36 @@
 OB Sports Betting - 核心配置
 """
 import json
+from datetime import datetime, timezone, timedelta
 from pydantic import field_validator
 from pydantic_settings import BaseSettings
 from typing import Any, Optional
+
+# 本地时区（UTC+8 上海），用于"今日"投注统计的起始时间计算
+LOCAL_TZ = timezone(timedelta(hours=8))
+
+
+def today_start_utc() -> datetime:
+    """返回本地时区当天 00:00 对应的 UTC 时间。
+
+    DB 中 created_at 以 UTC 存储（DateTimeUTC 去掉 tzinfo 存为 naive UTC），
+    因此查询"今日"注单时应以本地午夜对应的 UTC 时刻为起点。
+    """
+    now_local = datetime.now(LOCAL_TZ)
+    local_midnight = datetime.combine(
+        now_local.date(), datetime.min.time(), tzinfo=LOCAL_TZ
+    )
+    return local_midnight.astimezone(timezone.utc)
+
+
+def month_start_utc() -> datetime:
+    """返回本地时区当月 1 号 00:00 对应的 UTC 时间。"""
+    now_local = datetime.now(LOCAL_TZ)
+    month_first = now_local.date().replace(day=1)
+    local_month_start = datetime.combine(
+        month_first, datetime.min.time(), tzinfo=LOCAL_TZ
+    )
+    return local_month_start.astimezone(timezone.utc)
 
 
 def _parse_str_list(v: Any) -> Any:
@@ -74,9 +101,9 @@ class Settings(BaseSettings):
     # --- AI 分析配置 ---
     GPT_TIMEOUT_SEC: float = 45.0          # 单次 GPT 分析总超时（外层 wait_for）
     LLM_CLIENT_TIMEOUT_SEC: float = 50.0   # OpenAI 客户端超时（须 ≥ GPT_TIMEOUT_SEC）
-    LLM_MAX_TOKENS: int = 2048              # GPT 最大输出 tokens（确保 JSON 不被截断）
+    LLM_MAX_TOKENS: int = 3072              # GPT 最大输出 tokens（确保多维度JSON不被截断）
     LLM_DEFAULT_CONFIDENCE: float = 0.33    # GPT 未返回置信度时的默认值
-    LLM_TEMPERATURE: float = 0.2            # GPT 温度
+    LLM_TEMPERATURE: float = 0.35           # GPT 温度（0.2太低导致模板化，0.35平衡稳定与差异化）
     LLM_CACHE_TTL: int = 600               # 10分钟
     AI_SKIP_CACHE_TTL: int = 180           # GPT 判 skip 的负缓存（略超 120s 轮询间隔，跨轮生效）
     LLM_NEG_CACHE_TTL: int = 150           # 无共识结果负缓存（略超轮询间隔）
@@ -126,7 +153,7 @@ class Settings(BaseSettings):
     NOWSCORE_TITLE_CACHE_TTL: int = 1800    # 标题缓存 TTL（秒）
     NOWSCORE_TITLE_BATCH_SIZE: int = 20     # 并发获取标题每批数量
     # nowscore 当日全量预取（批量缓存所有比赛上下文，AI 分析时直接读 Redis）
-    NOWSCORE_PREFETCH_ENABLED: bool = False  # 预取开关（默认关闭）
+    NOWSCORE_PREFETCH_ENABLED: bool = True  # 预取开关（打开：AI 分析时读取 nowscore 基本面，提升置信度）
     NOWSCORE_PREFETCH_INTERVAL_SEC: int = 3600  # 预取间隔（秒，默认 1h）
     NOWSCORE_PREFETCH_CONCURRENCY: int = 10  # 预取并发数
     # 上下文缓存

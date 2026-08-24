@@ -22,7 +22,7 @@ from app.core.websocket import manager, WSEventType
 from app.schemas import (
     APIResponse, PlaceBetRequest, PlaceBetResponse,
 )
-from app.config import settings
+from app.config import settings, today_start_utc, month_start_utc
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/bets", tags=["投注"])
@@ -452,8 +452,7 @@ async def place_bet(
     try:
         # 抢锁后再检查每日限额和同场未结算单，避免跨 worker 并发穿透。
         async with AsyncSessionLocal() as cdb:
-            today = datetime.now(timezone.utc).date()
-            today_start = datetime.combine(today, datetime.min.time(), tzinfo=timezone.utc)
+            today_start = today_start_utc()
             daily_count_result = await cdb.execute(
                 select(func.count(Bet.id)).where(
                     Bet.user_id == user_id_val,
@@ -726,10 +725,8 @@ async def portfolio_summary(
     """持仓概览统计：仅统计本地下单成功记录。"""
     pending_items = await _load_pending_items_for_view(current_user.id, scene="持仓概览")
 
-    today = datetime.now(timezone.utc).date()
-    today_start = datetime.combine(today, datetime.min.time(), tzinfo=timezone.utc)
-    month_start = today.replace(day=1)
-    month_start_dt = datetime.combine(month_start, datetime.min.time(), tzinfo=timezone.utc)
+    today_start = today_start_utc()
+    month_start_dt = month_start_utc()
     pending_today = 0
     pending_month = 0
     for item in pending_items:

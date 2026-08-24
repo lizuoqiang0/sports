@@ -38,7 +38,7 @@ from app.core.websocket import manager
 from app.services.bet_mode import get_user_bet_mode, is_active_mode
 from app.services.bookmakers.china_match import is_china_match
 from app.services.bookmakers.plugins.ob.odds import is_virtual_match
-from app.config import settings
+from app.config import settings, today_start_utc
 
 logger = logging.getLogger(__name__)
 
@@ -502,8 +502,8 @@ class AIBettingEngine:
                         active_bets_count=active_count_now,
                     )
                     stake = Decimal(str(decision.suggested_stake or 0))
-                    if stake < Decimal("1.00"):
-                        stake = Decimal("1.00")
+                    # 不强制兜底到 1.00：站点降仓保护可能将仓位压到 < 1.0
+                    # 执行层 bet_executor 会拒绝 < 1.0 的仓位，等效于跳过高风险单
                     decision = decision.model_copy(update={"suggested_stake": stake})
                     decisions.append(decision)
 
@@ -766,8 +766,7 @@ class AIBettingEngine:
 
         from app.services.fixture_key import group_matches_by_fixture, same_fixture
 
-        today = datetime.now(timezone.utc).date()
-        today_start = datetime.combine(today, datetime.min.time(), tzinfo=timezone.utc)
+        today_start = today_start_utc()
         existing_bets = await db.execute(
             select(Bet.match_id).where(
                 Bet.user_id == self.user_id,
@@ -973,8 +972,7 @@ class AIBettingEngine:
             sib_ids = await sibling_match_ids(db, match)
         except Exception:
             sib_ids = [int(match.id)]
-        today = datetime.now(timezone.utc).date()
-        today_start = datetime.combine(today, datetime.min.time(), tzinfo=timezone.utc)
+        today_start = today_start_utc()
         count_res = await db.execute(
             select(func.count(Bet.id)).where(
                 Bet.user_id == user.id,
@@ -1088,8 +1086,7 @@ class AIBettingEngine:
 
         返回注单总数，调用方按 MAX_BETS_PER_FIXTURE 判定是否允许继续下注。
         """
-        today = datetime.now(timezone.utc).date()
-        today_start = datetime.combine(today, datetime.min.time(), tzinfo=timezone.utc)
+        today_start = today_start_utc()
         total = 0
 
         # 1. 检查 DB 已确认注单（含同场 sibling）
@@ -1622,8 +1619,8 @@ async def analyze_and_recommend(
                 # 异常仓位按最小注兜底（展示用途；执行层仍会拒绝 ≤0 的单）
                 sug_stake = Decimal("1")
             sug_stake = min(sug_stake, Decimal(str(strat_cfg.max_bet_amount or 1)))
-            if sug_stake < Decimal("1"):
-                sug_stake = Decimal("1")
+            # 不强制 < 1 抬回 1：站点降仓保护可能将仓位压到 < 1.0
+            # 执行层 bet_executor 会拒绝 < 1.0 的仓位，等效于跳过高风险单
             decision = decision.model_copy(update={"suggested_stake": sug_stake})
         else:
             sug_stake = Decimal("0")
