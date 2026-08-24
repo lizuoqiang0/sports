@@ -328,7 +328,7 @@ bash scripts/ensure_browser_gate.sh status
 bash scripts/ensure_browser_gate.sh stop
 ```
 
-### 6.3 数据库迁移
+### 6.4 数据库迁移
 
 ```bash
 # 容器启动时自动执行
@@ -338,6 +338,48 @@ docker exec ob-backend alembic upgrade head
 docker exec ob-backend alembic upgrade head
 docker exec ob-backend alembic revision --autogenerate -m "描述"
 ```
+
+### 6.5 Dockerfile 结构
+
+```dockerfile
+FROM python:3.12-slim AS runtime
+
+# 系统依赖（curl 用于健康检查）
+RUN apt-get update && apt-get install -y --no-install-recommends curl
+
+# Python 依赖（BuildKit 缓存）
+COPY requirements.txt .
+RUN --mount=type=cache,target=/root/.cache/pip pip install -r requirements.txt
+
+# 业务代码（仅 COPY 必要目录，不含根目录 __init__.py）
+COPY app ./app
+COPY alembic ./alembic
+COPY alembic.ini ./alembic.ini
+COPY scripts ./scripts
+
+# 健康检查 + 入口
+HEALTHCHECK CMD curl -fsS http://127.0.0.1:8000/health || exit 1
+CMD ["/app/scripts/docker_entrypoint_backend.sh"]
+```
+
+> **注意**：根目录 `__init__.py` 已在 v2.1.0 清理中删除，Dockerfile 不再 `COPY __init__.py`。
+> 项目顶层包是 `app.`，根 `__init__.py` 为残留文件，删除后不影响导入。
+> `ai-engine` 容器与 `backend` 共享同一镜像，入口命令不同（`ai_betting_engine.py`）。
+
+### 6.6 一键部署脚本内部流程
+
+`scripts/quick.sh` 执行步骤：
+
+```
+1. Python 语法检查     — 对 9 个核心 .py 文件执行 ast.parse，任一失败则终止
+2. 重建 Docker 镜像     — docker compose build --no-cache backend（--no-build 可跳过）
+3. 清除 Redis 旧缓存    — 删除 calibration/patterns/risk_tuning/stats 缓存键
+4. 强制重建容器         — docker compose up -d --force-recreate backend [ai-engine]
+5. 等待服务健康         — 轮询 http://127.0.0.1:8000/health，超时 60s
+6. 输出容器状态         — docker compose ps + 访问地址
+```
+
+> 构建输出通过 `grep -E '(DONE|Built|ERROR)'` 过滤，避免 `set -o pipefail` 下 `tail` 管道导致的误报。
 
 ---
 
@@ -485,6 +527,8 @@ docker exec ob-backend alembic upgrade head
 | 下单失败 | 检查 Browser Gate 健康 `curl http://127.0.0.1:9277/health`；查看 `docker logs ob-backend` 中 `[下单]` 日志 |
 | 赔率不更新 | 检查站点连接状态；`docker exec ob-redis redis-cli KEYS "odds:*"` 查看缓存 |
 | 数据库连接超时 | 检查 `docker compose ps` 中 postgres 状态；`docker exec ob-postgres pg_isready -U ob_user` |
+| Docker 构建报 `__init__.py: not found` | Dockerfile 中 `COPY __init__.py` 已移除（v2.1.0）；若旧缓存仍报错，执行 `docker compose build --no-cache` |
+| `quick.sh` 构建步骤非零退出 | 构建输出管道在 `set -o pipefail` 下可能误报；已改用 `grep -E '(DONE|Built|ERROR)' \|\| true` 过滤 |
 
 ### 10.4 数据备份与恢复
 
