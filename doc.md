@@ -231,6 +231,7 @@ AI_MIN_CONFIDENCE = 0.47        # 下单最低置信度
 AI_MIN_ODDS = 1.65              # 下单最低赔率
 AI_MAX_ODDS = 5.00              # 下单最高赔率
 AI_SCAN_INTERVAL_SEC = 120      # 引擎扫描间隔
+AI_IDLE_RESCAN_SEC = 30         # 空轮快扫间隔（无候选时）
 AI_ANALYZE_CONCURRENCY = 8      # GPT 分析并发
 AI_SKIP_COOLDOWN_SEC = 300      # 同场 skip 冷却
 AI_ENABLE_OVER = True           # 大球 over 开关
