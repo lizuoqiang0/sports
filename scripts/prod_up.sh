@@ -52,6 +52,12 @@ if [[ ! -f .env ]]; then
   echo "已写入 .env，请按需补充 API Key"
 fi
 
+# 安全检查：弱内部令牌不可上线（原 deploy_prod.sh 独有逻辑，合并于此）
+if grep -qE '^INTERNAL_API_TOKEN=(ob-internal)?[[:space:]]*$' .env 2>/dev/null; then
+  echo "请先设置强 INTERNAL_API_TOKEN: openssl rand -hex 32" >&2
+  exit 1
+fi
+
 pull_bases() {
   echo "==> 预拉基础镜像（可并行）"
   docker pull postgres:16-alpine &

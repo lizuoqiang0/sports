@@ -477,10 +477,8 @@ python3 tests/ai/test_bet_flow_simulation.py
 | 脚本 | 用途 |
 |------|------|
 | `scripts/quick.sh` | **一键部署**：语法检查→构建→重建→清缓存→健康检查 |
-| `scripts/prod_up.sh` | 完整启动（首次部署/Browser Gate 管理） |
+| `scripts/prod_up.sh` | 完整启动（首次部署/Browser Gate 管理/安全令牌检查） |
 | `scripts/prod_down.sh` | 停止服务（`--wipe` 清数据） |
-| `scripts/deploy.sh` | 部署新代码（构建+重启+清缓存，与 quick.sh 类似） |
-| `scripts/deploy_prod.sh` | 生产刷新（重建+Browser Gate） |
 | `scripts/ensure_browser_gate.sh` | Browser Gate 启动/守护/停止 |
 | `scripts/clean_prod_env.sh` | 清空业务数据（保留账号） |
 
