@@ -1,7 +1,7 @@
 # 生产编排（高性能 · 低延迟 · 多 worker）
 # 数据持久化: ./data/postgres ./data/redis ./logs
-# 快速启动: bash scripts/prod_up.sh
-# AI 引擎可选: bash scripts/prod_up.sh --with-ai
+# 快速启动: bash scripts/quick.sh --init
+# AI 引擎可选: bash scripts/quick.sh --init --with-ai
 #
 # 主机参考（12 核 / 16G）：backend 多 worker + uvloop；postgres/redis 多线程。
 # Browser Gate 在 Mac/GUI 宿主机运行（弹出可见 Chromium），后端经 host.docker.internal 调用。

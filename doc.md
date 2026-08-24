@@ -321,7 +321,7 @@ bash scripts/quick.sh --stop --wipe
 在宿主机运行可见 Chromium，后端经 `host.docker.internal:9277` 调用：
 
 ```bash
-# 自动启动（prod_up.sh 内置）
+# 自动启动（quick.sh --init 内置）
 bash scripts/ensure_browser_gate.sh watch
 
 # 手动管理

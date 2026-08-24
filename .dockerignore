@@ -17,5 +17,4 @@ data
 **/playwright-report
 **/test-results
 scripts/_tmp_*
-scripts/_pin_e2e_static.py
 agent-transcripts

@@ -133,23 +133,17 @@ def test_conservative_semantics():
 
 
 def test_doc_coverage():
-    """文档与代码同步：doc.md 第八节关键值与代码一致。"""
-    # 容器内路径 /app/docs/，本地路径 <repo>/docs/，两者兼容
-    candidates = [
-        Path(__file__).resolve().parents[2] / "docs" / "CHANGELOG-ai-bidirectional-20260820.md",
-        Path("/app/docs/CHANGELOG-ai-bidirectional-20260820.md"),
-    ]
-    doc = next((p for p in candidates if p.exists()), None)
-    if doc is None:
-        return [("doc.md 存在", False, "checked=" + ";".join(str(p) for p in candidates))]
-    text = doc.read_text(encoding="utf-8")
+    """文档与代码同步：doc.md 关键配置值与代码一致。"""
+    doc_path = Path(__file__).resolve().parents[2] / "doc.md"
+    if not doc_path.exists():
+        return [("doc.md 存在", False, f"path={doc_path}")]
+    text = doc_path.read_text(encoding="utf-8")
     return [
-        ("doc 含性能优化章节", "性能优化" in text, f"file={doc}"),
-        ("doc 记录并发 3→8", "默认 3" in text and "默认 **8**" in text, ""),
+        ("doc 记录 AI_ANALYZE_CONCURRENCY", "AI_ANALYZE_CONCURRENCY" in text, ""),
         ("doc 记录空轮 30s 快扫", "AI_IDLE_RESCAN_SEC = 30" in text, ""),
         ("doc 记录 skip 冷却 300s", "AI_SKIP_COOLDOWN_SEC = 300" in text, ""),
-        ("doc 记录保守语义（只冷却 skip）", "只冷却 skip" in text, ""),
-        ("doc 预期收益量化（165s→45s）", "165s" in text and "45s" in text, ""),
+        ("doc 记录 AI_ENABLE_OVER", "AI_ENABLE_OVER" in text, ""),
+        ("doc 记录时区工具", "today_start_utc" in text, ""),
     ]
 
 
