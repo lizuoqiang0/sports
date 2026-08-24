@@ -273,10 +273,15 @@ DATA_RETENTION_HOURS = 24       # 自动清理超期数据
 
 ## 六、部署
 
-### 6.1 一键部署
+### 6.1 一键部署（quick.sh）
+
+`quick.sh` 是唯一的部署入口脚本，用 `--init` 区分首次部署和日常部署。
 
 ```bash
-# 完整部署（语法检查 → 镜像构建 → 容器重建 → 缓存清理 → 健康检查）
+# 首次部署 / 全量启动（.env生成 → 数据目录 → 基础镜像 → Browser Gate → 全容器）
+bash scripts/quick.sh --init --with-ai
+
+# 日常部署（语法检查 → 镜像构建 → 容器重建 → 缓存清理 → 健康检查）
 bash scripts/quick.sh
 
 # 跳过构建，仅强制重建容器
@@ -291,23 +296,23 @@ bash scripts/quick.sh --logs
 # 查看状态
 bash scripts/quick.sh --status
 
-# 停止所有服务
+# 停止所有服务（含 Browser Gate）
 bash scripts/quick.sh --stop
 
-# 重启（不重建镜像）
+# 重启容器（不重建镜像）
 bash scripts/quick.sh --restart
+
+# 仅预拉基础镜像
+bash scripts/quick.sh --pull
 ```
 
-### 6.2 完整启动（首次部署）
+### 6.2 停止服务
 
 ```bash
-# 首次启动（构建镜像 + 启动 Browser Gate + 启动容器）
-bash scripts/prod_up.sh --build --with-ai
+# 停止所有服务（含 Browser Gate）
+bash scripts/quick.sh --stop
 
-# 日常启动（有镜像秒级 up）
-bash scripts/prod_up.sh
-
-# 停止
+# 或使用专用脚本
 bash scripts/prod_down.sh
 
 # 停止 + 清空数据
@@ -368,8 +373,9 @@ CMD ["/app/scripts/docker_entrypoint_backend.sh"]
 
 ### 6.6 一键部署脚本内部流程
 
-`scripts/quick.sh` 执行步骤：
+`scripts/quick.sh` 根据模式执行不同步骤：
 
+**日常部署**（`bash scripts/quick.sh`）：
 ```
 1. Python 语法检查     — 对 9 个核心 .py 文件执行 ast.parse，任一失败则终止
 2. 重建 Docker 镜像     — docker compose build --no-cache backend（--no-build 可跳过）
@@ -377,6 +383,19 @@ CMD ["/app/scripts/docker_entrypoint_backend.sh"]
 4. 强制重建容器         — docker compose up -d --force-recreate backend [ai-engine]
 5. 等待服务健康         — 轮询 http://127.0.0.1:8000/health，超时 60s
 6. 输出容器状态         — docker compose ps + 访问地址
+```
+
+**首次部署**（`bash scripts/quick.sh --init --with-ai`）：
+```
+1. 创建数据目录         — data/postgres data/redis logs + chown
+2. 检查 .env 配置       — 缺失则从 .env.example 生成 + 写入 SECRET_KEY
+3. 安全令牌检查         — INTERNAL_API_TOKEN 为空或弱令牌则终止
+4. 预拉基础镜像         — 缺镜像时并行拉 postgres/redis/python/nginx/node
+5. 启动依赖             — postgres + redis，等待健康（45s）
+6. 配置 Browser Gate    — .env 注入 GATE_URL + HEADLESS=0
+7. 启动 Browser Gate    — 可见 Chromium + 守护进程，等待健康（90s）
+8. 语法检查 → 构建镜像 → 清缓存 → 启动全容器（backend+frontend+[ai-engine]）
+9. 等待 API 健康        — 轮询 /health，超时 60s
 ```
 
 > 构建输出通过 `grep -E '(DONE|Built|ERROR)'` 过滤，避免 `set -o pipefail` 下 `tail` 管道导致的误报。
@@ -476,8 +495,7 @@ python3 tests/ai/test_bet_flow_simulation.py
 
 | 脚本 | 用途 |
 |------|------|
-| `scripts/quick.sh` | **一键部署**：语法检查→构建→重建→清缓存→健康检查 |
-| `scripts/prod_up.sh` | 完整启动（首次部署/Browser Gate 管理/安全令牌检查） |
+| `scripts/quick.sh` | **唯一部署入口**：`--init` 首次部署，无参数日常部署，`--status/--stop/--restart` 运维 |
 | `scripts/prod_down.sh` | 停止服务（`--wipe` 清数据） |
 | `scripts/ensure_browser_gate.sh` | Browser Gate 启动/守护/停止 |
 | `scripts/clean_prod_env.sh` | 清空业务数据（保留账号） |
