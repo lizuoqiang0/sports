@@ -312,7 +312,9 @@ class MatchAnalyzer:
 
         try:
             timeout = float(settings.GPT_TIMEOUT_SEC)
-            raw = await asyncio.wait_for(self._call_gpt(prompt), timeout=timeout)
+            # 加载历史胜率反馈注入 system prompt，帮助 GPT 从过去的错误中学习
+            system_extra = await self._build_historical_feedback(match_info)
+            raw = await asyncio.wait_for(self._call_gpt(prompt, system_extra), timeout=timeout)
             content = raw.get("content", "")
             parsed = self._parse_analysis_result(content)
 
@@ -349,8 +351,43 @@ class MatchAnalyzer:
                 pred = normalize_prediction(parsed.get("prediction"), bet_type="total")
 
             if pred not in ("under", "over", "skip"):
+                # 精简 prompt 重试：原始输出可能因 max_tokens 截断或格式偏差导致无效
+                # 用极简 prompt 重试一次，只要求核心字段，大幅降低 token 消耗
                 logger.warning(
-                    "[AI分析] GPT 返回无效结果 match=%s | bt=%s pred=%s",
+                    "[AI分析] GPT 返回无效结果，尝试精简 prompt 重试 match=%s | bt=%s pred=%s",
+                    match_info.get("id"), parsed.get("bet_type"), parsed.get("prediction"),
+                )
+                retry_parsed = await self._retry_with_minimal_prompt(match_info, market_odds, system_extra)
+                if retry_parsed:
+                    parsed = retry_parsed
+                    # 重新提取双向置信度
+                    under_conf_raw = parsed.get("under_confidence")
+                    over_conf_raw = parsed.get("over_confidence")
+                    try:
+                        under_conf = float(under_conf_raw) if under_conf_raw is not None else None
+                    except (TypeError, ValueError):
+                        under_conf = None
+                    try:
+                        over_conf = float(over_conf_raw) if over_conf_raw is not None else None
+                    except (TypeError, ValueError):
+                        over_conf = None
+                    if under_conf is not None and over_conf is not None:
+                        if under_conf < 0.30 and over_conf < 0.30:
+                            pred = "skip"
+                        elif under_conf >= over_conf:
+                            pred = "under"
+                        else:
+                            pred = "over"
+                    else:
+                        pred = normalize_prediction(parsed.get("prediction"), bet_type="total")
+                    logger.info(
+                        "[AI分析] 精简 prompt 重试成功 match=%s | pred=%s conf=%s",
+                        match_info.get("id"), pred, parsed.get("confidence"),
+                    )
+
+            if pred not in ("under", "over", "skip"):
+                logger.warning(
+                    "[AI分析] GPT 最终返回无效结果 match=%s | bt=%s pred=%s",
                     match_info.get("id"), parsed.get("bet_type"), parsed.get("prediction"),
                 )
                 return self._fallback_result(
@@ -526,50 +563,189 @@ class MatchAnalyzer:
             return analysis
 
         except asyncio.TimeoutError:
-            logger.error(
-                "[AI分析] GPT 超时 match=%s timeout=%.0fs",
+            logger.warning(
+                "[AI分析] GPT 超时 match=%s timeout=%.0fs，尝试精简 prompt 重试",
                 match_info.get("id"), timeout,
+            )
+            # 超时后用精简 prompt 重试：更短 prompt + 更少 tokens + 更短超时
+            # system_extra 在 wait_for 之前已构建，超时时仍可用
+            _timeout_extra = locals().get("system_extra", "")
+            retry_parsed = await self._retry_with_minimal_prompt(match_info, market_odds, _timeout_extra)
+            if retry_parsed:
+                logger.info(
+                    "[AI分析] 精简 prompt 重试成功（超时恢复）match=%s",
+                    match_info.get("id"),
+                )
+                # 用重试结果重新走双向置信度提取流程
+                under_conf_raw = retry_parsed.get("under_confidence")
+                over_conf_raw = retry_parsed.get("over_confidence")
+                try:
+                    under_conf = float(under_conf_raw) if under_conf_raw is not None else None
+                except (TypeError, ValueError):
+                    under_conf = None
+                try:
+                    over_conf = float(over_conf_raw) if over_conf_raw is not None else None
+                except (TypeError, ValueError):
+                    over_conf = None
+
+                if under_conf is not None and over_conf is not None:
+                    if under_conf < 0.30 and over_conf < 0.30:
+                        pred = "skip"
+                    elif under_conf >= over_conf:
+                        pred = "under"
+                    else:
+                        pred = "over"
+                else:
+                    pred = normalize_prediction(retry_parsed.get("prediction"), bet_type="total")
+
+                if pred in ("under", "over"):
+                    try:
+                        conf = float(retry_parsed.get("confidence", 0))
+                    except (TypeError, ValueError):
+                        conf = 0.0
+                    conf = max(0.0, min(conf, 1.0))
+                    line_f = _line_for_pick(market_odds, match_info, "total")
+                    od = _odds_for_pick(market_odds, "total", pred)
+                    analysis = {
+                        "prediction": pred,
+                        "bet_type": "total",
+                        "line": line_f,
+                        "confidence": round(conf, 4),
+                        "under_confidence": round(float(under_conf), 4) if under_conf is not None else None,
+                        "over_confidence": round(float(over_conf), 4) if over_conf is not None else None,
+                        "reasoning": (retry_parsed.get("reasoning") or "精简prompt重试结果")[:800],
+                        "consensus_reached": True,
+                        "models_used": ["gpt"],
+                        "models_failed": [],
+                        "analyzed_at": datetime.now(timezone.utc).isoformat(),
+                        "timeout_retry": True,
+                    }
+                    if od > 1:
+                        analysis["odds"] = od
+                    analysis = self._apply_context_quality_cap(analysis, historical_data)
+                    analysis = self._apply_signal_review(
+                        analysis, match_info=match_info,
+                        historical_data=historical_data, market_odds=market_odds,
+                    )
+                    analysis = self._apply_market_odds_constraint(analysis, match_info)
+                    analysis = self._apply_line_up_constraint(analysis, match_info, market_odds)
+                    analysis = await self._apply_historical_calibration(analysis, match_info)
+                    return analysis
+                elif pred == "skip":
+                    logger.info(
+                        "[AI分析] 精简 prompt 重试判定跳过 match=%s",
+                        match_info.get("id"),
+                    )
+                    return self._fallback_result(
+                        "GPT精简重试判定skip", error="gpt_timeout_retry_skip",
+                    )
+            logger.warning(
+                "[AI分析] 精简 prompt 重试仍失败 match=%s，改用盘口启发式",
+                match_info.get("id"),
             )
             return self._fallback_result("AI分析超时，改用盘口启发式", error="gpt_timeout")
         except Exception as e:
             logger.error("[AI分析] GPT 失败 match=%s: %s", match_info.get("id"), e)
             return self._fallback_result(f"AI分析暂不可用: {e}", error=str(e))
 
-    async def _call_gpt(self, prompt: str) -> dict:
-        """调用 GPT 模型，返回 content 和 _meta 信息。429/529/空响应指数退避，超时不重试。"""
+    async def _retry_with_minimal_prompt(
+        self, match_info: dict, market_odds: Optional[dict], system_extra: str = "",
+    ) -> Optional[dict]:
+        """精简 prompt 重试：原始输出无效/超时时，用极简 prompt 再调一次 GPT。
+
+        只要求 under_confidence / over_confidence / reasoning 三个核心字段，
+        max_tokens 降到 512，大幅降低截断和格式偏差概率。
+        超时设为 30s（比正常 45s 短，避免拖长总分析时间）。
+
+        Args:
+            match_info: 比赛信息
+            market_odds: 盘口数据
+            system_extra: 注入到 system prompt 的额外上下文（历史胜率反馈）
+        """
+        if not self.client or not self.model:
+            return None
+        total_line = match_info.get("total_line") or match_info.get("line") or "?"
+        hs = match_info.get("home_score")
+        aws = match_info.get("away_score")
+        score_str = f"{hs}-{aws}" if hs is not None else "未知"
+        sport = str(match_info.get("sport") or "football").lower()
+        league = match_info.get("league", "")
+
+        # 极简 prompt：只给核心数据，要求最小输出
+        mini_prompt = (
+            f"赛事: {match_info.get('home_team', '?')} vs {match_info.get('away_team', '?')} | "
+            f"联赛: {league} | 球种: {sport} | 比分: {score_str} | 盘口线: {total_line}\n"
+            f"请只输出以下JSON（不要多余字段，不要markdown）:\n"
+            '{"under_confidence": 0.0-1.0, "over_confidence": 0.0-1.0, '
+            '"reasoning": "一句话理由", "risk_level": "low/medium/high"}\n'
+            "规则: under_confidence 和 over_confidence 都必须给出(0.0-1.0)，"
+            "都低于0.30表示skip。只输出JSON。"
+        )
+        try:
+            timeout = min(float(settings.GPT_TIMEOUT_SEC), 30.0)
+            raw = await asyncio.wait_for(self._call_gpt(mini_prompt, system_extra), timeout=timeout)
+            content = raw.get("content", "")
+            parsed = self._parse_analysis_result(content)
+            # 只要有 under_confidence 或 over_confidence 就算成功
+            if parsed.get("under_confidence") is not None or parsed.get("over_confidence") is not None:
+                return parsed
+            if parsed.get("prediction") in ("under", "over", "skip"):
+                return parsed
+            logger.warning(
+                "[AI分析] 精简 prompt 重试仍无效 match=%s | content=%s",
+                match_info.get("id"), (content or "")[:200],
+            )
+            return None
+        except asyncio.TimeoutError:
+            logger.warning("[AI分析] 精简 prompt 重试超时 match=%s", match_info.get("id"))
+            return None
+        except Exception as e:
+            logger.warning("[AI分析] 精简 prompt 重试失败 match=%s: %s", match_info.get("id"), e)
+            return None
+
+    async def _call_gpt(self, prompt: str, system_extra: str = "") -> dict:
+        """调用 GPT 模型，返回 content 和 _meta 信息。429/529/空响应指数退避，超时重试1次。
+
+        Args:
+            prompt: 用户 prompt
+            system_extra: 注入到 system prompt 末尾的额外上下文（如历史胜率反馈）
+        """
         if not self.client or not self.model:
             raise RuntimeError("GPT 模型未配置")
+        _system_content = (
+            "你是专业体育赛事滚球大小球分析师。只输出JSON。\n"
+            "## 核心原则\n"
+            "1. 量化优先：每个判断必须有具体数字支撑（盘口变化幅度、进球节奏、余量）\n"
+            "2. 信号区分：必须区分「资金推动型」和「数学调整型」盘口变化\n"
+            "3. 节奏校准：0球时不能用pace=0推演全场，改用联赛均值（足球约2.5球/场）\n"
+            "4. 反向风险：高置信度(≥0.73)存在反向相关，over/under均封顶0.72\n"
+            "5. 下半场爆发：0-0或1球不代表安全，弱队对强队时下半场可能集中爆发\n\n"
+            "## 常见错误（必须避免）\n"
+            "- 把数学调整型升盘当资金推动型升盘（当前进球≥原盘口线时的升盘是数学调整）\n"
+            "- 0-0时用pace=0线性外推全场0球（概率仅8%）\n"
+            "- 忽略杯赛强弱悬殊的历史数据失真\n"
+            "- 对高线(≥3.0)0-0场景给出高under置信度（市场看大但暂未爆发）\n"
+            "- 对0-0+30分钟以上的比赛仍用当前0球推算（后段进球概率上升）"
+        )
+        if system_extra:
+            _system_content += f"\n\n{system_extra}"
         messages = [
-            {
-                "role": "system",
-                "content": (
-                    "你是专业体育赛事滚球大小球分析师。只输出JSON。\n"
-                    "## 核心原则\n"
-                    "1. 量化优先：每个判断必须有具体数字支撑（盘口变化幅度、进球节奏、余量）\n"
-                    "2. 信号区分：必须区分「资金推动型」和「数学调整型」盘口变化\n"
-                    "3. 节奏校准：0球时不能用pace=0推演全场，改用联赛均值（足球约2.5球/场）\n"
-                    "4. 反向风险：高置信度(≥0.73)存在反向相关，over/under均封顶0.72\n"
-                    "5. 下半场爆发：0-0或1球不代表安全，弱队对强队时下半场可能集中爆发\n\n"
-                    "## 常见错误（必须避免）\n"
-                    "- 把数学调整型升盘当资金推动型升盘（当前进球≥原盘口线时的升盘是数学调整）\n"
-                    "- 0-0时用pace=0线性外推全场0球（概率仅8%）\n"
-                    "- 忽略杯赛强弱悬殊的历史数据失真\n"
-                    "- 对高线(≥3.0)0-0场景给出高under置信度（市场看大但暂未爆发）\n"
-                    "- 对0-0+30分钟以上的比赛仍用当前0球推算（后段进球概率上升）"
-                ),
-            },
+            {"role": "system", "content": _system_content},
             {"role": "user", "content": prompt},
         ]
         started = time.perf_counter()
         max_retries = 2  # 最多 2 次重试（共 3 次调用），确保总时长可控
         content = ""
+        # 每轮 max_tokens：超时后降配重试，减少输出量缩短响应时间
+        tokens_per_attempt = [settings.LLM_MAX_TOKENS, max(512, settings.LLM_MAX_TOKENS // 2)]
         for attempt in range(max_retries + 1):
+            cur_max_tokens = tokens_per_attempt[min(attempt, len(tokens_per_attempt) - 1)]
             try:
                 response = await self.client.chat.completions.create(
                     model=self.model,
                     messages=messages,
                     temperature=settings.LLM_TEMPERATURE,
-                    max_tokens=settings.LLM_MAX_TOKENS,
+                    max_tokens=cur_max_tokens,
                     response_format={"type": "json_object"},
                 )
                 if not response.choices:
@@ -586,8 +762,15 @@ class MatchAnalyzer:
                 break  # 最后一次仍为空，交给上层无效结果兜底
             except Exception as e:
                 err_str = str(e).lower()
-                # 超时：不重试（GPT 已耗时长，重试只会更长）
+                # 超时：首次超时降配重试 1 次（减半 max_tokens，缩短响应时间）
                 if "timeout" in err_str or "timed out" in err_str or "apitimeout" in type(e).__name__.lower():
+                    if attempt == 0:
+                        logger.warning(
+                            "[GPT] 超时，降配重试 (max_tokens %d→%d) (attempt 1/%d)",
+                            settings.LLM_MAX_TOKENS, cur_max_tokens, max_retries,
+                        )
+                        await asyncio.sleep(0.5)
+                        continue
                     raise
                 # 429 限流 / 529 上游过载：指数退避（1s -> 2s），仅重试 2 次
                 if (
@@ -841,6 +1024,64 @@ class MatchAnalyzer:
                 conf, ld, "; ".join(reason_parts),
             )
         return analysis
+
+    async def _build_historical_feedback(self, match_info: dict) -> str:
+        """构建历史胜率反馈文本，注入 GPT system prompt。
+
+        从 recent_betting_stats 获取近7天按方向/运动/置信度的实际胜率，
+        让 GPT 知道自己哪些预测区间准确、哪些偏差大，从而自我校正。
+        """
+        try:
+            from app.services.bet_settlement import recent_betting_stats
+            stats = await recent_betting_stats(days=7)
+            parts: list[str] = []
+            # 全局概览
+            settled = stats.get("settled", 0)
+            if settled < 3:
+                return ""  # 样本太少不注入
+            wr = stats.get("win_rate")
+            if isinstance(wr, (int, float)):
+                parts.append(f"## 历史表现反馈（近7天 {settled} 注结算）")
+                parts.append(f"整体胜率: {wr*100:.1f}%")
+
+            # 按方向
+            by_sel = stats.get("by_selection") or {}
+            for sel in ("under", "over"):
+                sd = by_sel.get(sel) or {}
+                n = sd.get("settled", 0)
+                if n >= 3:
+                    swr = sd.get("win_rate")
+                    if isinstance(swr, (int, float)):
+                        tag = "偏低，需更保守" if swr < 0.45 else ("偏高，可维持" if swr >= 0.55 else "正常")
+                        parts.append(f"{sel} 方向: {n}注 胜率{swr*100:.1f}% ({tag})")
+
+            # 按置信度分桶（结构: {selection: {bucket: {settled, won, lost, win_rate}}}）
+            by_conf = stats.get("by_confidence") or {}
+            if by_conf:
+                conf_warnings: list[str] = []
+                for sel_key, conf_store in by_conf.items():
+                    if not isinstance(conf_store, dict):
+                        continue
+                    for bucket, bd in sorted(conf_store.items()):
+                        if not isinstance(bd, dict):
+                            continue
+                        bn = bd.get("settled", 0) or (bd.get("won", 0) + bd.get("lost", 0))
+                        if bn < 3:
+                            continue
+                        bwr = bd.get("win_rate")
+                        if isinstance(bwr, (int, float)) and bwr < 0.40:
+                            conf_warnings.append(f"{sel_key} conf {bucket}: {bn}注 胜率仅{bwr*100:.0f}%")
+                if conf_warnings:
+                    parts.append("⚠️ 低胜率置信区间: " + "; ".join(conf_warnings))
+
+            if len(parts) <= 1:
+                return ""
+            feedback = "\n".join(parts)
+            logger.info("[历史反馈] 注入 system prompt | %d 注结算 | %s", settled, feedback.replace("\n", " | "))
+            return feedback
+        except Exception as e:
+            logger.debug("[历史反馈] 构建失败(跳过): %s", e)
+            return ""
 
     async def _apply_historical_calibration(self, analysis: dict, match_info: dict) -> dict:
         """基于历史投注结果校准 GPT 置信度。
@@ -2181,24 +2422,155 @@ class MatchAnalyzer:
         return prompt
 
     def _parse_analysis_result(self, raw: str) -> dict:
+        text = (raw or "").strip()
+        if not text:
+            logger.warning("LLM返回空内容")
+            return {}
+
+        # 1) 去除 markdown 代码块包裹
+        if text.startswith("```"):
+            text = text.split("\n", 1)[1] if "\n" in text else text[3:]
+            if text.endswith("```"):
+                text = text[:-3]
+            text = text.strip()
+            if text.lower().startswith("json"):
+                text = text[4:].strip()
+
+        # 2) 提取最外层 { ... }
+        if not text.startswith("{"):
+            start = text.find("{")
+            end = text.rfind("}")
+            if start >= 0 and end > start:
+                text = text[start : end + 1]
+
+        # 3) 尝试直接解析
         try:
-            text = (raw or "").strip()
-            if text.startswith("```"):
-                text = text.split("\n", 1)[1] if "\n" in text else text[3:]
-                if text.endswith("```"):
-                    text = text[:-3]
-                text = text.strip()
-                if text.lower().startswith("json"):
-                    text = text[4:].strip()
-            if not text.startswith("{"):
-                start = text.find("{")
-                end = text.rfind("}")
-                if start >= 0 and end > start:
-                    text = text[start : end + 1]
             return json.loads(text)
         except (json.JSONDecodeError, TypeError, ValueError):
-            logger.warning(f"LLM返回非JSON: {(raw or '')[:200]}")
-            return {}  # 返回空 dict，调用方会标记为无效
+            pass
+
+        # 4) 截断 JSON 修复：max_tokens 不足时 JSON 被截断，尝试补全
+        try:
+            fixed = self._repair_truncated_json(text)
+            if fixed:
+                result = json.loads(fixed)
+                logger.warning(
+                    "LLM返回截断JSON已修复 | 原始末尾=%s | 修复后字段=%s",
+                    text[-60:],
+                    list(result.keys()) if isinstance(result, dict) else "?",
+                )
+                return result
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+
+        # 5) 字段级正则提取兜底：从原始文本中提取关键字段
+        extracted = self._extract_fields_from_text(raw or "")
+        if extracted:
+            logger.warning(
+                "LLM返回非标准JSON，字段级提取成功 | 字段=%s | 原始前200字=%s",
+                list(extracted.keys()),
+                (raw or "")[:200],
+            )
+            return extracted
+
+        logger.warning("LLM返回无法解析: %s", (raw or "")[:300])
+        return {}
+
+    @staticmethod
+    def _repair_truncated_json(text: str) -> str | None:
+        """尝试修复被 max_tokens 截断的 JSON。
+
+        策略：找到最后一个完整的键值对，在其后补全缺失的括号。
+        """
+        if not text or not text.strip().startswith("{"):
+            return None
+        text = text.strip()
+        # 已经是合法 JSON 的话不需要修复
+        try:
+            json.loads(text)
+            return None
+        except json.JSONDecodeError:
+            pass
+
+        # 找最后一个完整的字符串值结尾（"后跟,或}）
+        last_complete = text.rfind('",')
+        if last_complete < 0:
+            # 找最后一个完整的数字/布尔值结尾
+            for pattern in (',"', ",}", ",]", "true", "false", "null"):
+                idx = text.rfind(pattern)
+                if idx > last_complete:
+                    last_complete = idx
+        if last_complete < 0:
+            return None
+
+        # 截断到最后一个完整值，补全括号
+        truncated = text[: last_complete + 1]
+        # 计算需要补的括号
+        opens = truncated.count("{") - truncated.count("}")
+        brackets = truncated.count("[") - truncated.count("]")
+        # 去掉末尾多余的逗号
+        truncated = truncated.rstrip().rstrip(",")
+        repaired = truncated + ("}" * max(0, opens)) + ("]" * max(0, brackets))
+        return repaired
+
+    @staticmethod
+    def _extract_fields_from_text(text: str) -> dict:
+        """从非标准 JSON 文本中正则提取关键字段。"""
+        if not text:
+            return {}
+        result = {}
+
+        # prediction: under/over/skip
+        m = re.search(r'"prediction"\s*:\s*"?(under|over|skip)"?', text, re.IGNORECASE)
+        if m:
+            result["prediction"] = m.group(1).lower()
+
+        # bet_type: total/first_half_total/second_half_total
+        m = re.search(
+            r'"bet_type"\s*:\s*"?(total|first_half_total|second_half_total)"?',
+            text, re.IGNORECASE,
+        )
+        if m:
+            result["bet_type"] = m.group(1).lower()
+
+        # confidence: 浮点数
+        m = re.search(r'"confidence"\s*:\s*([0-9.]+)', text)
+        if m:
+            try:
+                result["confidence"] = float(m.group(1))
+            except ValueError:
+                pass
+
+        # under_confidence
+        m = re.search(r'"under_confidence"\s*:\s*([0-9.]+)', text)
+        if m:
+            try:
+                result["under_confidence"] = float(m.group(1))
+            except ValueError:
+                pass
+
+        # over_confidence
+        m = re.search(r'"over_confidence"\s*:\s*([0-9.]+)', text)
+        if m:
+            try:
+                result["over_confidence"] = float(m.group(1))
+            except ValueError:
+                pass
+
+        # reasoning: 提取字符串值（截断时可能没有结尾引号）
+        m = re.search(r'"reasoning"\s*:\s*"([^"]*)', text)
+        if m:
+            result["reasoning"] = m.group(1)[:800]
+
+        # risk_level
+        m = re.search(r'"risk_level"\s*:\s*"?(low|medium|high)"?', text, re.IGNORECASE)
+        if m:
+            result["risk_level"] = m.group(1).lower()
+
+        # 至少要有 prediction 或 under/over_confidence 才认为提取成功
+        if "prediction" in result or "under_confidence" in result or "over_confidence" in result:
+            return result
+        return {}
 
     def _fallback_result(self, reason: str, error: Optional[str] = None) -> dict:
         result = {

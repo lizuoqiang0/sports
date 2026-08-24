@@ -168,11 +168,16 @@ services:
       DOUBAO_API_KEY: ${DOUBAO_API_KEY:-}
       DOUBAO_BASE_URL: ${DOUBAO_BASE_URL:-https://ark.cn-beijing.volces.com/api/plan/v3}
       DOUBAO_MODEL: ${DOUBAO_MODEL:-doubao-seed-2.0-lite}
-      GPT_API_KEY: ${GPT_API_KEY:-}
-      GPT_BASE_URL: ${GPT_BASE_URL:-https://xfastapi.ai/v1}
-      GPT_MODEL: ${GPT_MODEL:-gpt-5.6-terra}
-      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
-      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://ark.cn-beijing.volces.com/api/plan/v3}
+      GPT_API_KEY: ${GPT_API_KEY:-sk-yZ8VwVDsA8aShbwXR9XnUIwzp6NIRPM5BqwgBvHsTOREUAYD}
+      GPT_BASE_URL: ${GPT_BASE_URL:-https://tokenhub.tencentmaas.com/v1}
+      GPT_MODEL: ${GPT_MODEL:-deepseek-v4-pro}
+      GPT_TIMEOUT_SEC: ${GPT_TIMEOUT_SEC:-90}
+      LLM_CLIENT_TIMEOUT_SEC: ${LLM_CLIENT_TIMEOUT_SEC:-40}
+      LLM_MAX_TOKENS: ${LLM_MAX_TOKENS:-2458}
+      LLM_TEMPERATURE: ${LLM_TEMPERATURE:-0.2}
+      AI_ANALYZE_CONCURRENCY: ${AI_ANALYZE_CONCURRENCY:-12}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-sk-yZ8VwVDsA8aShbwXR9XnUIwzp6NIRPM5BqwgBvHsTOREUAYD}
+      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://tokenhub.tencentmaas.com/v1}
       DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-v4-pro}
       KIMI_API_KEY: ${KIMI_API_KEY:-}
       KIMI_BASE_URL: ${KIMI_BASE_URL:-https://ark.cn-beijing.volces.com/api/plan/v3}
@@ -185,7 +190,6 @@ services:
       GLM_MODEL: ${GLM_MODEL:-glm-5.2}
       ENSEMBLE_MIN_CONSENSUS: ${ENSEMBLE_MIN_CONSENSUS:-0.60}
       ENSEMBLE_MIN_VOTES: ${ENSEMBLE_MIN_VOTES:-2}
-      AI_ANALYZE_CONCURRENCY: ${AI_ANALYZE_CONCURRENCY:-8}
       AI_IDLE_RESCAN_SEC: ${AI_IDLE_RESCAN_SEC:-30}
       AI_SKIP_COOLDOWN_SEC: ${AI_SKIP_COOLDOWN_SEC:-300}
       ENSEMBLE_TIMEOUT_SEC: ${ENSEMBLE_TIMEOUT_SEC:-35}
@@ -199,7 +203,7 @@ services:
       AI_SCAN_INTERVAL_SEC: ${AI_SCAN_INTERVAL_SEC:-120}
       AI_MATCH_CONTEXT_ENABLED: ${AI_MATCH_CONTEXT_ENABLED:-true}
       AI_MATCH_CONTEXT_TTL_SEC: ${AI_MATCH_CONTEXT_TTL_SEC:-21600}
-      NOWSCORE_PROXY_URL: ${NOWSCORE_PROXY_URL:-http://host.docker.internal:7897}
+      NOWSCORE_PROXY_URL: ${NOWSCORE_PROXY_URL:-}
       AI_ENABLED: ${AI_ENABLED:-true}
       DEFAULT_BET_MODE: ${DEFAULT_BET_MODE:-manual}
       ALLOW_PUBLIC_REGISTER: ${ALLOW_PUBLIC_REGISTER:-false}
@@ -273,9 +277,14 @@ services:
       REDIS_URL: redis://redis:6379/0
       LOG_FILE: /app/logs/app.log
       SECRET_KEY: ${SECRET_KEY:-ob-prod-please-override-with-openssl-rand-hex-32}
-      GPT_API_KEY: ${GPT_API_KEY:-}
-      GPT_BASE_URL: ${GPT_BASE_URL:-https://xfastapi.ai/v1}
-      GPT_MODEL: ${GPT_MODEL:-gpt-5.6-terra}
+      GPT_API_KEY: ${GPT_API_KEY:-sk-yZ8VwVDsA8aShbwXR9XnUIwzp6NIRPM5BqwgBvHsTOREUAYD}
+      GPT_BASE_URL: ${GPT_BASE_URL:-https://tokenhub.tencentmaas.com/v1}
+      GPT_MODEL: ${GPT_MODEL:-deepseek-v4-pro}
+      GPT_TIMEOUT_SEC: ${GPT_TIMEOUT_SEC:-90}
+      LLM_CLIENT_TIMEOUT_SEC: ${LLM_CLIENT_TIMEOUT_SEC:-40}
+      LLM_MAX_TOKENS: ${LLM_MAX_TOKENS:-2458}
+      LLM_TEMPERATURE: ${LLM_TEMPERATURE:-0.2}
+      AI_ANALYZE_CONCURRENCY: ${AI_ANALYZE_CONCURRENCY:-12}
       AI_RECS_LIMIT: ${AI_RECS_LIMIT:-80}
       AI_LIVE_SCAN_LIMIT: ${AI_LIVE_SCAN_LIMIT:-120}
       AI_MATCH_CONTEXT_IN_BATCH: ${AI_MATCH_CONTEXT_IN_BATCH:-true}
@@ -283,7 +292,7 @@ services:
       AI_MATCH_CONTEXT_ENABLED: ${AI_MATCH_CONTEXT_ENABLED:-true}
       AI_MATCH_CONTEXT_SEARCH: ${AI_MATCH_CONTEXT_SEARCH:-true}
       AI_MATCH_CONTEXT_TTL_SEC: ${AI_MATCH_CONTEXT_TTL_SEC:-21600}
-      NOWSCORE_PROXY_URL: ${NOWSCORE_PROXY_URL:-http://host.docker.internal:7897}
+      NOWSCORE_PROXY_URL: ${NOWSCORE_PROXY_URL:-}
       AI_ENABLED: ${AI_ENABLED:-true}
     healthcheck:
       test: ["CMD", "python", "-c", "from pathlib import Path; import sys; sys.exit(0 if b'ai_betting_engine.py' in Path('/proc/1/cmdline').read_bytes() else 1)"]

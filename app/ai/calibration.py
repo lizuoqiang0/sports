@@ -25,17 +25,17 @@ from app.models.user import Bet, Match, BetStatus, MatchStatus
 logger = logging.getLogger(__name__)
 
 _CAL_CACHE_TTL = 300  # 5 分钟
-_CAL_CACHE_KEY = "ai:calibration:v1"
-_PATTERN_CACHE_KEY = "ai:patterns:v1"
-_RISK_TUNING_CACHE_KEY = "ai:risk_tuning:v1"
+_CAL_CACHE_KEY = "ai:calibration:v2"
+_PATTERN_CACHE_KEY = "ai:patterns:v2"
+_RISK_TUNING_CACHE_KEY = "ai:risk_tuning:v2"
 
-# 置信度分桶宽度
-_CONF_BUCKET_WIDTH = 0.05
-# 每桶最低样本数（低于此数不校准，使用原始值）
-_MIN_BUCKET_SAMPLES = 5
-# 模式检测：最低样本 + 最低亏损率
-_MIN_PATTERN_SAMPLES = 5
-_PATTERN_LOSS_RATE_THRESHOLD = 0.60  # 亏损率 ≥60% 判定为高风险模式
+# 置信度分桶宽度（0.05→0.10：每日注单量有限，宽桶增加每桶样本量，提升校准有效性）
+_CONF_BUCKET_WIDTH = 0.10
+# 每桶最低样本数（5→4：降低门槛使校准更早生效，配合宽桶提升覆盖率）
+_MIN_BUCKET_SAMPLES = 4
+# 模式检测：最低样本 + 最低亏损率（5→6 提高可靠性，0.60→0.65 降低误报）
+_MIN_PATTERN_SAMPLES = 6
+_PATTERN_LOSS_RATE_THRESHOLD = 0.65  # 亏损率 ≥65% 判定为高风险模式
 
 
 def _conf_bucket(conf: float) -> str:
@@ -105,11 +105,13 @@ def _odds_range(odds: float) -> str:
 async def load_calibration_table(user_id: Optional[int] = None) -> dict[str, dict]:
     """从 DB 加载置信度分桶 → 实际胜率映射。
 
+    使用 30 天窗口（原14天样本量不足导致多数桶未达最低样本数）。
+
     返回结构:
     {
         "under": {
-            "0.60-0.65": {"settled": 12, "won": 5, "win_rate": 0.417},
-            "0.65-0.70": {"settled": 8, "won": 6, "win_rate": 0.750},
+            "0.60-0.70": {"settled": 12, "won": 5, "win_rate": 0.417},
+            "0.70-0.80": {"settled": 8, "won": 6, "win_rate": 0.750},
             ...
         },
         "over": { ... }
@@ -123,7 +125,7 @@ async def load_calibration_table(user_id: Optional[int] = None) -> dict[str, dic
     except Exception:
         pass
 
-    since = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=14)
+    since = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=30)
     conditions = [
         Bet.settled_at.is_not(None),
         Bet.created_at >= since,
@@ -241,6 +243,8 @@ def calibrate_confidence(
 async def load_risk_patterns(user_id: Optional[int] = None) -> list[dict]:
     """从 DB 加载多维度高风险模式。
 
+    使用 30 天窗口提升模式检测的统计显著性。
+
     返回结构:
     [
         {
@@ -262,7 +266,7 @@ async def load_risk_patterns(user_id: Optional[int] = None) -> list[dict]:
     except Exception:
         pass
 
-    since = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=14)
+    since = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=30)
     conditions = [
         Bet.settled_at.is_not(None),
         Bet.created_at >= since,

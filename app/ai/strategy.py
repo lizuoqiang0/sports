@@ -66,7 +66,7 @@ SPORT_RISK: dict[str, dict] = {
         # ── under 小球链（高赢单率配置）──
         "under_min_conf": 0.65,            # 0.58→0.65：实盘 5 单 3 负，低 conf 注单亏损严重
         "under_min_conf_no_fund": 0.68,    # 无基本面时进一步加严
-        "under_min_line": 2.5,             # 2.0→2.5：line≤2.0 一球即破盘，0.5 线风险极高
+        "under_min_line": 2.0,            # 2.5→2.0：2.5 是最常见盘线，0-0 时 margin=2.5 并非一球破盘
         "under_max_line": 5.0,             # 6.5→5.0：低级联赛高线（8.5）波动极大，8球破盘
         "under_min_played_mins": 20.0,
         "under_late_block_mins": 90.0,
@@ -81,7 +81,7 @@ SPORT_RISK: dict[str, dict] = {
         "over_min_conf": 0.65,             # 0.58→0.65：与 under 对等
         "over_min_conf_no_fund": 0.68,     # 无基本面时加严
         "over_min_line": 2.5,              # 2.0→2.5：低线=市场极度看小
-        "over_max_line": 4.0,              # 4.5→4.0：高线残余进球空间不足
+        "over_max_line": 4.5,              # 4.0→4.5：4.25 线在 2 球时仍可追，D1 速率闸门兜底无解场景
         "over_min_played_mins": 20.0,
         "over_late_block_mins": 85.0,      # 85'后追大球时间不够
         "over_pace_factor": 1.05,          # 与 under margin_factor 对称，不过度要求速率
@@ -96,7 +96,7 @@ SPORT_RISK["default"] = {k: dict(v) if isinstance(v, dict) else v for k, v in SP
 # 高波动联赛（冰岛/威尔士/澳洲NSW）实盘0%胜率，2026-08-22 纳入黑名单完全禁止
 LEAGUE_BLACKLIST_KEYWORDS: tuple[str, ...] = (
     "u19", "u21", "u18", "u20", "u17", "u16",
-    "青年", "青少年", "后备队", "女子", "(女)", "women", "女篮",
+    "青年", "青少年", "后备队", "女子", "女足", "(女)", "women", "女篮",
     "友谊赛", "表演赛",
     # 高波动联赛：进球数极不稳定，under/over实盘0%胜率
     "冰岛", "iceland",
@@ -437,64 +437,124 @@ class StrategyEngine:
         except Exception as e:
             logger.warning("[A3/胜率自适应] 统计加载失败(跳过): %s", e)
 
-        required_conf = base_req + adaptive_bump
-
         # ── 动态风控参数调优：基于近7天结算结果自动加严门槛 ──
         # （近7天某方向胜率<35% → conf_bump+0.08；<45% → +0.04）
+        dyn_bump = 0.0
         try:
             from app.ai.calibration import get_dynamic_conf_bump, load_risk_tuning
 
             risk_tuning = await load_risk_tuning(user_id=self.user_id)
             dyn_bump = get_dynamic_conf_bump(sport_l, prediction, risk_tuning)
             if dyn_bump > 0:
-                required_conf += dyn_bump
                 logger.info(
-                    "[A3/动态调优] match=%s | %s %s 近7天低胜率 门槛+%.2f→%.2f",
-                    mid, sport_l, prediction, dyn_bump, required_conf,
+                    "[A3/动态调优] match=%s | %s %s 近7天低胜率 门槛+%.2f",
+                    mid, sport_l, prediction, dyn_bump,
                 )
         except Exception as e:
             logger.debug("[A3/动态调优] 跳过(异常): %s", e)
 
         # 时间维度：后半段 under 风险递增（进球集中在后段），提高置信度要求
+        time_bump = 0.0
         if prediction == "under" and played_mins is not None:
             full_mins_a3 = float(RISK.get("margin_full_mins", 90.0))
             if played_mins >= full_mins_a3 * 0.65:  # 足球≥58'/篮球≥31'
                 time_bump = 0.03
-                required_conf += time_bump
                 logger.info(
-                    "[A3/时间维度] match=%s | %s under 后半段(%.0f'≥%.0f'×65%%) 门槛+%.2f→%.2f",
-                    mid, sport_l, played_mins, full_mins_a3, time_bump, required_conf,
+                    "[A3/时间维度] match=%s | %s under 后半段(%.0f'≥%.0f'×65%%) 门槛+%.2f",
+                    mid, sport_l, played_mins, full_mins_a3, time_bump,
                 )
 
-        if conf_f < required_conf:
+        # 加严叠加总上限：防止 adaptive + dynamic + time 叠加到不可通过的程度
+        _MAX_TOTAL_BUMP = 0.12
+        total_bump = adaptive_bump + dyn_bump + time_bump
+        if total_bump > _MAX_TOTAL_BUMP:
+            # 按比例缩减各 bump，保持相对权重
+            scale = _MAX_TOTAL_BUMP / total_bump
+            adaptive_bump = round(adaptive_bump * scale, 4)
+            dyn_bump = round(dyn_bump * scale, 4)
+            time_bump = round(time_bump * scale, 4)
+            total_bump = _MAX_TOTAL_BUMP
             logger.info(
-                "[A3/置信度] ❌ 拒绝 match=%s | conf=%.4f < 要求=%.4f (用户配置=%.2f fundamentals=%s 自适应+%.2f)",
-                mid, conf_f, required_conf, user_min_conf, has_fundamentals, adaptive_bump,
+                "[A3/加严封顶] match=%s | 总加严>%.2f → 按比例缩减至 adaptive+%.2f dyn+%.2f time+%.2f",
+                mid, _MAX_TOTAL_BUMP,
+                adaptive_bump, dyn_bump, time_bump,
             )
-            return self._reject(
-                match_info, analysis,
-                f"{prediction}置信度不足（当前{conf_f:.2f}，要求{required_conf:.2f}）",
+
+        required_conf = base_req + total_bump
+        if dyn_bump > 0 or time_bump > 0:
+            logger.info(
+                "[A3/门槛汇总] match=%s | base=%.2f + adaptive=%.2f + dyn=%.2f + time=%.2f → required=%.2f",
+                mid, base_req, adaptive_bump, dyn_bump, time_bump, required_conf,
             )
-        # ── P7：under 过高置信度反向风险（实盘 conf≥0.74 的 under 0%胜率）──
+
+        if conf_f < required_conf:
+            # ── 校准后 EV 豁免：历史校准已将 conf 映射为实际胜率，
+            # 如果实际胜率仍满足 EV 盈亏平衡（conf ≥ 1/odds + edge），
+            # 说明该注单长期正 EV，不应被固定门槛误杀。
+            is_calibrated = bool(analysis.get("calibration_note") or analysis.get("confidence_before_calibration"))
+            if is_calibrated:
+                try:
+                    _ev_odds = float(odds_data.get(prediction) or analysis.get("odds") or 0)
+                except (TypeError, ValueError):
+                    _ev_odds = 0.0
+                if _ev_odds > 1.0:
+                    _ev_edge = float(RISK.get("ev_conf_edge", 0.0) or 0.0)
+                    if prediction == "over":
+                        _ev_edge = max(_ev_edge, 0.02)
+                    _breakeven = 1.0 / _ev_odds + _ev_edge
+                    if conf_f >= _breakeven:
+                        logger.info(
+                            "[A3/EV豁免] ✅ 校准后 conf=%.4f < 门槛%.4f 但 ≥ EV平衡%.4f (odds=%.2f) → 放行",
+                            mid, conf_f, required_conf, _breakeven, _ev_odds,
+                        )
+                        # 跳过 A3 拒绝，继续后续闸门
+                    else:
+                        logger.info(
+                            "[A3/置信度] ❌ 拒绝 match=%s | conf=%.4f < 要求=%.4f 且 < EV平衡%.4f (校准后仍不足)",
+                            mid, conf_f, required_conf, _breakeven,
+                        )
+                        return self._reject(
+                            match_info, analysis,
+                            f"{prediction}置信度不足（校准后{conf_f:.2f}，要求{required_conf:.2f}，EV平衡{_breakeven:.2f}）",
+                        )
+                else:
+                    logger.info(
+                        "[A3/置信度] ❌ 拒绝 match=%s | conf=%.4f < 要求=%.4f (校准后无有效赔率)",
+                        mid, conf_f, required_conf,
+                    )
+                    return self._reject(
+                        match_info, analysis,
+                        f"{prediction}置信度不足（当前{conf_f:.2f}，要求{required_conf:.2f}）",
+                    )
+            else:
+                logger.info(
+                    "[A3/置信度] ❌ 拒绝 match=%s | conf=%.4f < 要求=%.4f (用户配置=%.2f fundamentals=%s 自适应+%.2f)",
+                    mid, conf_f, required_conf, user_min_conf, has_fundamentals, adaptive_bump,
+                )
+                return self._reject(
+                    match_info, analysis,
+                    f"{prediction}置信度不足（当前{conf_f:.2f}，要求{required_conf:.2f}）",
+                )
+        # ── P7/P9：过高置信度反向风险封顶（非拒绝）
+        # 实盘数据显示高 conf 存在反向相关，但不直接丢弃信号，
+        # 而是封顶到安全值，让闸门其余阶段继续评估。
+        _REVERSE_CONF_CAP = 0.72
         if prediction == "under" and conf_f >= 0.74:
             logger.info(
-                "[A3/P7] ❌ 拒绝 match=%s | under conf=%.2f≥0.74 过高置信度反向风险（实盘0%%胜率）",
-                mid, conf_f,
+                "[A3/P7] ⚠️ 封顶 match=%s | under conf=%.2f≥0.74 → 封顶%.2f（高conf反向风险）",
+                mid, conf_f, _REVERSE_CONF_CAP,
             )
-            return self._reject(
-                match_info, analysis,
-                f"under置信度过高（{conf_f:.2f}≥0.74），存在反向风险（高conf under实盘0%胜率）",
-            )
-        # ── P9：over 过高置信度反向风险（实盘 conf≥0.73 的 over 仅33%胜率）──
-        if prediction == "over" and conf_f >= 0.73:
+            conf_f = _REVERSE_CONF_CAP
+            analysis["confidence"] = round(conf_f, 4)
+            analysis["confidence_capped_reason"] = "under高置信度反向风险封顶0.72"
+        elif prediction == "over" and conf_f >= 0.73:
             logger.info(
-                "[A3/P9] ❌ 拒绝 match=%s | over conf=%.2f≥0.73 过高置信度反向风险（实盘仅33%%胜率）",
-                mid, conf_f,
+                "[A3/P9] ⚠️ 封顶 match=%s | over conf=%.2f≥0.73 → 封顶%.2f（高conf反向风险）",
+                mid, conf_f, _REVERSE_CONF_CAP,
             )
-            return self._reject(
-                match_info, analysis,
-                f"over置信度过高（{conf_f:.2f}≥0.73），存在反向风险（高conf over实盘仅33%胜率）",
-            )
+            conf_f = _REVERSE_CONF_CAP
+            analysis["confidence"] = round(conf_f, 4)
+            analysis["confidence_capped_reason"] = "over高置信度反向风险封顶0.72"
         logger.info(
             "[A3/置信度] ✅ 通过 match=%s | conf=%.2f ≥ 要求=%.2f | 方向=%s fundamentals=%s",
             mid, conf_f, required_conf, prediction, has_fundamentals,
@@ -874,18 +934,18 @@ class StrategyEngine:
                 mid, mkt_support, prediction, mkt_strength,
             )
             return self._reject(match_info, analysis, f"盘口变化方向({mkt_support})与预测({prediction})相反")
-        if sport_l == "basketball" and prediction == "over" and mkt_support != "over":
+        if sport_l == "basketball" and prediction == "over" and mkt_support == "under":
             logger.info(
-                "[C1/盘口方向] ❌ 拒绝 match=%s | 篮球over要求市场同步支持，当前=%s",
-                mid, mkt_support,
+                "[C1/盘口方向] ❌ 拒绝 match=%s | 篮球over但市场降盘看小 | strength=%s",
+                mid, mkt_strength,
             )
-            return self._reject(match_info, analysis, "篮球over缺少升盘/水位同步支持，不放行")
-        if sport_l == "basketball" and prediction == "under" and mkt_support != "under":
+            return self._reject(match_info, analysis, "篮球over与市场降盘方向冲突")
+        if sport_l == "basketball" and prediction == "under" and mkt_support == "over":
             logger.info(
-                "[C1/盘口方向] ❌ 拒绝 match=%s | 篮球under要求市场同步支持，当前=%s",
-                mid, mkt_support,
+                "[C1/盘口方向] ❌ 拒绝 match=%s | 篮球under但市场升盘看大 | strength=%s",
+                mid, mkt_strength,
             )
-            return self._reject(match_info, analysis, "篮球under缺少降盘/水位同步支持，不放行")
+            return self._reject(match_info, analysis, "篮球under与市场升盘方向冲突")
         logger.info(
             "[C1/盘口方向] ✅ 通过 match=%s | 市场支持=%s 预测=%s strength=%s",
             mid, mkt_support, prediction, mkt_strength,

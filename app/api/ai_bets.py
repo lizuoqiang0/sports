@@ -247,6 +247,45 @@ async def start_ai(
                 cfg.preferred_sports = ["football", "basketball"]
         await db.flush()
 
+        # ── 启动前预检风控：避免引擎启动后第一轮因风控自停 ──
+        # 引擎 _run_cycle 会调用 _check_risk，如果风控不通过会自动关闭 ai_enabled
+        # 并通过 WebSocket 通知前端关闭开关，导致"启动后立即自动关闭"现象。
+        # 这里提前检查，不通过则直接返回 400，让前端开关不开启。
+        from app.ai.strategy_gates import check_daily_risk
+        from app.models.user import BookmakerAccount, BookmakerStatus
+        from app.services.bookmakers.registry import is_real_live_account
+
+        strat = effective_strategy_from_ai_config(cfg)
+        triggered, why = await check_daily_risk(db, current_user.id, strat)
+        if triggered:
+            raise HTTPException(
+                status_code=400,
+                detail=f"无法启动：{why}（请调整风控参数或稍后再试）",
+            )
+
+        # 余额预检：引擎启动后立即检查余额，不足则自停
+        bal_res = await db.execute(
+            select(BookmakerAccount).where(
+                BookmakerAccount.user_id == current_user.id,
+                BookmakerAccount.code.in_(["ob", "pinnacle"]),
+                BookmakerAccount.status == BookmakerStatus.CONNECTED,
+            )
+        )
+        site_balances = [
+            Decimal(str(acc.balance or 0))
+            for acc in bal_res.scalars().all()
+            if is_real_live_account(acc.code, acc.base_url or "")
+        ]
+        spendable = max(site_balances, default=Decimal("0"))
+        if spendable <= 0:
+            spendable = Decimal(str(current_user.balance or 0))
+        min_balance = Decimal(str(getattr(settings, "AI_MIN_BALANCE", 10) or 10))
+        if spendable < min_balance:
+            raise HTTPException(
+                status_code=400,
+                detail=f"无法启动：余额不足（{spendable} < {min_balance}）",
+            )
+
         start_result = await start_user_engine(current_user.id)
         status_info = await get_engine_status(current_user.id)
         if not status_info.get("running"):
