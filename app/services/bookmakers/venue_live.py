@@ -122,6 +122,44 @@ def _parse_total_from_raw(raw: str, *, sport: str = "football") -> Optional[dict
     text = (raw or "").replace("\u200e", " ").replace("\u200f", " ")
     if not text or not re.search(r"大|小|Over|Under|\bO\b|\bU\b", text, re.I):
         return None
+    # 平博 compact 的常见省略标签布局：
+    #   <全场线> <大球赔率> 小 <小球赔率>
+    # 页面不渲染「大」字，因此旧逻辑会从前面的让球 0.5-1 误取出 1.0。
+    # 取最后一个匹配，避免同一赛事前面的让球/独赢数字抢先命中。
+    # 显式含「大/Over」时必须走成对解析；否则 `大 2.5 1.85 小 2.5 1.75`
+    # 会被 compact 规则截成 line=2.5/under=2.5。
+    compact_matches = [] if re.search(r"(?:大|Over|\bO\b)", text, re.I) else list(re.finditer(
+        r"(?:^|\s)(\d+(?:\.\d+)?(?:\s*-\s*\d+(?:\.\d+)?)?)\s+"
+        r"(\d{1,2}\.\d{1,3})\s*(?:小|Under)\s*"
+        r"(\d{1,2}\.\d{1,3})(?=$|\s)",
+        text,
+        re.I,
+    ))
+    if compact_matches:
+        # 同一赛事可能同时出现半场线（如 1.0）和全场线（如 2-2.5）。
+        # 全场大小球是本产品唯一允许的盘口，足球/篮球中通常对应更大的
+        # 总线；选最大线，避免把半场/球队总分误写成全场。
+        hit = max(
+            compact_matches,
+            key=lambda m: sum(
+                float(x.strip()) for x in str(m.group(1)).split("-")
+                if x.strip()
+            ) / max(1, len(str(m.group(1)).split("-"))),
+        )
+        try:
+            parts = [float(x.strip()) for x in str(hit.group(1)).split("-")]
+            line = sum(parts) / len(parts)
+            over = float(hit.group(2))
+            under = float(hit.group(3))
+        except (TypeError, ValueError):
+            line = over = under = None
+        if (
+            line is not None and over is not None and under is not None
+            and over > 1 and under > 1
+            and ((sport == "football" and 0.5 <= line <= 12)
+                 or (sport == "basketball" and 0.5 <= line <= 280))
+        ):
+            return {"line": line, "over": over, "under": under}
     m = re.search(
         r"(?:大|O(?:ver)?)\s*([0-9]+(?:\.[0-9]+)?)\s+(\d{1,2}\.\d{1,3}).{0,48}?"
         r"(?:小|U(?:nder)?)\s*(?:[0-9]+(?:\.[0-9]+)?\s+)?(\d{1,2}\.\d{1,3})",
@@ -423,8 +461,29 @@ async def scrape_dom_matches(page, *, site_code: str, live_only: bool = False, l
                     else { over = a; under = b; }
                   }
                 } else if (/大|小|Over|Under|\bO\b|\bU\b/i.test(t)) {
+                  // compact 常省略「大」：<全场线> <大赔率> 小 <小赔率>。
+                  // 先在「小」前后解析紧邻盘口，避免让球 0.5-1 的 1.0 抢走 lineHit。
+                  const compact = [...t.matchAll(/(?:^|\\s)(\\d+(?:\\.\\d+)?(?:\\s*-\\s*\\d+(?:\\.\\d+)?)?)\\s+(\\d{1,2}\\.\\d{1,3})\\s*(?:小|Under)\\s*(\\d{1,2}\\.\\d{1,3})(?=$|\\s)/gi)];
+                  const compactHit = compact.length ? compact.reduce((best, cur) => {
+                    const avg = (String(cur[1]).split('-').map(Number).filter(Number.isFinite));
+                    const bestAvg = (String(best[1]).split('-').map(Number).filter(Number.isFinite));
+                    const score = avg.length ? avg.reduce((a, b) => a + b, 0) / avg.length : -1;
+                    const bestScore = bestAvg.length ? bestAvg.reduce((a, b) => a + b, 0) / bestAvg.length : -1;
+                    return score > bestScore ? cur : best;
+                  }) : null;
+                  if (compactHit) {
+                    const compactParts = String(compactHit[1]).split('-').map(Number).filter(Number.isFinite);
+                    const compactLine = compactParts.length ? compactParts.reduce((a, b) => a + b, 0) / compactParts.length : NaN;
+                    const compactOver = Number(compactHit[2]);
+                    const compactUnder = Number(compactHit[3]);
+                    if (Number.isFinite(compactLine) && compactOver > 1 && compactUnder > 1) {
+                      total_line = compactLine;
+                      over = compactOver;
+                      under = compactUnder;
+                    }
+                  }
                   // 盘口线：.0/.25/.5/.75（足球）或 120–280（篮球）；末两档亚赔视作大/小
-                  const lineHit = parts.map(Number).find((n) =>
+                  const lineHit = total_line != null ? null : parts.map(Number).find((n) =>
                     Number.isFinite(n) && (
                       (n >= 0.5 && n <= 12 && Math.abs(n * 4 - Math.round(n * 4)) < 1e-6) ||
                       (n >= 120 && n <= 280)
@@ -699,10 +758,13 @@ async def scrape_dom_matches(page, *, site_code: str, live_only: bool = False, l
         if (not over_v or not under_v) and item.get("raw"):
             tot = _parse_total_from_raw(str(item.get("raw") or ""), sport=sport)
             if tot:
-                over_v = over_v or tot.get("over")
-                under_v = under_v or tot.get("under")
-                if total_line is None:
-                    total_line = tot.get("line")
+                # DOM JS 的宽松兜底可能先把相邻让球线（如 0.5-1）
+                # 当成 total_line，并留下一个错误 over。正文结构解析更精确：
+                # 省略「大」标签时仍能锁定「全场线 + over + 小 + under」，
+                # 因此只要命中就整体替换，不能用 `or` 保留旧猜测。
+                over_v = tot.get("over") or over_v
+                under_v = tot.get("under") or under_v
+                total_line = tot.get("line") or total_line
         # 允许只有 under 或只有 over 时也创建 TOTAL
         if total_line and ((under_v and 1.1 <= under_v <= 10) or (over_v and over_v > 1)):
             total_data: dict[str, Any] = {

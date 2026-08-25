@@ -349,7 +349,7 @@ async def list_live_match_ids(
 
         from app.ai.analysis_filters import any_market_odds_meet_min
 
-        # 业务仅支持小球：候选过滤只看 total/under，避免无效调用 LLM。
+        # 业务只支持全场大小球：候选过滤只看 total/under/over，避免无效调用 LLM。
         odds_res = await db.execute(
             select(Odds.match_id, Odds.bet_type, Odds.total, Odds.spread, Odds.odds_data)
             .where(
@@ -374,7 +374,7 @@ async def list_live_match_ids(
             if isinstance(odata, dict):
                 entry_odds = {}
                 keys = {
-                    "total": ("under",),
+                    "total": ("under", "over"),
                     "moneyline": ("home", "away", "draw"),
                     "spread": ("home", "away"),
                 }.get(bt, ())
@@ -648,7 +648,7 @@ async def _run_recs_job(
                 "status": "ready",
                 "progress": 0,
                 "total": 0,
-                "hint": "暂无滚球小球（请先在赛事页同步 OB / 平博滚球）",
+                "hint": "暂无滚球大小球（请先在赛事页同步 OB / 平博滚球）",
                 "analyzed_at": datetime.now(timezone.utc).isoformat(),
                 "source": "matches_live",
                 "fixture_dedup": True,

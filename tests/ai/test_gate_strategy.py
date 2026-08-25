@@ -1,7 +1,7 @@
 """闸门策略精确测试：五阶段闸门链 (A0-E2) 全覆盖 + 仓位计算 + 流程测试。
 
 测试覆盖：
-- A0 玩法白名单（total/first_half_total/second_half_total）
+- A0 玩法白名单（仅全场 total）
 - A1 方向检查（under/over 均可参与闸门评估）
 - A2 模型共识（consensus_reached / 文案标记）
 - A3 置信度（基础门槛 / 无基本面加严 / P7P9封顶 / EV豁免 / 胜率自适应 / 动态调优 / 时间维度）
@@ -113,7 +113,7 @@ def _under_analysis(conf: float = 0.70, **kw) -> dict:
         "consensus_reached": True,
         "reasoning": "双方防守稳固",
         "context_source": "none",
-        "models_used": ["gpt"],
+        "models_used": ["deepseek"],
     }
     a.update(kw)
     return a
@@ -123,12 +123,12 @@ def _over_match(**kw) -> dict:
     """构造能通过全部 A-E 闸门的足球 over 比赛。
 
     关键参数：
-    - 1-1 → current_total=2, needed=1.0 < 3.5 过 D1
-    - line=3.0 → >2.5 过 over_min_line, <4.5 过 over_max_line
+    - 1-1 → current_total=2, needed=0.75 < 3.5 过 D1
+    - line=2.75 → >2.5 过 over_min_line, <3.5 过 over_max_line, <3.0 不触线距加严
     - clock="35'" → >20 过早段, <85 不过末段, <40 不触发 P10
     - odds over=1.80 → <2.0 过 B3, <1.90 跳过 B3b
     - current_total=2 > 1 → 不触发 P1
-    - conf=0.70, current_total=2 > line-1.5=1.5 → 不触发 P4
+    - conf=0.72, current_total=2 > line-1.5=1.25 → 不触发 P4
     """
     m = {
         "id": 2001,
@@ -140,7 +140,7 @@ def _over_match(**kw) -> dict:
         "away_score": 1,
         "clock": "35'",
         "period": "1H",
-        "total_line": 3.0,
+        "total_line": 2.75,
         "odds": {"under": 1.90, "over": 1.80},
         "line_movements": {},
     }
@@ -148,22 +148,23 @@ def _over_match(**kw) -> dict:
     return m
 
 
-def _over_analysis(conf: float = 0.70, **kw) -> dict:
+def _over_analysis(conf: float = 0.72, **kw) -> dict:
     """构造能通过全部 A-E 闸门的 over 分析。
 
-    conf=0.70 > over_min_conf_no_fund=0.68 → 过 A3
-    odds=1.80 → 过 E1/E2（over edge=0.02, breakeven=0.556+0.02=0.576 < 0.70）
+    conf=0.72 > over_min_conf_no_fund=0.70 → 过 A3
+    odds=1.80 → 过 E1/E2（over edge=0.02, breakeven=0.556+0.02=0.576 < 0.72）
+    line=2.75 < 3.0 → 不触线距加严
     """
     a = {
         "prediction": "over",
         "bet_type": "total",
         "confidence": conf,
         "odds": 1.80,
-        "line": 3.0,
+        "line": 2.75,
         "consensus_reached": True,
         "reasoning": "双方进攻强势",
         "context_source": "none",
-        "models_used": ["gpt"],
+        "models_used": ["deepseek"],
     }
     a.update(kw)
     return a
@@ -209,7 +210,7 @@ async def _eval(eng: StrategyEngine, match: dict, analysis: dict,
 # ════════════════════════════════════════════════════════════════
 
 class TestA0BetTypeWhitelist:
-    """A0：玩法白名单（仅 total/first_half_total/second_half_total）。"""
+    """A0：玩法白名单（仅全场 total）。"""
 
     @pytest.mark.asyncio
     async def test_spread_rejected(self):
@@ -240,20 +241,22 @@ class TestA0BetTypeWhitelist:
         assert "玩法" not in decision.reasoning
 
     @pytest.mark.asyncio
-    async def test_first_half_total_allowed(self):
-        """first_half_total 应通过 A0。"""
+    async def test_first_half_total_rejected(self):
+        """半场盘口可采集展示，但不得进入分析/下单链路。"""
         engine = _mk_engine()
         analysis = _under_analysis(bet_type="first_half_total")
         decision = await _eval(engine, _under_match(), analysis)
-        assert "玩法" not in decision.reasoning
+        assert not decision.should_bet
+        assert "玩法" in decision.reasoning
 
     @pytest.mark.asyncio
-    async def test_second_half_total_allowed(self):
-        """second_half_total 应通过 A0。"""
+    async def test_second_half_total_rejected(self):
+        """下半场盘口不在全场大小球投注白名单。"""
         engine = _mk_engine()
         analysis = _under_analysis(bet_type="second_half_total")
         decision = await _eval(engine, _under_match(), analysis)
-        assert "玩法" not in decision.reasoning
+        assert not decision.should_bet
+        assert "玩法" in decision.reasoning
 
     @pytest.mark.asyncio
     async def test_empty_bet_type_allowed(self):
@@ -386,7 +389,7 @@ class TestA3Confidence:
 
     @pytest.mark.asyncio
     async def test_over_conf_below_floor_rejected(self):
-        """over conf < over_min_conf(0.65) 应被拒绝。"""
+        """over conf < over_min_conf(0.68) 应被拒绝。"""
         engine = _mk_engine()
         analysis = _over_analysis(conf=0.60)
         decision = await _eval(engine, _over_match(), analysis)
@@ -395,7 +398,7 @@ class TestA3Confidence:
 
     @pytest.mark.asyncio
     async def test_over_no_fundamentals_higher_threshold(self):
-        """无基本面时 over 门槛从 0.65 升到 0.68。"""
+        """无基本面时 over 门槛 0.68（与有基本面一致，线距加严区分高线风险）。"""
         engine = _mk_engine()
         analysis = _over_analysis(conf=0.66)
         analysis["context_source"] = "none"
@@ -618,6 +621,7 @@ class TestB1UnderLineRange:
         """足球 under line ≥ 5.0 应被拒绝。"""
         engine = _mk_engine()
         analysis = _under_analysis(conf=0.70, line=5.5)
+        analysis["context_source"] = "nowscore"  # 有基本面，避免线距加严导致A3先拒
         match = _under_match(total_line=5.5)
         decision = await _eval(engine, match, analysis)
         assert not decision.should_bet
@@ -689,13 +693,14 @@ class TestB1OverLineRange:
 
     @pytest.mark.asyncio
     async def test_football_over_line_too_high(self):
-        """足球 over line ≥ 4.5 应被拒绝（残余空间不足）。"""
+        """足球 over line ≥ 3.5 应被拒绝（A3线距加严或B1高线拦截）。"""
         engine = _mk_engine()
         analysis = _over_analysis(conf=0.70, line=5.0)
         match = _over_match(total_line=5.0)
         decision = await _eval(engine, match, analysis)
         assert not decision.should_bet
-        assert "高线" in decision.reasoning or "残余" in decision.reasoning
+        # line≥3.0 触发线距加严 → A3 先拒；或 B1 高线拦截
+        assert "高线" in decision.reasoning or "残余" in decision.reasoning or "置信度" in decision.reasoning
 
     @pytest.mark.asyncio
     async def test_football_over_early_block(self):
@@ -719,7 +724,7 @@ class TestB1OverLineRange:
 
     @pytest.mark.asyncio
     async def test_over_params_independent_from_under(self):
-        """over 参数与 under 独立：over_max_line=4.5 < under_max_line=5.0。"""
+        """over 参数与 under 独立：over_max_line=3.5 < under_max_line=5.0。"""
         fb = SPORT_RISK["football"]
         assert fb["over_max_line"] != fb["under_max_line"]
         assert fb["over_min_line"] != fb["under_min_line"]
@@ -784,7 +789,7 @@ class TestP5PaceProjection:
         """当前节奏推算全场进球 ≥ 盘口线时不应押 under。"""
         engine = _mk_engine()
         # 45', 1-1 → total=2, pace=2/45*90=4.0 ≥ 3.5, margin=1.5 > 1.0（过 B1b）
-        analysis = _under_analysis(conf=0.70, line=3.5)
+        analysis = _under_analysis(conf=0.74, line=3.5)
         match = _under_match(home_score=1, away_score=1, clock="45'",
                              total_line=3.5)
         decision = await _eval(engine, match, analysis)
@@ -813,7 +818,7 @@ class TestP8HighLineTrap:
     async def test_zero_zero_high_line_rejected(self):
         """0-0 且 line≥3.0 且 <30' 应被拒绝。"""
         engine = _mk_engine()
-        analysis = _under_analysis(conf=0.70, line=3.5)
+        analysis = _under_analysis(conf=0.74, line=3.5)
         match = _under_match(home_score=0, away_score=0, clock="25'",
                              total_line=3.5)
         decision = await _eval(engine, match, analysis)
@@ -833,7 +838,7 @@ class TestP8HighLineTrap:
     async def test_zero_zero_high_line_after_30_passes(self):
         """0-0 且 line≥3.0 但 ≥30' 不触发 P8。"""
         engine = _mk_engine()
-        analysis = _under_analysis(conf=0.70, line=3.5)
+        analysis = _under_analysis(conf=0.74, line=3.5)
         match = _under_match(home_score=0, away_score=0, clock="35'",
                              total_line=3.5)
         decision = await _eval(engine, match, analysis)
@@ -852,7 +857,7 @@ class TestP1P4OverRules:
         """P1：足球 over 总进球≤1 且 line≥3.25 应被拒绝。"""
         engine = _mk_engine()
         # 0-1, line=3.5, over
-        analysis = _over_analysis(conf=0.70, line=3.5)
+        analysis = _over_analysis(conf=0.72, line=3.5)
         match = _over_match(home_score=0, away_score=1, clock="35'",
                             total_line=3.5)
         decision = await _eval(engine, match, analysis)
@@ -863,12 +868,11 @@ class TestP1P4OverRules:
     async def test_p4_high_conf_large_gap_over_rejected(self):
         """P4：conf≥0.70 且 total < line-1.5 应被拒绝。"""
         engine = _mk_engine()
-        # 0-0, line=3.0, over conf=0.72
-        # total=0 < 3.0-1.5=1.5 → P4 触发
-        # P1 不触发（line=3.0 < 3.25）
-        analysis = _over_analysis(conf=0.72, line=3.0)
+        # 0-0, line=2.75, over conf=0.72
+        # total=0 < 2.75-1.5=1.25 → P4 触发；3.0+ 由 B1 高线保护优先拦截。
+        analysis = _over_analysis(conf=0.72, line=2.75)
         match = _over_match(home_score=0, away_score=0, clock="35'",
-                            total_line=3.0)
+                            total_line=2.75)
         decision = await _eval(engine, match, analysis)
         assert not decision.should_bet
         assert "大差距" in decision.reasoning or "过度自信" in decision.reasoning
@@ -877,11 +881,10 @@ class TestP1P4OverRules:
     async def test_p4_not_triggered_when_gap_small(self):
         """P4 不触发：total ≥ line-1.5 时不拦截。"""
         engine = _mk_engine()
-        # 1-1, line=3.0, over conf=0.70
-        # total=2 ≥ 3.0-1.5=1.5 → 不触发 P4
-        analysis = _over_analysis(conf=0.70, line=3.0)
+        # 1-1, line=2.75, over conf=0.70；total=2 ≥ 1.25，不触发 P4。
+        analysis = _over_analysis(conf=0.70, line=2.75)
         match = _over_match(home_score=1, away_score=1, clock="35'",
-                            total_line=3.0)
+                            total_line=2.75)
         decision = await _eval(engine, match, analysis)
         assert "过度自信" not in decision.reasoning
 
@@ -897,12 +900,11 @@ class TestP10HalfTimeExtrapolation:
     async def test_p10_low_conf_rejected(self):
         """P10：40-55'、≥2球、pace_proj仅高超线≤1球、conf<0.70 应被拒绝。"""
         engine = _mk_engine()
-        # 45', 1-1 → total=2, line=3.0
-        # pace_proj = 2/45*90 = 4.0 >= 3.0, pace_proj - line = 1.0 <= 1.0
-        # conf=0.69 < 0.70 → P10 拒绝
-        analysis = _over_analysis(conf=0.69, line=3.0)
-        match = _over_match(home_score=1, away_score=1, clock="45'",
-                            total_line=3.0)
+        # 55', 1-1 → total=2, line=2.75；pace_proj≈3.27，仅超线0.52。
+        # 使用有基本面来源让 A3 通过，验证 P10 本身而非更早的置信度/高线闸门。
+        analysis = _over_analysis(conf=0.69, line=2.75, context_source="nowscore")
+        match = _over_match(home_score=1, away_score=1, clock="55'",
+                            total_line=2.75)
         decision = await _eval(engine, match, analysis)
         assert not decision.should_bet
         assert "外推" in decision.reasoning or "半场" in decision.reasoning
@@ -911,11 +913,10 @@ class TestP10HalfTimeExtrapolation:
     async def test_p10_high_conf_continues(self):
         """P10：conf≥0.70 时不直接拒绝（交由 D1 决定）。"""
         engine = _mk_engine()
-        # 45', 1-1, line=3.0, conf=0.72
-        # P10 不拒绝，但 conf=0.72 >= 0.73？ No, 0.72 < 0.73, 不触发 P9 封顶
-        analysis = _over_analysis(conf=0.72, line=3.0)
+        # 45', 1-1, line=2.75, conf=0.72；P10 不直接拒绝。
+        analysis = _over_analysis(conf=0.72, line=2.75)
         match = _over_match(home_score=1, away_score=1, clock="45'",
-                            total_line=3.0)
+                            total_line=2.75)
         decision = await _eval(engine, match, analysis)
         # 不应因 P10 被拒绝
         assert "外推" not in decision.reasoning
@@ -924,9 +925,9 @@ class TestP10HalfTimeExtrapolation:
     async def test_p10_not_triggered_before_40(self):
         """P10 不触发：< 40' 不在半场窗口。"""
         engine = _mk_engine()
-        analysis = _over_analysis(conf=0.69, line=3.0)
+        analysis = _over_analysis(conf=0.69, line=2.75, context_source="nowscore")
         match = _over_match(home_score=1, away_score=1, clock="35'",
-                            total_line=3.0)
+                            total_line=2.75)
         decision = await _eval(engine, match, analysis)
         assert "外推" not in decision.reasoning
 
@@ -1163,13 +1164,11 @@ class TestD1OverPaceGate:
     async def test_pace_insufficient_rejected(self):
         """over 进球速率不足时拒绝。"""
         engine = _mk_engine()
-        # conf=0.69 < 0.70 → P4 不触发
-        # A3: 0.69 > 0.68 ✓
-        # 35', 0-0, line=3.0 → needed=3.0 < 3.5 通过第一关
-        # pace=0, expected=0 < 3.0*1.05=3.15 → 速率不足拒绝
-        analysis = _over_analysis(conf=0.69, line=3.0)
+        # 使用有基本面来源让 A3 通过，且 conf<0.70 跳过 P4。
+        # 35', 0-0, line=2.75 → pace=0，预期不足 → D1 拒绝。
+        analysis = _over_analysis(conf=0.69, line=2.75, context_source="nowscore")
         match = _over_match(home_score=0, away_score=0, clock="35'",
-                            total_line=3.0)
+                            total_line=2.75)
         decision = await _eval(engine, match, analysis)
         assert not decision.should_bet
         assert "速率" in decision.reasoning or "预期" in decision.reasoning
@@ -1292,12 +1291,12 @@ class TestE2EVBreakeven:
     @pytest.mark.asyncio
     async def test_negative_ev_rejected(self):
         """conf < 1/odds + edge 时拒绝（负EV单）。"""
-        engine = _mk_engine(min_odds=1.50)
-        # over odds=1.50 → breakeven=1/1.50=0.6667, edge=0.02, required=0.6867
-        # conf=0.68 < 0.6867 → E2 拒绝
-        analysis = _over_analysis(conf=0.68, line=3.0, odds=1.50)
+        engine = _mk_engine(min_odds=1.40)
+        # 先通过 A3/B1/D1，再验证 E2：odds=1.40 时 required≈0.734，conf=0.70 为负 EV。
+        analysis = _over_analysis(conf=0.70, line=2.75, odds=1.40)
         match = _over_match()
-        match["odds"] = {"under": 1.90, "over": 1.50}
+        match["total_line"] = 2.75
+        match["odds"] = {"under": 1.90, "over": 1.40}
         decision = await _eval(engine, match, analysis)
         assert not decision.should_bet
         assert "EV" in decision.reasoning or "盈亏平衡" in decision.reasoning or "负EV" in decision.reasoning
@@ -1773,7 +1772,7 @@ class TestFullFlowRejectAtEachStage:
     @pytest.mark.asyncio
     async def test_reject_at_e1(self):
         """E1 拒绝：赔率无效。"""
-        engine = _mk_engine(min_odds=1.50)
+        engine = _mk_engine(min_odds=1.40)
         analysis = _under_analysis(conf=0.70, odds=1.20)
         match = _under_match()
         match["odds"] = {"under": 1.20, "over": 1.90}
@@ -1784,12 +1783,12 @@ class TestFullFlowRejectAtEachStage:
     @pytest.mark.asyncio
     async def test_reject_at_e2(self):
         """E2 拒绝：负EV。"""
-        engine = _mk_engine(min_odds=1.50)
-        # over odds=1.50, edge=0.02, breakeven=0.6667, required=0.6867
-        # conf=0.68 < 0.6867 → 拒绝
-        analysis = _over_analysis(conf=0.68, line=3.0, odds=1.50)
+        engine = _mk_engine(min_odds=1.40)
+        # 先通过 A3/B1/D1，再验证 E2 的负 EV 拒绝。
+        analysis = _over_analysis(conf=0.70, line=2.75, odds=1.40)
         match = _over_match()
-        match["odds"] = {"under": 1.90, "over": 1.50}
+        match["total_line"] = 2.75
+        match["odds"] = {"under": 1.90, "over": 1.40}
         decision = await _eval(engine, match, analysis)
         assert not decision.should_bet
         assert "EV" in decision.reasoning or "盈亏平衡" in decision.reasoning
@@ -1802,13 +1801,12 @@ class TestUnderOverIndependent:
     async def test_under_rejected_over_passes_same_match(self):
         """同一场比赛 under 被拒但 over 可能通过（独立评估）。"""
         engine = _mk_engine()
-        # 35', 1-1, line=3.0
-        # under: B1b margin=1.5 > 1.0 通过, D1b margin=1.5 ≤ 1.5 → 需要 conf≥0.73
-        # under conf=0.70 < 0.73 → D1b 拒绝
-        under_d = await _eval(engine, _over_match(), _under_analysis(conf=0.70, line=3.0))
+        # 35', 1-1, line=2.75；under 余量0.75先被 B1b 拒绝，over 节奏充分可通过。
+        match = _over_match(total_line=2.75)
+        under_d = await _eval(engine, match, _under_analysis(conf=0.70, line=2.75))
         # over: needed=1.0 < 3.5, pace sufficient → 通过
-        over_d = await _eval(engine, _over_match(), _over_analysis(conf=0.70, line=3.0))
-        assert not under_d.should_bet  # under 被 D1b 拒绝
+        over_d = await _eval(engine, match, _over_analysis(conf=0.70, line=2.75))
+        assert not under_d.should_bet  # under 被 B1b 拒绝
         assert over_d.should_bet       # over 通过
 
     @pytest.mark.asyncio

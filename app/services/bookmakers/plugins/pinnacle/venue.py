@@ -21,7 +21,7 @@ async def pinnacle_session_expired(page) -> bool:
 
     try:
         state = await page.evaluate(
-            """() => {
+            r"""() => {
               const visible = (el) => {
                 if (!el) return false;
                 const style = window.getComputedStyle(el);
@@ -39,8 +39,14 @@ async def pinnacle_session_expired(page) -> bool:
                 const hint = (el.name || '') + ' ' + (el.id || '') + ' ' + (el.placeholder || '');
                 return !/搜索|search|验证码|verify|captcha|code/i.test(hint);
               });
+              const body = String((document.body && document.body.innerText) || '');
+              const guest = /访客用户看到的赔率存在延迟|请登录或注册以查看|guest.+odds.+delay|log\s*in\s*or\s*register/i.test(body);
+              const loginAction = [...document.querySelectorAll('button, a, [role="button"]')]
+                .some((el) => visible(el) && /^(登录|登入|log\s*in|sign\s*in)$/i.test(
+                  String(el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim()
+                ));
               // 盘口页也可能带有非登录密码控件；必须同时存在可见账号和密码输入才算退出。
-              return {password, username, loginSurface: password && username};
+              return {password, username, guest, loginAction, loginSurface: (password && username) || guest};
             }"""
         )
     except Exception:

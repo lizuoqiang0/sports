@@ -73,13 +73,13 @@ _best_by_selection = best_by_selection
 
 
 async def compare_match_odds(db: AsyncSession, match_id: int) -> dict:
-    """OB / 平博全场小球比价。"""
+    """OB / 平博全场大小球比价。"""
     matrix = await load_odds_matrix(db, match_id, bet_type=BetType.TOTAL)
-    # 仅保留单边站点的小球方向。
+    # 仅保留单边站点的全场大小球方向；让球/胜负不进入比价结果。
     allow = {"OB体育", "平博"}
     filtered: dict[str, dict[str, float]] = {}
     for sel, provs in matrix.items():
-        if str(sel).lower() != "under":
+        if str(sel).lower() not in {"under", "over"}:
             continue
         for p, o in (provs or {}).items():
             if p in allow:

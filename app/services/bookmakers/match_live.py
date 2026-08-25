@@ -406,7 +406,7 @@ def total_goals_exceed_line(
     away_score: Any,
     total_line: Any,
 ) -> bool:
-    """当前总比分是否已超过小球盘口。"""
+    """当前总比分是否已超过全场大小球盘口。"""
     if total_line is None or total_line == "":
         return False
     try:

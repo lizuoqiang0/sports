@@ -29,7 +29,7 @@ export function WSProvider({ children }) {
         [mid]: { ...data.odds_data, _updatedAt: Date.now() },
       }))
     } else if (Array.isArray(data.odds)) {
-      // 业务仅支持小球：优先取 total/under 盘口。
+      // 业务仅支持全场大小球：保留 total 盘口的 under/over 两边。
       const total = data.odds.find((o) => String(o.bet_type || '').toLowerCase() === 'total')
       if (total?.odds_data) {
         setOddsUpdates((prev) => ({

@@ -71,9 +71,9 @@ class SportType(str, Enum):
 class BetType(str, Enum):
     MONEYLINE = "moneyline"        # 胜负
     SPREAD = "spread"              # 让分
-    TOTAL = "total"                # 全场小球总分
-    FIRST_HALF_TOTAL = "first_half_total"  # 上半场小球
-    SECOND_HALF_TOTAL = "second_half_total"  # 下半场小球
+    TOTAL = "total"                # 全场大小球总分
+    FIRST_HALF_TOTAL = "first_half_total"  # 上半场大小球（历史兼容）
+    SECOND_HALF_TOTAL = "second_half_total"  # 下半场大小球（历史兼容）
     PROPOSITION = "prop"           # 特殊投注
     PARLAY = "parlay"              # 串关
     LIVE = "live"                  # 滚球
@@ -227,9 +227,9 @@ class Odds(Base):
     # 如: {"home": 1.85, "away": 2.10, "draw": 3.20}
     odds_data: Mapped[dict] = mapped_column(JSON, nullable=False)
 
-    # 盘口信息（让分/小球）
+    # 盘口信息（让分/大小球）
     spread: Mapped[Optional[float]] = mapped_column(default=0)  # 让分数
-    total: Mapped[Optional[float]] = mapped_column(default=0)    # 小球盘口线
+    total: Mapped[Optional[float]] = mapped_column(default=0)    # 大小球盘口线
 
     # 来源
     provider: Mapped[str] = mapped_column(String(50), default="OB Sports")
@@ -258,12 +258,12 @@ class Bet(Base):
 
     # 投注详情
     bet_type: Mapped[BetType] = mapped_column(nullable=False)
-    selection: Mapped[str] = mapped_column(String(50), nullable=False)  # under（仅小球）
+    selection: Mapped[str] = mapped_column(String(50), nullable=False)  # total: under / over
     odds: Mapped[float] = mapped_column(nullable=False)  # 下注时赔率
     stake: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)  # 投注金额
     potential_payout: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)  # 预期赔付
     actual_payout: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False, default=0)  # 实际赔付
-    # 盘口线：小球 total / 让球 spread（结算用）
+    # 盘口线：大小球 total / 让球 spread（结算用）
     line: Mapped[Optional[float]] = mapped_column(nullable=True)
 
     # 多站点

@@ -275,7 +275,10 @@ class BrowserSiteConnector(BookmakerConnector):
                     continue
                 odds_list.append(
                     RemoteOdds(
-                        bet_type=str(od.get("bet_type") or "moneyline"),
+                        # 缺少盘口类型时保持为空，由同步层跳过；绝不能把
+                        # 未知/损坏的 under/over 结构默认当成独赢，避免让球
+                        # 或特殊盘污染当前盘口。
+                        bet_type=str(od.get("bet_type") or "").strip().lower(),
                         odds_data=dict(od.get("odds_data") or {}),
                         spread=float(od.get("spread") or 0),
                         total=float(od.get("total") or 0),
@@ -296,6 +299,7 @@ class BrowserSiteConnector(BookmakerConnector):
                     away_score=int(item.get("away_score") or 0),
                     clock=str(item.get("clock") or ""),
                     period=str(item.get("period") or ""),
+                    data_quality=dict(item.get("data_quality") or {}),
                 )
             )
         from app.services.bookmakers.match_live import remote_match_started
@@ -395,6 +399,29 @@ class BrowserSiteConnector(BookmakerConnector):
         bet_type: str = "moneyline",
         odds_data: Optional[dict] = None,
     ) -> PlaceBetResult:
+        # 连接器边界再做一次平博玩法校验。即使上层或 Browser Gate 版本较旧，
+        # spread/moneyline/半场单也不能离开后端进程。
+        if self.code == "pinnacle":
+            if str(bet_type or "").strip().lower() != "total":
+                return PlaceBetResult(ok=False, message="平博仅支持全场大小球（bet_type=total）")
+            if str(selection or "").strip().lower() not in {"under", "over"}:
+                return PlaceBetResult(ok=False, message="平博仅支持大小球方向（under/over）")
+            payload = odds_data if isinstance(odds_data, dict) else {}
+            meta = payload.get("_site") or payload.get("_pinnacle") or {}
+            if isinstance(meta, dict):
+                meta_bt = str(meta.get("bet_type") or "").strip().lower()
+                if meta_bt and meta_bt not in {"total", "totals", "ou"}:
+                    return PlaceBetResult(ok=False, message="平博盘口元数据不是全场大小球，已阻止下单")
+                meta_line = meta.get("line")
+            else:
+                meta_line = None
+            try:
+                total_line = float(payload.get("line") or payload.get("total") or meta_line or 0)
+            except (TypeError, ValueError):
+                total_line = 0.0
+            if total_line <= 0:
+                return PlaceBetResult(ok=False, message="平博缺少当前全场大小球盘口线，已阻止下单")
+
         if gate_url() and self.session_token:
             data = await post_place_bet(
                 base_url=self.base_url,
@@ -419,6 +446,7 @@ class BrowserSiteConnector(BookmakerConnector):
                     message=str(data.get("message") or "下单成功"),
                     external_bet_id=data.get("external_bet_id"),
                     balance_after=self._balance,
+                    actual_stake=to_decimal(data.get("actual_stake")),
                 )
             msg = str(data.get("message") or "下单失败")
             if "浏览器网关下单失败" in msg:

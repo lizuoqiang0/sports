@@ -4,7 +4,7 @@
 
 - `quick.sh`: 集成首次部署、日常部署、状态查看、停止、重启、清数据为一体。
   - `bash scripts/quick.sh --init --with-ai` — 首次部署/全量启动（.env+数据目录+Browser Gate+frontend）
-  - `bash scripts/quick.sh` — 日常部署（语法检查→构建→重建→清缓存→健康检查）
+  - `bash scripts/quick.sh` — 日常部署（全量语法检查→构建 backend/frontend→重建→清临时缓存→就绪检查）
   - `bash scripts/quick.sh --no-build` — 跳过构建，仅重建容器
   - `bash scripts/quick.sh --with-ai` — 同时启动 AI 引擎
   - `bash scripts/quick.sh --logs` — 部署后跟踪日志

@@ -365,7 +365,7 @@ async def get_recommendation(
     match_id: int,
     current_user: User = Depends(get_current_user),
 ):
-    """获取 AI 全场小球投注建议。"""
+    """获取 AI 全场大小球投注建议。"""
     result = await analyze_and_recommend(
         match_id, current_user.id
     )
@@ -561,7 +561,7 @@ async def start_recommendations_analysis(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """开始后台轮询分析当前球类滚球小球。"""
+    """开始后台轮询分析当前球类滚球全场大小球。"""
     from app.ai.recs_job import start_analysis_watch
     from app.config import settings as _settings
     from app.ai.strategy import load_fresh_strategy
@@ -653,7 +653,7 @@ async def one_click_bet(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """一键投注：OB/平博单边全场小球。
+    """一键投注：OB/平博单边全场大小球。
 
     与自动投注使用同一套 execute_bet 执行逻辑：
     跨站比价 → provider 解析 → 未连接自动切站 → 动态仓位 → 重试下单。

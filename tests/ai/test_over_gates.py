@@ -6,7 +6,7 @@
 - B3 高赔率 over 镜像
 - C1 升盘→over 支持（against_under 改名 over 后语义）
 - D1-over 进球速率闸门（needed 上限 + pace 校验）
-- A3 方向统一门槛（over/under 均 0.65，实盘调参后提高）
+- A3 方向门槛（over 0.68 / under 0.65，实盘调参后提高）
 - 胜率自适应按 by_selection 隔离（over 样本不污染 under 门槛）
 - 归一化层 over 词表
 """
@@ -91,38 +91,38 @@ async def run_cases():
     results.append(("开启后 over 不再被 A1 拦", "未启用" not in d.reasoning and "不支持的投注方向" not in d.reasoning,
                     f"should_bet={d.should_bet} reasoning={d.reasoning[:60]}"))
 
-    # ── 4. A3 方向统一门槛：over/under 均 0.65（实盘调参后提高）──
+    # ── 4. A3 方向门槛：over 0.68 / under 0.65（实盘调参后提高）──
     fb = SPORT_RISK["football"]
-    results.append(("over/under 门槛统一 0.65",
-                    fb["over_min_conf"] == 0.65 and fb["under_min_conf"] == 0.65,
+    results.append(("over门槛0.68 under门槛0.65",
+                    fb["over_min_conf"] == 0.68 and fb["under_min_conf"] == 0.65,
                     f"over={fb['over_min_conf']} under={fb['under_min_conf']}"))
-    # conf=0.58 低于门槛 0.65，应被拒绝
+    # conf=0.58 低于门槛 0.68，应被拒绝
     eng = _mk_engine(over_enabled=True)
     d = await _eval(eng, _base_match(), _analysis(confidence=0.58, context_source="none"))
-    results.append(("conf=0.58 低于门槛 0.65 被拒",
+    results.append(("conf=0.58 低于门槛 0.68 被拒",
                     not d.should_bet and "置信度不足" in d.reasoning,
                     f"reasoning={d.reasoning[:60]}"))
 
     # ── 5. B1-over 线区间独立参数 ──
     eng = _mk_engine(over_enabled=True)
-    d = await _eval(eng, _base_match(), _analysis(line=5.0))  # 足球 over_max_line=4.5
-    results.append(("高线 over 拒（line=5.0≥4.5）", not d.should_bet and "高线over" in d.reasoning,
+    d = await _eval(eng, _base_match(), _analysis(line=5.0))  # 足球 over_max_line=3.5
+    results.append(("高线 over 拒（line=5.0≥3.5）", not d.should_bet and "高线over" in d.reasoning,
                     f"reasoning={d.reasoning}"))
     eng = _mk_engine(over_enabled=True)
-    d = await _eval(eng, _base_match(), _analysis(line=1.5))  # over_min_line=2.0
-    results.append(("低线 over 拒（line=1.5≤2.0）", not d.should_bet and "低线over" in d.reasoning,
+    d = await _eval(eng, _base_match(), _analysis(line=1.5))  # over_min_line=2.5
+    results.append(("低线 over 拒（line=1.5≤2.5）", not d.should_bet and "低线over" in d.reasoning,
                     f"reasoning={d.reasoning}"))
 
     # ── 6. B3 高赔率镜像 ──
     eng = _mk_engine(over_enabled=True)
-    d = await _eval(eng, _base_match(odds={"under": 1.90, "over": 2.10}), _analysis(odds=2.10, line=3.0))
+    d = await _eval(eng, _base_match(odds={"under": 1.90, "over": 2.10}), _analysis(odds=2.10, line=2.75, confidence=0.72))
     results.append(("over 赔率≥2.0 拒（市场看小）", not d.should_bet and "大球赔率过高" in d.reasoning,
                     f"reasoning={d.reasoning}"))
 
     # ── 7. C1 升盘→over 支持：升盘+over 通过方向检查（降盘+over 拒）──
     eng = _mk_engine(over_enabled=True)
     d = await _eval(eng, _base_match(line_movements={"total": {"line_delta": -0.5}}, odds={"under": 1.80, "over": 1.80}),
-                    _analysis(line=3.0, odds=1.80, confidence=0.75))
+                    _analysis(line=2.75, odds=1.80, confidence=0.72))
     results.append(("降盘+over 拒（盘口方向相反）", not d.should_bet and "相反" in d.reasoning,
                     f"reasoning={d.reasoning}"))
 

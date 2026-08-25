@@ -47,6 +47,24 @@ async def _reload_live_map(session: AsyncSession) -> dict[int, Match]:
     return {m.id: m for m in matches_res.scalars().all()}
 
 
+def _collapse_active_odds_rows(rows: list[Odds], close_at: datetime) -> dict[BetType, Odds]:
+    """保留每个玩法最新的一条有效赔率，并关闭历史重复的 ``valid_to=NULL`` 行。
+
+    调用方必须按 ``bet_type, valid_from DESC, id DESC`` 排序传入。旧版同步从
+    ``match.odds`` 关系中任取第一行，关系顺序并不保证最新，导致每次盘口变化
+    都可能留下多条“当前”行。下游读取到的行随查询顺序漂移，是 UI 找错盘口和
+    自动下单未命中接口的根源之一。
+    """
+    latest: dict[BetType, Odds] = {}
+    for row in rows:
+        bet_type = row.bet_type
+        if bet_type not in latest:
+            latest[bet_type] = row
+        else:
+            row.valid_to = close_at
+    return latest
+
+
 async def _broadcast_match_update(match: Match, odds_payload: list[dict], now: datetime) -> None:
     """同 tick 合并推送：live 频道 + match 频道各一条，避免 moneyline 重复风暴。"""
     from app.core.websocket import manager, WSEventType
@@ -203,25 +221,48 @@ async def sync_live_scores_odds(
                     match.updated_at = now.replace(tzinfo=None) if getattr(now, "tzinfo", None) else now
 
                     odds_payload = []
+                    # 关闭本轮已经消失的盘口版本。滚球同步以前只写入新盘口，
+                    # 当 OB 从全场大小切换到半场/锁盘时，旧的 TOTAL 会继续
+                    # 保持 valid_to=NULL，AI 便可能读到过期盘口；下单复核也会
+                    # 因此出现“接口未命中”或把旧行当成当前行。只要本轮确实
+                    # 收到该场赛事，就以远端返回的 bet_type 集合为准收口。
+                    # 直接从表中读取并按版本倒序收敛，不能依赖 relationship 的
+                    # 载入顺序；同时自愈旧版产生的重复有效行。
+                    close_at = now.replace(tzinfo=None) if getattr(now, "tzinfo", None) else now
+                    active_result = await wdb.execute(
+                        select(Odds).where(
+                            Odds.match_id == match_id,
+                            Odds.provider == provider,
+                            Odds.valid_to.is_(None),
+                        ).order_by(Odds.bet_type, Odds.valid_from.desc(), Odds.id.desc())
+                    )
+                    active_by_type = _collapse_active_odds_rows(
+                        list(active_result.scalars().all()), close_at
+                    )
+                    seen_bet_types: set[BetType] = set()
                     for ro in rm.odds_list:
                         try:
                             bt = BetType(ro.bet_type)
                         except ValueError:
-                            bt = BetType.MONEYLINE
+                            # 未知盘口绝不能静默降级为 MONEYLINE：其 under/over
+                            # 字段可能来自让球或特殊盘，降级会污染当前盘口并
+                            # 触发错误的 UI 下单接口。
+                            logger.warning(
+                                "[sync_live] 未知 bet_type=%s 跳过 match=%s provider=%s",
+                                ro.bet_type, match_id, provider,
+                            )
+                            continue
+                        seen_bet_types.add(bt)
 
                         write_key = (match_id, provider, bt.value if hasattr(bt, "value") else str(bt))
                         if write_key in written_keys:
                             continue
 
-                        current = None
-                        for o in (match.odds or []):
-                            if o.valid_to is None and o.provider == provider and o.bet_type == bt:
-                                current = o
-                                break
+                        current = active_by_type.get(bt)
 
                         pub = _public_odds_data(ro.odds_data)
                         new_data = normalize_odds_data_to_european(ro.odds_data)
-                        _, wrote = apply_odds_version(
+                        current, wrote = apply_odds_version(
                             wdb,
                             current=current,
                             match_id=match_id,
@@ -237,6 +278,9 @@ async def sync_live_scores_odds(
                         if wrote:
                             written_keys.add(write_key)
                             updated += 1
+                            # apply_odds_version 返回新建/更新后的当前版本；保留
+                            # 该对象，后续同一赛事的收敛逻辑才能正确关闭旧版本。
+                            active_by_type[bt] = current
 
                         odds_payload.append({
                             "bet_type": bt.value if hasattr(bt, "value") else str(bt),
@@ -245,6 +289,12 @@ async def sync_live_scores_odds(
                             "total": ro.total,
                             "is_live": True,
                         })
+
+                    # 同一站点同一赛事未再返回的盘口已不再可用；关闭其
+                    # 当前版本，避免历史 TOTAL/SPREAD/MONEYLINE 泄漏到 AI。
+                    for old_bt, old in active_by_type.items():
+                        if old_bt not in seen_bet_types:
+                            old.valid_to = close_at
 
                     await _broadcast_match_update(match, odds_payload, now)
 

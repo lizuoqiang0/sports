@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional
 
@@ -35,6 +35,41 @@ logger = logging.getLogger(__name__)
 # 单边模式可下注站点
 SINGLE_SIDE_PROVIDER_NAMES = frozenset({"平博", "OB体育"})
 SINGLE_SIDE_PROVIDER_CODES = frozenset({"pinnacle", "ob"})
+
+
+def _place_failure_is_retryable(message: str) -> bool:
+    """Only retry failures known to happen before an order can be submitted.
+
+    DOM selection/safety failures already run their own targeted recovery.  Retrying
+    them blindly repeats the same click path; retrying an ambiguous post-click failure
+    can even create a duplicate order.
+    """
+    text = str(message or "").lower()
+    transient_markers = (
+        "浏览器网关正忙",
+        "本站浏览器正忙",
+        "browser gate",
+        "connection refused",
+        "connect timeout",
+        "read timeout",
+        "timed out",
+        "timeout",
+        "超时",
+        "temporarily unavailable",
+        "service unavailable",
+    )
+    return any(marker.lower() in text for marker in transient_markers)
+
+
+def _provider_row_matches(row: Optional[Odds], provider_code: str, provider_label: str) -> bool:
+    """判断赔率行是否确实属于目标站点（允许历史 code/name 两种写法）。"""
+    if row is None:
+        return False
+    aliases = {
+        "pinnacle": {"平博", "pinnacle"},
+        "ob": {"ob体育", "ob sports", "ob"},
+    }.get(str(provider_code or "").lower(), {str(provider_label or "").strip().lower()})
+    return str(getattr(row, "provider", "") or "").strip().lower() in aliases
 
 
 @dataclass
@@ -62,7 +97,7 @@ async def get_best_market_pack(
     *,
     providers_filter: set[str] | None = None,
 ) -> dict:
-    """精选指定盘口（total/moneyline/spread），跨站比价。"""
+    """精选全场大小球盘口，跨站比价；其它玩法直接返回空。"""
     from app.ai.market_recommend import load_market_matrix
     from app.services.provider_utils import (
         best_by_selection as _best_by_selection,
@@ -70,7 +105,15 @@ async def get_best_market_pack(
     )
 
     bt = str(bet_type or "total").lower()
-    matrix, spread_line, total_line = await load_market_matrix(
+    if bt != "total":
+        return {
+            "odds": {},
+            "best_by_selection": {},
+            "odds_by_provider": {},
+            "line": None,
+            "bet_type": bt,
+        }
+    matrix, _spread_line, total_line = await load_market_matrix(
         db, match_id, bt, providers_filter=providers_filter
     )
     best_raw = _best_by_selection(matrix)
@@ -90,8 +133,6 @@ async def get_best_market_pack(
     line = None
     if bt == "total" and total_line:
         line = float(total_line)
-    elif bt == "spread" and spread_line:
-        line = float(spread_line)
     return {
         "odds": odds,
         "best_by_selection": best_by_selection,
@@ -108,7 +149,11 @@ async def get_odds_row(
     provider_name_prefer: str = "平博",
     bet_type: BetType = BetType.TOTAL,
 ) -> Optional[Odds]:
-    """优先取指定站盘口行（默认全场小球）。"""
+    """只返回指定站点、指定盘口类型的当前赔率行。
+
+    绝不能在 total 行缺失时回退到 spread/moneyline：那会把同名
+    ``under/over`` 字段误当成大小球，实际下成让球单。
+    """
     match_ids = [int(match_id)]
     try:
         from app.models.user import Match as _Match
@@ -122,12 +167,19 @@ async def get_odds_row(
     except Exception:
         pass
 
+    # 自动投注只消费实时盘口。valid_to=NULL 并不代表仍然在场：当 Gate
+    # 暂时返回空列表时，旧版本可能继续保持 current。超过 5 分钟直接失效，
+    # 避免对已结束/已下架赛事重复执行 UI 点击。
+    fresh_after = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=5)
+
     result = await db.execute(
         select(Odds).where(
             Odds.match_id.in_(match_ids),
             Odds.bet_type == bet_type,
             Odds.provider == provider_name_prefer,
             Odds.valid_to.is_(None),
+            Odds.is_live.is_(True),
+            Odds.valid_from >= fresh_after,
         ).limit(1)
     )
     row = result.scalar_one_or_none()
@@ -138,21 +190,23 @@ async def get_odds_row(
             Odds.match_id.in_(match_ids),
             Odds.bet_type == bet_type,
             Odds.valid_to.is_(None),
+            Odds.is_live.is_(True),
+            Odds.valid_from >= fresh_after,
         )
     )
-    odds_list = result.scalars().all()
-    if odds_list:
-        for o in odds_list:
-            if str(o.provider or "") == "平博":
-                return o
-        return odds_list[0]
-    result = await db.execute(
-        select(Odds).where(
-            Odds.match_id.in_(match_ids),
-            Odds.valid_to.is_(None),
-        )
-    )
-    return result.scalars().first()
+    odds_list = list(result.scalars().all())
+    # provider 别名只在同一站点内归一化，禁止跨站或跨玩法接管。
+    preferred = str(provider_name_prefer or "").strip().lower()
+    aliases = {
+        "平博": {"平博", "pinnacle"},
+        "pinnacle": {"平博", "pinnacle"},
+        "ob体育": {"ob体育", "ob sports", "ob"},
+        "ob": {"ob体育", "ob sports", "ob"},
+    }.get(preferred, {preferred})
+    for o in odds_list:
+        if str(o.provider or "").strip().lower() in aliases:
+            return o
+    return None
 
 
 async def mark_bet_pending(
@@ -246,7 +300,7 @@ async def execute_bet(
     bet_type = str(getattr(decision, "bet_type", None) or "total").lower()
 
     # ── 玩法白名单 ──
-    ALLOWED_BET_TYPES = {"total", "first_half_total", "second_half_total"}
+    ALLOWED_BET_TYPES = {"total"}
     allowed_sels = {"under", "over"}
     if bet_type not in ALLOWED_BET_TYPES or sel not in allowed_sels:
         logger.warning(
@@ -254,6 +308,9 @@ async def execute_bet(
             decision.match_id, bet_type, sel,
         )
         return BetExecResult(ok=False, message=f"不支持的盘口/方向: {bet_type}/{sel}")
+    if sel == "over" and not bool(getattr(settings, "AI_ENABLE_OVER", True)):
+        logger.info("[下单] over 已由 AI_ENABLE_OVER 关闭: match=%s", decision.match_id)
+        return BetExecResult(ok=False, message="不支持大球投注（AI_ENABLE_OVER=false）")
 
     sport_key = match.sport.value if hasattr(match.sport, "value") else str(match.sport)
     if is_virtual_match(sport_key, match.league or "", match.home_team or "", match.away_team or ""):
@@ -275,6 +332,17 @@ async def execute_bet(
         bet_type,
         providers_filter=SINGLE_SIDE_PROVIDER_NAMES,
     )
+    # 下单前再次确认数据库里确实有当前全场大小球的同向赔率和盘口线。
+    # 没有 total 行时禁止使用 decision.odds 继续点 UI，避免把旧让球赔率
+    # 当成 under/over。
+    pack_odds = pack.get("odds") or {}
+    if sel not in pack_odds or not pack.get("line"):
+        msg = "未找到当前全场大小球赔率，已阻止下单"
+        logger.warning(
+            "[下单] ❌ total 赔率行缺失: match=%s sel=%s odds_keys=%s line=%s",
+            decision.match_id, sel, sorted(pack_odds), pack.get("line"),
+        )
+        return BetExecResult(ok=False, message=msg)
     best_meta = (pack.get("best_by_selection") or {}).get(sel) or {}
 
     # ── 2. provider_code 四级 fallback ──
@@ -402,44 +470,71 @@ async def execute_bet(
         )
     odds_payload = dict(odds_row.odds_data or {}) if odds_row else {}
     line_val = None
-    row_is_own_site = bool(odds_row and str(odds_row.provider or "") == provider_label)
+    row_is_own_site = _provider_row_matches(odds_row, provider_code, provider_label)
     if bet_type == "total":
         if row_is_own_site and odds_row.total is not None:
             try:
                 line_val = float(odds_row.total)
             except (TypeError, ValueError):
                 line_val = None
-    if line_val is None and decision.line is not None:
-        try:
-            line_val = float(decision.line)
-        except (TypeError, ValueError):
-            line_val = None
-    if line_val is None and pack.get("line") is not None:
-        try:
-            line_val = float(pack["line"])
-        except (TypeError, ValueError):
-            line_val = None
+        if line_val is None and row_is_own_site:
+            try:
+                line_val = float(odds_payload.get("line") or odds_payload.get("total") or 0)
+            except (TypeError, ValueError):
+                line_val = None
+    # 目标站点没有自己的 total 行/方向赔率/盘口线时，禁止用决策缓存或另一站
+    # 的 pack 数据继续点 UI；这正是让球单混入平博注单的主要风险路径。
+    try:
+        row_side_odds = float(odds_payload.get(sel) or 0)
+    except (TypeError, ValueError):
+        row_side_odds = 0.0
+    if not row_is_own_site or row_side_odds <= 1.0 or line_val is None or line_val <= 0:
+        msg = "目标站点缺少当前全场大小球赔率/盘口线，已阻止下单"
+        logger.warning(
+            "[下单] ❌ 目标站点 total 行不完整: match=%s site=%s provider=%s sel=%s odds=%.3f line=%s",
+            decision.match_id, provider_code, getattr(odds_row, "provider", None), sel, row_side_odds, line_val,
+        )
+        return BetExecResult(ok=False, message=msg, provider_code=provider_code, provider_label=provider_label)
     if line_val is not None and bet_type == "total":
         odds_payload = {**odds_payload, "line": line_val, "total": line_val}
 
+    # 分析快照与实际下注快照必须是同一条全场线。哪怕只变动半球/四分之一，
+    # 亚洲盘的结算区间也已改变，直接停止并等待下一轮重新分析。
+    try:
+        decision_line = float(decision.line or 0)
+    except (TypeError, ValueError):
+        decision_line = 0.0
+    if decision_line > 0 and line_val is not None and abs(line_val - decision_line) > 0.01:
+        msg = f"盘口已从分析线 {decision_line:g} 变为 {line_val:g}，已阻止使用旧分析下单"
+        logger.warning(
+            "[下单] ❌ 分析盘口过期 match=%s site=%s decision_line=%s current_line=%s",
+            decision.match_id, provider_code, decision_line, line_val,
+        )
+        await _notify(user.id, "bet_failed", {"match_id": decision.match_id, "message": msg})
+        return BetExecResult(ok=False, message=msg, provider_code=provider_code, provider_label=provider_label)
+
     # ── 6. 当前赔率（优先数据库最新）──
     try:
-        fresh_sel_odds = float(odds_payload.get(sel) or 0)
-        current_odds = float(
-            fresh_sel_odds
-            or decision.odds
-            or (best_meta.get("odds") or 0)
-            or (pack.get("odds") or {}).get(sel)
-            or 0
-        )
+        current_odds = float(odds_payload.get(sel) or 0)
     except (TypeError, ValueError):
         current_odds = 0.0
     if current_odds <= 0:
         logger.warning("[下单] ❌ 赔率无效 match=%s type=%s sel=%s odds=0", decision.match_id, bet_type, sel)
         return BetExecResult(ok=False, message="赔率无效", provider_code=provider_code, provider_label=provider_label)
 
-    # 赔率变动记录
+    # 赔率大幅跳变时不能把旧模型置信度直接套到新价位；小幅跳水交给站点
+    # 原生接受更优赔率策略处理，大幅变化则重新分析。
     decision_odds = float(decision.odds or 0)
+    if decision_odds > 1.0 and abs(current_odds - decision_odds) > 0.10:
+        msg = f"赔率已从分析值 {decision_odds:.3f} 变为 {current_odds:.3f}，已阻止使用旧分析下单"
+        logger.warning(
+            "[下单] ❌ 分析赔率过期 match=%s site=%s decision_odds=%.3f current_odds=%.3f",
+            decision.match_id, provider_code, decision_odds, current_odds,
+        )
+        await _notify(user.id, "bet_failed", {"match_id": decision.match_id, "message": msg})
+        return BetExecResult(ok=False, message=msg, provider_code=provider_code, provider_label=provider_label)
+
+    # 赔率变动记录
     if decision_odds > 0 and abs(current_odds - decision_odds) > 0.05:
         if current_odds > decision_odds + 0.05:
             logger.info("[下单] 赔率上调 match=%s 决策=%.2f 最新=%.2f", decision.match_id, decision_odds, current_odds)
@@ -475,17 +570,22 @@ async def execute_bet(
         return BetExecResult(ok=False, message="仓位异常", provider_code=provider_code, provider_label=provider_label)
     if float(site_acc.balance or 0) < float(stake):
         # 余额不足时尝试切换到另一个已连接且有余额的站点
-        alt_res = await db.execute(
-            select(BookmakerAccount).where(
-                BookmakerAccount.user_id == user.id,
-                BookmakerAccount.enabled.is_(True),
-                BookmakerAccount.status == BookmakerStatus.CONNECTED,
-                BookmakerAccount.code != provider_code,
-                BookmakerAccount.code.in_(list(SINGLE_SIDE_PROVIDER_CODES)),
+        try:
+            alt_res = await db.execute(
+                select(BookmakerAccount).where(
+                    BookmakerAccount.user_id == user.id,
+                    BookmakerAccount.enabled.is_(True),
+                    BookmakerAccount.status == BookmakerStatus.CONNECTED,
+                    BookmakerAccount.code != provider_code,
+                    BookmakerAccount.code.in_(list(SINGLE_SIDE_PROVIDER_CODES)),
+                )
             )
-        )
+            alt_accounts = alt_res.scalars().all()
+        except Exception as e:
+            logger.warning("[下单] 余额不足时读取替代站点失败: %s", e)
+            alt_accounts = []
         switched = False
-        for alt_acc in alt_res.scalars().all():
+        for alt_acc in alt_accounts:
             logger.info(
                 "[下单] 余额切换检查: alt=%s real=%s balance=%.2f stake=%.2f",
                 alt_acc.code,
@@ -535,9 +635,17 @@ async def execute_bet(
                 provider_name_prefer=provider_name(alt_code),
                 bet_type=bt_enum,
             )
+            if not _provider_row_matches(alt_odds_row, alt_code, provider_name(alt_code)):
+                logger.info("[下单] 余额切换: %s 缺少本站全场大小球行，跳过", alt_code)
+                continue
             alt_odds_payload = dict(alt_odds_row.odds_data or {}) if alt_odds_row else {}
-            alt_current_odds = float(alt_odds_payload.get(sel) or decision_odds or current_odds)
-            if alt_current_odds <= 1.0:
+            try:
+                alt_current_odds = float(alt_odds_payload.get(sel) or 0)
+                alt_line = float(alt_odds_row.total or alt_odds_payload.get("line") or alt_odds_payload.get("total") or 0)
+            except (TypeError, ValueError):
+                alt_current_odds = 0.0
+                alt_line = 0.0
+            if alt_current_odds <= 1.0 or alt_line <= 0:
                 continue
             logger.info(
                 "[下单] 余额不足切换: %s(%.2f) -> %s(%.2f) | match=%s sel=%s odds=%.2f",
@@ -552,14 +660,8 @@ async def execute_bet(
             odds_row = alt_odds_row
             odds_payload = alt_odds_payload
             current_odds = alt_current_odds
-            # 重新解析 line
-            row_is_own_site = bool(odds_row and str(odds_row.provider or "") == provider_label)
-            if bet_type == "total":
-                if row_is_own_site and odds_row.total is not None:
-                    try:
-                        line_val = float(odds_row.total)
-                    except (TypeError, ValueError):
-                        pass
+            # 重新解析本站 total line
+            line_val = alt_line
             switched = True
             break
         if not switched:
@@ -605,6 +707,7 @@ async def execute_bet(
     retry_count = int(settings.BET_RETRY_COUNT)
     retry_delay = float(settings.BET_RETRY_DELAY)
     place = None
+    attempts_used = 0
     for attempt in range(1 + retry_count):
         if attempt > 0:
             logger.info("[下单] 补单重试 %s/%s: match=%s 等待 %.1fs", attempt, retry_count, decision.match_id, retry_delay)
@@ -618,8 +721,20 @@ async def execute_bet(
             )
             if fresh_odds_row:
                 fresh_payload = dict(fresh_odds_row.odds_data or {})
-                if line_val is not None and bet_type == "total":
-                    fresh_payload = {**fresh_payload, "line": line_val, "total": line_val}
+                if bet_type == "total":
+                    try:
+                        fresh_line = float(
+                            fresh_odds_row.total
+                            or ((fresh_payload.get("_site") or {}).get("line"))
+                            or fresh_payload.get("line")
+                            or fresh_payload.get("total")
+                            or 0
+                        )
+                    except (AttributeError, TypeError, ValueError):
+                        fresh_line = 0.0
+                    if fresh_line > 0:
+                        line_val = fresh_line
+                        fresh_payload = {**fresh_payload, "line": line_val, "total": line_val}
                 odds_payload = fresh_payload
                 try:
                     current_odds = float(
@@ -634,6 +749,7 @@ async def execute_bet(
         # 队名注入 odds_data
         odds_payload["_home_team"] = match.home_team or ""
         odds_payload["_away_team"] = match.away_team or ""
+        odds_payload["_is_live"] = True
         odds_payload["_stake_policy"] = {
             "dynamic_stake": str(stake),
             "max_stake": str(strat_cfg.max_bet_amount or stake),
@@ -648,6 +764,7 @@ async def execute_bet(
             bet_type=bet_type,
             odds_data=odds_payload,
         )
+        attempts_used = attempt + 1
         if place.ok:
             _actual = getattr(place, "actual_stake", None)
             if _actual:
@@ -672,10 +789,18 @@ async def execute_bet(
         if place.ok:
             break
         logger.warning("[下单] 失败 (attempt %s/%s): %s", attempt + 1, 1 + retry_count, place.message)
+        if attempt >= retry_count or not _place_failure_is_retryable(place.message):
+            if attempt < retry_count:
+                logger.info(
+                    "[下单] 不重复执行非瞬时/可能已点击的失败: match=%s reason=%s",
+                    decision.match_id,
+                    str(place.message or "")[:240],
+                )
+            break
 
     if not place or not place.ok:
         msg = place.message if place else "unknown"
-        logger.warning("[下单] 真实下单失败（已重试 %s 次）: %s", retry_count, msg)
+        logger.warning("[下单] 真实下单失败（尝试 %s 次）: %s", attempts_used, msg)
         await _notify(user.id, "bet_failed", {
             "match_id": decision.match_id,
             "message": msg or f"{provider_label}下单失败",

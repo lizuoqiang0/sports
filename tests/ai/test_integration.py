@@ -201,7 +201,7 @@ class TestUnderOnly:
         analysis = {
             "prediction": "skip", "bet_type": "total",
             "confidence": 0.80, "odds": 1.85, "line": 2.5,
-            "consensus_reached": True, "reasoning": "skip", "models_used": ["gpt"],
+            "consensus_reached": True, "reasoning": "skip", "models_used": ["deepseek"],
         }
         engine = StrategyEngine(mock_strategy_config, user_id=1)
         decision = await engine.evaluate_bet(
@@ -276,33 +276,35 @@ class TestEndToEnd:
 
 
 class TestHalfTimeTotals:
-    """半场大小球全链路测试（doc.md 第 9 章）。"""
+    """半场盘口采集兼容与投注隔离测试。"""
 
     @pytest.mark.asyncio
-    async def test_first_half_under_passes_a0(
+    async def test_first_half_under_rejected_by_a0(
         self, mock_strategy_config, mock_match_info, mock_analysis_first_half_under
     ):
-        """上半场小球通过 A0 玩法白名单。"""
+        """上半场盘口即使被解析，也不得进入投注链路。"""
         engine = StrategyEngine(mock_strategy_config, user_id=1)
         decision = await engine.evaluate_bet(
             mock_match_info, mock_analysis_first_half_under,
             user_balance=1000, daily_loss=0, active_bets_count=0,
         )
-        assert decision.should_bet
+        assert not decision.should_bet
         assert decision.selection == "under"
+        assert "玩法" in decision.reasoning
 
     @pytest.mark.asyncio
-    async def test_second_half_under_passes_a0(
+    async def test_second_half_under_rejected_by_a0(
         self, mock_strategy_config, mock_match_info, mock_analysis_second_half_under
     ):
-        """下半场小球通过 A0 玩法白名单。"""
+        """下半场盘口即使被解析，也不得进入投注链路。"""
         engine = StrategyEngine(mock_strategy_config, user_id=1)
         decision = await engine.evaluate_bet(
             mock_match_info, mock_analysis_second_half_under,
             user_balance=1000, daily_loss=0, active_bets_count=0,
         )
-        assert decision.should_bet
+        assert not decision.should_bet
         assert decision.selection == "under"
+        assert "玩法" in decision.reasoning
 
     @pytest.mark.asyncio
     async def test_non_whitelisted_bet_type_rejected(
@@ -317,7 +319,7 @@ class TestHalfTimeTotals:
             "line": 2.5,
             "consensus_reached": True,
             "reasoning": "让球",
-            "models_used": ["gpt"],
+            "models_used": ["deepseek"],
         }
         engine = StrategyEngine(mock_strategy_config, user_id=1)
         decision = await engine.evaluate_bet(

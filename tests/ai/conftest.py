@@ -1,4 +1,4 @@
-"""pytest 配置：mock 外部依赖（DB/Redis/GPT），隔离测试环境。"""
+"""pytest 配置：mock 外部依赖（DB/Redis/DeepSeek），隔离测试环境。"""
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from decimal import Decimal
@@ -57,7 +57,7 @@ def mock_basketball_match_info():
 
 @pytest.fixture
 def mock_analysis_under():
-    """构造 GPT 分析结果：under 方向、已达成共识。"""
+    """构造 DeepSeek 分析结果：under 方向、已达成共识。"""
     return {
         "prediction": "under",
         "bet_type": "total",
@@ -66,13 +66,13 @@ def mock_analysis_under():
         "line": 2.5,
         "consensus_reached": True,
         "reasoning": "双方近期防守稳固，小球概率较高",
-        "models_used": ["gpt"],
+        "models_used": ["deepseek"],
     }
 
 
 @pytest.fixture
 def mock_analysis_over():
-    """构造 GPT 分析结果：over 方向（应被 A1 拒绝）。"""
+    """构造 DeepSeek 分析结果：over 方向（应被 A1 拒绝）。"""
     return {
         "prediction": "over",
         "bet_type": "total",
@@ -81,13 +81,13 @@ def mock_analysis_over():
         "line": 2.5,
         "consensus_reached": True,
         "reasoning": "双方进攻强势",
-        "models_used": ["gpt"],
+        "models_used": ["deepseek"],
     }
 
 
 @pytest.fixture
 def mock_analysis_no_consensus():
-    """构造 GPT 分析结果：未达成共识（应被 A2 拒绝）。"""
+    """构造 DeepSeek 分析结果：未达成共识（应被 A2 拒绝）。"""
     return {
         "prediction": "under",
         "bet_type": "total",
@@ -96,7 +96,7 @@ def mock_analysis_no_consensus():
         "line": 2.5,
         "consensus_reached": False,
         "reasoning": "模型分歧较大",
-        "models_used": ["gpt"],
+        "models_used": ["deepseek"],
     }
 
 
@@ -212,7 +212,7 @@ def pinnacle_period2_under_only():
 
 @pytest.fixture
 def mock_analysis_first_half_under():
-    """GPT 分析结果：上半场小球。"""
+    """DeepSeek 分析结果：上半场小球。"""
     return {
         "prediction": "under",
         "bet_type": "first_half_total",
@@ -221,13 +221,13 @@ def mock_analysis_first_half_under():
         "line": 2.5,
         "consensus_reached": True,
         "reasoning": "上半场双方保守，小球概率高",
-        "models_used": ["gpt"],
+        "models_used": ["deepseek"],
     }
 
 
 @pytest.fixture
 def mock_analysis_second_half_under():
-    """GPT 分析结果：下半场小球。"""
+    """DeepSeek 分析结果：下半场小球。"""
     return {
         "prediction": "under",
         "bet_type": "second_half_total",
@@ -236,5 +236,5 @@ def mock_analysis_second_half_under():
         "line": 2.5,
         "consensus_reached": True,
         "reasoning": "下半场节奏放缓",
-        "models_used": ["gpt"],
+        "models_used": ["deepseek"],
     }

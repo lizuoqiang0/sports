@@ -70,7 +70,15 @@ async def run_all_users():
         result = await db.execute(User.__table__.select().where(User.ai_enabled == True))
         users = result.fetchall()
         if not users:
-            logger.warning("没有启用 AI 的用户")
+            # 这是正常的空闲状态，不能让进程退出后被 Docker 反复拉起。
+            # 用户随后在后台启用 AI 时，会由 API 侧的用户引擎管理器启动；
+            # 此守护进程保持健康，等待正常停机信号即可。
+            logger.warning("没有启用 AI 的用户，AI 守护进程进入空闲等待")
+            stop_event = asyncio.Event()
+            loop = asyncio.get_event_loop()
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                loop.add_signal_handler(sig, lambda: stop_event.set())
+            await stop_event.wait()
             return
         logger.info(f"为 {len(users)} 个用户启动 AI 引擎")
 

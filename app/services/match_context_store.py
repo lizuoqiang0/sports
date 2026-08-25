@@ -15,7 +15,7 @@ from app.services.sports_data import compute_quality
 
 logger = logging.getLogger(__name__)
 
-CACHE_PREFIX = "ai:match_ctx:v5:"
+CACHE_PREFIX = "ai:match_ctx:v6:"
 TRACKED_DIMENSIONS = (
     "h2h",
     "home_form",

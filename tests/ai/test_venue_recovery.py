@@ -18,7 +18,9 @@ from app.services.bookmakers.odds_change import (  # noqa: E402
 )
 from app.services.bookmakers.plugins.pinnacle.venue import (  # noqa: E402
     pinnacle_live_sport_urls,
+    pinnacle_session_expired,
 )
+from app.services.bookmakers.site_profiles import needs_manual_venue  # noqa: E402
 
 
 class TestOddsChangePolicy:
@@ -88,6 +90,24 @@ class TestPinnacleVenueUrls:
 
     def test_no_input_empty(self):
         assert pinnacle_live_sport_urls() == []
+
+    def test_pinnacle_compact_entry_is_automatic(self):
+        assert needs_manual_venue("pinnacle") is False
+        assert needs_manual_venue("ob") is True
+
+
+class TestPinnacleAuthentication:
+    class Page:
+        url = "https://www.rowilong.com/zh-cn/compact/sports/soccer/live"
+
+        def is_closed(self):
+            return False
+
+        async def evaluate(self, _script):
+            return {"guest": True, "loginSurface": True}
+
+    async def test_guest_sportsbook_is_expired(self):
+        assert await pinnacle_session_expired(self.Page()) is True
 
 
 class TestRejectCleanupKeywords:

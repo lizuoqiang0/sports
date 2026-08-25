@@ -491,12 +491,16 @@ async def interactive_site_login(
     from app.services.bookmakers.site_profiles import needs_manual_venue as _needs_manual
 
     # 手动场馆：登录后需在可见窗口中进入盘口
-    if _needs_manual(site_code) or manual_venue or (os.getenv("BOOKMAKER_MANUAL_VENUE") or "").strip().lower() in (
+    env_manual = (os.getenv("BOOKMAKER_MANUAL_VENUE") or "").strip().lower() in (
         "1",
         "true",
         "yes",
         "on",
-    ):
+    )
+    # Pinnacle has a deterministic compact sportsbook route.  A global manual
+    # switch intended for portal sites must not turn its guest page into a
+    # trusted "manually entered" session.
+    if _needs_manual(site_code) or manual_venue or (env_manual and site_code != "pinnacle"):
         manual_venue = True
     else:
         manual_venue = False
@@ -825,6 +829,15 @@ async def interactive_site_login(
                 tag = "已手动进入场馆" if use_manual else "已自动进入场馆"
                 if "场馆" not in (message or "") and "盘口" not in (message or ""):
                     message = (message or "登录成功") + f"；{tag}"
+                if site_code == "pinnacle":
+                    from app.services.bookmakers.plugins.pinnacle.venue import (
+                        pinnacle_session_expired,
+                    )
+
+                    if await pinnacle_session_expired(page):
+                        return await _fail(
+                            "平博登录未生效：体育页仍为访客状态，请在可见窗口完成登录后重试"
+                        )
         except Exception as e:
             logger.warning("enter venue after login (%s): %s", site_code, e)
             from app.services.bookmakers.site_profiles import needs_manual_venue
@@ -1025,7 +1038,7 @@ async def interactive_site_login(
                 auth_mode=auth_mode,
                 captured=captured,
             )
-            if not session_logged_in and site_code == "pinnacle" and rebound is not None:
+            if site_code == "pinnacle" and rebound is not None:
                 try:
                     from app.services.bookmakers.plugins.pinnacle.venue import (
                         pinnacle_session_expired,
@@ -1033,13 +1046,12 @@ async def interactive_site_login(
                     )
                     from app.services.bookmakers.venue_entry import is_in_sportsbook
 
-                    if not await pinnacle_session_expired(page):
+                    if await pinnacle_session_expired(page):
+                        session_logged_in = False
+                    elif not session_logged_in:
                         session_logged_in = await is_in_sportsbook(page)
                         if not session_logged_in and await recover_pinnacle_live_list(page):
-                            session_logged_in = (
-                                await is_in_sportsbook(page)
-                                and not await pinnacle_session_expired(page)
-                            )
+                            session_logged_in = await is_in_sportsbook(page) and not await pinnacle_session_expired(page)
                 except Exception:
                     session_logged_in = False
             if session_logged_in:

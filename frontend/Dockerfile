@@ -1,5 +1,7 @@
-# 多阶段：静态构建 + nginx，容器秒级启动
-FROM node:20-alpine AS build
+# 多阶段：静态构建 + nginx，容器秒级启动。
+# 默认使用 DaoCloud 国内镜像；私有镜像仓库可通过 BASE_IMAGE_REGISTRY 覆盖。
+ARG BASE_IMAGE_REGISTRY=docker.m.daocloud.io
+FROM ${BASE_IMAGE_REGISTRY}/library/node:20-alpine AS build
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN --mount=type=cache,target=/root/.npm \
@@ -7,7 +9,7 @@ RUN --mount=type=cache,target=/root/.npm \
 COPY . .
 RUN npm run build
 
-FROM nginx:1.27-alpine
+FROM ${BASE_IMAGE_REGISTRY}/library/nginx:1.27-alpine
 COPY nginx.main.conf /etc/nginx/nginx.conf
 COPY nginx.conf /etc/nginx/conf.d/default.conf
 COPY --from=build /app/dist /usr/share/nginx/html

@@ -1,7 +1,7 @@
 # OB Sports 投注平台 — 技术文档
 
-> **版本**：v2.1.0  
-> **更新日期**：2026-08-24  
+> **版本**：v2.2.0
+> **更新日期**：2026-08-25
 > **技术栈**：FastAPI + React + PostgreSQL + Redis + Playwright  
 
 ---
@@ -15,10 +15,10 @@ OB Sports 是一个**体育赔率监控与 AI 自动投注平台**，支持 OB �
 | 能力 | 说明 |
 |------|------|
 | 双站盘口监控 | OB 体育 + 平博（Pinnacle）实时滚球赔率，通过 Browser Gate 长连接 Chromium 采集 |
-| AI 智能分析 | GPT 模型分析全场大小球（under/over），结合赛前上下文（交锋/近况/积分/伤停） |
+| AI 智能分析 | DeepSeek 模型分析全场大小球（under/over），结合赛前上下文（交锋/近况/积分/伤停） |
 | 跨站比价择优 | 同一场比赛在 OB 和平博各有一条记录，自动选择赔率最优站点下单 |
 | 同场投注控制 | 同一场比赛最多投注 2 次（`MAX_BETS_PER_FIXTURE=2`，可配置） |
-| 别名自动生效 | 队名匹配失败时自动沉淀候选别名并写入正式别名，无需人工确认 |
+| 别名安全生效 | 高置信队名别名自动生效；低于 0.75 的候选只进入审计待复核，不污染运行时索引 |
 | 双模式切换 | 人工模式（只出推荐，手动下单）/ 自动模式（命中后自动下单） |
 | 严格风控 | 止损/止盈、日注数限制、赔率区间过滤、中国赛事过滤、虚拟盘过滤 |
 
@@ -51,8 +51,8 @@ OB Sports 是一个**体育赔率监控与 AI 自动投注平台**，支持 OB �
 
 | 服务 | 镜像 | 端口 | 说明 |
 |------|------|------|------|
-| postgres | postgres:16-alpine | 5432 | 数据库，max_connections=200 |
-| redis | redis:7-alpine | 6379 | 缓存 + Pub/Sub + 限流 |
+| postgres | `${BASE_IMAGE_REGISTRY}/library/postgres:16-alpine` | 5432 | 数据库，max_connections=200 |
+| redis | `${BASE_IMAGE_REGISTRY}/library/redis:7-alpine` | 6379 | 缓存 + Pub/Sub + 限流 |
 | backend | ob-sports-betting-backend | 8000 | FastAPI，多 worker + uvloop |
 | frontend | ob-sports-betting-frontend | 3000 | Nginx 静态资源 |
 | ai-engine | ob-sports-betting-backend | — | AI 引擎守护进程（可选） |
@@ -83,7 +83,7 @@ app/
 
 | 文件 | 职责 |
 |------|------|
-| `analyzer.py` | GPT 赛事分析：调用 LLM 分析全场大小球(under/over)，输出预测方向+置信度+理由 |
+| `analyzer.py` | DeepSeek 赛事分析：调用 LLM 分析全场大小球(under/over)，输出预测方向+置信度+理由 |
 | `strategy.py` | 策略引擎：`StrategyConfig` 参数模型，五阶段闸门链（A信号→B结构→C市场→D滚球→E赔率），under/over 独立闸门参数，动态仓位计算 |
 | `strategy_gates.py` | 策略门禁：人工/自动共用，最低仓位、仓位上限、站点最低注额协调 |
 | `auto_better.py` | 自动投注主调度器：扫描滚球 → LLM 分析 → 策略评估 → 自动下单 |
@@ -109,7 +109,7 @@ AIBettingEngine._run_cycle()
   │
   ├─ analyze_and_recommend()
   │   ├─ fetch_match_context() ← 赛前上下文
-  │   ├─ analyzer.analyze_match() ← GPT 分析
+  │   ├─ analyzer.analyze_match() ← DeepSeek 分析
   │   └─ build_match_market_recommendations() ← 跨站比价
   │
   ├─ evaluate_bet() ← 策略闸门（风控/止损止盈/共识门禁）
@@ -133,18 +133,16 @@ AIBettingEngine._run_cycle()
 - `MAX_BETS_PER_FIXTURE = 2`（默认 2 次/场，可通过 `AI_MAX_BETS_PER_FIXTURE` 配置）
 - `sibling_match_ids` 包含自身，计数递增只走 sib 循环，避免双重计数
 
-### 3.5 别名自动生效
+### 3.5 别名安全生效
 
 ```
-匹配失败（best_score ≥ 阈值）
+匹配失败
   ↓
 _record_alias_candidate()
   ├─ 写入候选别名到 Redis
-  ├─ _build_alias_override_record() ← 构建正式别名
-  ├─ 写入正式别名到 Redis
-  ├─ _invalidate_alias_override_cache() ← 清空内存缓存
-  ├─ logger.info("alias auto-approved & effective")
-  └─ _emit_alias_audit_log("auto_approve")
+  ├─ best_score ≥ 0.75 → 构建并写入正式别名
+  ├─ best_score < 0.75 → 保留候选/审计，等待人工复核
+  └─ 生效后清空运行时索引缓存并写审计日志
   ↓
 下一轮匹配（≤60s TTL）
   ├─ _get_runtime_alias_index() ← 从 Redis 加载正式别名
@@ -226,17 +224,17 @@ _record_alias_candidate()
 ### 5.1 核心配置 (`app/config.py`)
 
 ```python
-# === GPT API ===
-GPT_API_KEY: Optional[str] = None
-GPT_BASE_URL: str = "https://xfastapi.ai/v1"
-GPT_MODEL: str = "gpt-5.6-terra"
-GPT_TIMEOUT_SEC: float = 45.0          # 单次 GPT 分析总超时
-LLM_CLIENT_TIMEOUT_SEC: float = 50.0   # OpenAI 客户端超时（须 ≥ GPT_TIMEOUT_SEC）
-LLM_MAX_TOKENS: int = 3072             # GPT 最大输出 tokens
-LLM_DEFAULT_CONFIDENCE: float = 0.33   # GPT 未返回置信度时的默认值
-LLM_TEMPERATURE: float = 0.35          # GPT 温度（0.2太低导致模板化，0.35平衡）
+# === DeepSeek API ===
+DEEPSEEK_API_KEY: Optional[str] = None
+DEEPSEEK_BASE_URL: str = "https://api.deepseek.com/v1"
+DEEPSEEK_MODEL: str = "deepseek-chat"
+DEEPSEEK_TIMEOUT_SEC: float = 90.0          # 单次 DeepSeek 分析总超时（含一次降配重试）
+LLM_CLIENT_TIMEOUT_SEC: float = 50.0   # OpenAI-compatible 客户端超时（须 ≥ DEEPSEEK_TIMEOUT_SEC）
+LLM_MAX_TOKENS: int = 3072             # DeepSeek 最大输出 tokens
+LLM_DEFAULT_CONFIDENCE: float = 0.33   # DeepSeek 未返回置信度时的默认值
+LLM_TEMPERATURE: float = 0.35          # DeepSeek 温度（0.2太低导致模板化，0.35平衡）
 LLM_CACHE_TTL: int = 600               # 10分钟正缓存
-AI_SKIP_CACHE_TTL: int = 180           # GPT 判 skip 的负缓存
+AI_SKIP_CACHE_TTL: int = 180           # DeepSeek 判 skip 的负缓存
 LLM_NEG_CACHE_TTL: int = 150            # 无共识结果负缓存
 
 # === AI 分析 ===
@@ -248,7 +246,7 @@ AI_SCAN_INTERVAL_SEC: int = 120        # 引擎扫描间隔（有候选时）
 AI_IDLE_RESCAN_SEC: int = 30           # 空轮快扫间隔（无候选时）
 AI_RECS_LIMIT: int = 80                # 推荐页分析上限
 AI_LIVE_SCAN_LIMIT: int = 120          # 自动引擎扫描上限
-AI_ANALYZE_CONCURRENCY: int = 8        # GPT 分析并发数
+AI_ANALYZE_CONCURRENCY: int = 8        # DeepSeek 分析并发数
 AI_SKIP_COOLDOWN_SEC: int = 300        # 同场 LLM skip 冷却
 AI_ENABLE_OVER: bool = True            # 大球 over 下单开关（over 与 under 对等参与闸门评估）
 
@@ -320,9 +318,9 @@ under/over 双向独立闸门参数，足球和篮球各自一套：
 | 变量 | 说明 |
 |------|------|
 | `SECRET_KEY` | JWT 密钥（启动时校验弱密钥） |
-| `GPT_API_KEY` | GPT API Key |
-| `GPT_BASE_URL` | GPT API 地址 |
-| `GPT_MODEL` | 模型名称 |
+| `DEEPSEEK_API_KEY` | DeepSeek API Key |
+| `DEEPSEEK_BASE_URL` | DeepSeek API 地址 |
+| `DEEPSEEK_MODEL` | 模型名称 |
 | `BOOKMAKER_BROWSER_GATE_URL` | Browser Gate 地址 |
 | `DEFAULT_BET_MODE` | 默认下单模式（manual/active） |
 | `CORS_ORIGINS` | 跨域白名单 |
@@ -340,7 +338,7 @@ under/over 双向独立闸门参数，足球和篮球各自一套：
 # 首次部署 / 全量启动（.env生成 → 数据目录 → 基础镜像 → Browser Gate → 全容器）
 bash scripts/quick.sh --init --with-ai
 
-# 日常部署（语法检查 → 镜像构建 → 容器重建 → 缓存清理 → 健康检查）
+# 日常部署（全量语法检查 → backend/frontend 镜像构建 → 容器重建 → 临时缓存清理 → 就绪检查）
 bash scripts/quick.sh
 
 # 跳过构建，仅强制重建容器
@@ -403,7 +401,8 @@ docker exec ob-backend alembic revision --autogenerate -m "描述"
 ### 6.5 Dockerfile 结构
 
 ```dockerfile
-FROM python:3.12-slim AS runtime
+ARG BASE_IMAGE_REGISTRY=docker.m.daocloud.io
+FROM ${BASE_IMAGE_REGISTRY}/library/python:3.12-slim AS runtime
 
 # 系统依赖（curl 用于健康检查）
 RUN apt-get update && apt-get install -y --no-install-recommends curl
@@ -425,6 +424,10 @@ CMD ["/app/scripts/docker_entrypoint_backend.sh"]
 
 > **注意**：根目录 `__init__.py` 已在 v2.1.0 清理中删除，Dockerfile 不再 `COPY __init__.py`。
 > 项目顶层包是 `app.`，根 `__init__.py` 为残留文件，删除后不影响导入。
+>
+> **国内基础镜像**：默认使用 `docker.m.daocloud.io` 的官方镜像同步。可在 `.env` 设置
+> `BASE_IMAGE_REGISTRY=你的企业镜像仓库`，后端、前端、PostgreSQL 和 Redis 会统一切换；
+> `bash scripts/quick.sh --pull` 会预拉同一来源的全部基础镜像。
 > `ai-engine` 容器与 `backend` 共享同一镜像，入口命令不同（`ai_betting_engine.py`）。
 
 ### 6.6 一键部署脚本内部流程
@@ -433,11 +436,11 @@ CMD ["/app/scripts/docker_entrypoint_backend.sh"]
 
 **日常部署**（`bash scripts/quick.sh`）：
 ```
-1. Python 语法检查     — 对 9 个核心 .py 文件执行 ast.parse，任一失败则终止
-2. 重建 Docker 镜像     — docker compose build --no-cache backend（--no-build 可跳过）
-3. 清除 Redis 旧缓存    — 删除 calibration/patterns/risk_tuning/stats 缓存键
-4. 强制重建容器         — docker compose up -d --force-recreate backend [ai-engine]
-5. 等待服务健康         — 轮询 http://127.0.0.1:8000/health，超时 60s
+1. Python 语法检查     — `python3 -m compileall -q app scripts` 全量检查，任一失败则终止
+2. 重建 Docker 镜像     — `docker compose build --no-cache backend frontend`（--no-build 可跳过；ai-engine 复用 backend 镜像）
+3. 清除 Redis 临时缓存 — 删除推荐/上下文/LLM 临时缓存；校准、模式、风险调优状态保留
+4. 强制重建容器         — `docker compose up -d --force-recreate backend frontend [ai-engine]`
+5. 等待服务就绪         — 轮询 `http://127.0.0.1:8000/ready`，超时 90s
 6. 输出容器状态         — docker compose ps + 访问地址
 ```
 
@@ -446,15 +449,16 @@ CMD ["/app/scripts/docker_entrypoint_backend.sh"]
 1. 创建数据目录         — data/postgres data/redis logs + chown
 2. 检查 .env 配置       — 缺失则从 .env.example 生成 + 写入 SECRET_KEY
 3. 安全令牌检查         — INTERNAL_API_TOKEN 为空或弱令牌则终止
-4. 预拉基础镜像         — 缺镜像时并行拉 postgres/redis/python/nginx/node
+4. 预拉基础镜像         — 缺镜像时从 BASE_IMAGE_REGISTRY 并行拉 postgres/redis/python/nginx/node
 5. 启动依赖             — postgres + redis，等待健康（45s）
 6. 配置 Browser Gate    — .env 注入 GATE_URL + HEADLESS=0
 7. 启动 Browser Gate    — 可见 Chromium + 守护进程，等待健康（90s）
-8. 语法检查 → 构建镜像 → 清缓存 → 启动全容器（backend+frontend+[ai-engine]）
-9. 等待 API 健康        — 轮询 /health，超时 60s
+8. 全量语法检查 → 构建 backend/frontend 镜像 → 清临时缓存 → 启动全容器（backend+frontend+[ai-engine]）
+9. 等待 API 就绪        — 轮询 /ready，超时 90s
 ```
 
-> 构建输出通过 `grep -E '(DONE|Built|ERROR)'` 过滤，避免 `set -o pipefail` 下 `tail` 管道导致的误报。
+> 构建命令不再通过 `grep`/`tail` 管道吞掉退出码；Docker 构建失败会立即终止部署。
+> `/docs`、`/redoc`、`/openapi.json` 在生产环境关闭，使用 `/health`（存活）和 `/ready`（数据库/Redis 就绪）探测。
 
 ---
 
@@ -475,10 +479,11 @@ CMD ["/app/scripts/docker_entrypoint_backend.sh"]
 | `test_alias_backend_active.py` | 别名自动生效全链路 | 20 |
 | `test_bet_executor.py` | 下单执行器（跨站比价/provider fallback/切站/重试） | 16 |
 | `test_analysis_filters.py` | 分析过滤（中国赛事/黑名单/排序） | 10 |
-| `test_analyzer.py` | GPT 分析引擎（时钟解析/信号/缓存/重试） | 10 |
-| `test_odds_parsing.py` | 赔率解析（OB/平博半场大小球） | 16 |
+| `test_analyzer.py` | DeepSeek 分析引擎（时钟解析/信号/缓存/重试） | 10 |
+| `test_odds_parsing.py` | 赔率解析（OB/平博盘口；半场盘口仅兼容采集，不进入投注） | 16 |
 | `test_venue_recovery.py` | 平博页面状态恢复 | 15 |
-| `test_integration.py` | 集成测试（全链路/竞态/热更新/半场） | 16 |
+| `test_integration.py` | 集成测试（全链路/竞态/热更新/玩法白名单） | 16 |
+| `test_sync_live_odds_versions.py` | 滚球赔率版本收敛（每站/玩法仅最新有效行） | 1 |
 | `test_over_gates.py` | 大小球双闸门链（under/over 互不参与） | 12 |
 | `test_one_click_bet.py` | 一键投注端到端 | 12 |
 | `test_handicap_exclusion.py` | 让球盘排除 + 赔率匹配 | 60+ |
@@ -486,8 +491,8 @@ CMD ["/app/scripts/docker_entrypoint_backend.sh"]
 ### 7.2 运行测试
 
 ```bash
-# 运行全部 pytest 测试（313 个）
-python3 -m pytest tests/ai/ -v --tb=short
+# 运行全部 pytest 测试（数量随覆盖新增变化）
+python3 -m pytest -q --asyncio-mode=auto --disable-warnings
 
 # 运行特定测试文件
 python3 -m pytest tests/ai/test_gate_strategy.py -v
@@ -517,7 +522,8 @@ python3 tests/ai/test_bet_flow_simulation.py
 
 | 关键词 | 含义 |
 |--------|------|
-| `alias auto-approved & effective` | 别名自动写入正式别名 |
+| `alias auto-approved & effective` | 高置信别名自动写入正式别名 |
+| `alias candidate pending review` | 低置信别名仅保留候选，等待复核 |
 | `runtime alias index loaded` | 运行时别名索引加载 |
 | `runtime alias expanded` | 别名扩展了队名变体 |
 | `同场注单已达上限` | 同场投注次数达上限被拦截 |
@@ -582,8 +588,8 @@ docker exec -it ob-backend bash
 # 查看数据库
 docker exec ob-postgres psql -U ob_user -d ob_sports -c "SELECT * FROM bets ORDER BY id DESC LIMIT 10;"
 
-# 清空 Redis 缓存
-docker exec ob-redis redis-cli FLUSHALL
+# 仅清理临时推荐缓存（不要在生产使用 FLUSHALL）
+bash scripts/quick.sh --no-build
 
 # 执行数据库迁移
 docker exec ob-backend alembic upgrade head
@@ -599,7 +605,7 @@ docker exec ob-backend alembic upgrade head
 | 赔率不更新 | 检查站点连接状态；`docker exec ob-redis redis-cli KEYS "odds:*"` 查看缓存 |
 | 数据库连接超时 | 检查 `docker compose ps` 中 postgres 状态；`docker exec ob-postgres pg_isready -U ob_user` |
 | Docker 构建报 `__init__.py: not found` | Dockerfile 中 `COPY __init__.py` 已移除（v2.1.0）；若旧缓存仍报错，执行 `docker compose build --no-cache` |
-| `quick.sh` 构建步骤非零退出 | 构建输出管道在 `set -o pipefail` 下可能误报；已改用 `grep -E '(DONE|Built|ERROR)' \|\| true` 过滤 |
+| `quick.sh` 构建失败 | 查看 Docker 原始输出；脚本不会吞掉非零退出码，修复网络/依赖后重新部署 |
 
 ### 10.4 数据备份与恢复
 
@@ -629,7 +635,7 @@ cp data/redis/dump.rdb backup_redis_$(date +%Y%m%d).rdb
 StrategyEngine.evaluate_bet() 五阶段闸门链：
 
   A 信号有效性    A0玩法白名单 → A1方向 → A2共识 → A3置信度(含P7/P9封顶/EV豁免) → A4篮球三重 → A5历史模式
-  B 结构性风控    B1盘线区间(under/over独立) → B1b余量接近度 → P1/P4/P5/P8/P10 → B2联赛黑名单 → B3高赔率 → B3b赔率一致性
+  B 结构性风控    B1盘线区间(under/over独立) → P1/P4/P10 → B1b余量/P5/P8 → B2联赛黑名单 → B3高赔率 → B3b赔率一致性
   C 市场一致性    C1 盘口变化方向 vs 预测方向
   D 滚球余量      D1-under余量/D1-over速率(加权模型) → D1b已进球接近度
   E 赔率有效性    E1区间 → E2 EV盈亏平衡
@@ -637,4 +643,4 @@ StrategyEngine.evaluate_bet() 五阶段闸门链：
   → 仓位计算: max_bet × conf_scale(under×1.10/over×0.8) × risk_factor × prov_factor × 余额锚定(25%) × 日亏递减
 ```
 
-测试覆盖：`test_gate_strategy.py`（125 个）+ `test_gate_strategy_supplement.py`（38 个）= 163 个闸门策略测试。
+测试覆盖：闸门主测试与补充测试、双站解析、下单执行、别名、数据质量和前端构建均纳入生产发布前检查；以本地 `pytest` 实际输出为准。

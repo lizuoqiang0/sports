@@ -65,5 +65,10 @@ def is_live_site_code(code: str) -> bool:
 
 
 def needs_manual_venue(code: str) -> bool:
-    """所有站点均需手动进场馆（BOOKMAKER_MANUAL_VENUE=1）。"""
-    return True
+    """Only portal/manual profiles require a human venue-entry step.
+
+    Pinnacle has a stable compact sportsbook URL and must remain fully automatic;
+    forcing it into manual mode previously let a guest page pass as connected.
+    """
+    profile = get_site_profile(code)
+    return bool(profile.get("manual_venue") or profile.get("portal"))

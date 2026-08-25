@@ -6,6 +6,7 @@ import pytest
 from app.services.bookmakers.plugins.ob.odds import (
     _total_from_hps,
     _half_totals_from_hps,
+    parse_asian_line,
     parse_matches_pb,
 )
 from app.services.bookmakers.plugins.pinnacle.odds import (
@@ -90,6 +91,39 @@ class TestOBHalfTotalsParsing:
         }]
         result = _half_totals_from_hps(hps, mid="m1")
         assert len(result) == 0
+
+    def test_full_time_requires_valid_native_refs_and_line(self):
+        """全场线/原生 oid 缺失时只应丢弃，不能生成可下注 total 行。"""
+        invalid_line = [{
+            "hpid": "2", "hpn": "全场大小",
+            "hl": [{"hv": "", "hid": "h1", "hs": "0", "ol": [
+                {"ot": "over", "ov": "1.85", "oid": "o1", "os": 1},
+                {"ot": "under", "ov": "1.75", "oid": "o2", "os": 1},
+            ]}],
+        }]
+        assert _total_from_hps(invalid_line, mid="m1", csid="1") is None
+
+        missing_ref = [{
+            "hpid": "2", "hpn": "全场大小",
+            "hl": [{"hv": "2.5", "hid": "h1", "hs": "0", "ol": [
+                {"ot": "over", "ov": "1.85", "oid": "", "os": 1},
+                {"ot": "under", "ov": "1.75", "oid": "o2", "os": 1},
+            ]}],
+        }]
+        assert _total_from_hps(missing_ref, mid="m1", csid="1") is None
+
+    def test_half_time_text_never_becomes_full_time_total(self):
+        half_text = [{
+            "hpid": "2", "hpn": "上半场大小",
+            "hl": [{"hv": "1.5", "hid": "h1", "hs": "0", "ol": [
+                {"ot": "over", "ov": "1.85", "oid": "o1", "os": 1},
+                {"ot": "under", "ov": "1.75", "oid": "o2", "os": 1},
+            ]}],
+        }]
+        assert _total_from_hps(half_text, mid="m1", csid="1") is None
+
+    def test_quarter_total_line_is_normalized_for_ob_bet_ref(self):
+        assert parse_asian_line("2/2.5") == 2.25
 
 
 class TestPinnacleHalfTotalsParsing:

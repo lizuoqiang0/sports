@@ -173,7 +173,15 @@ def _ms_to_iso(ms: Any) -> str:
         return ""
 
 
-def _odds_from_period0(p0: list, *, mid: str, sport_id: int) -> list[RemoteOdds]:
+def _odds_from_period0(
+    p0: list,
+    *,
+    mid: str,
+    sport_id: int,
+    event_home: str = "",
+    event_away: str = "",
+    event_league: str = "",
+) -> list[RemoteOdds]:
     out: list[RemoteOdds] = []
     if not isinstance(p0, list) or len(p0) < 3:
         return out
@@ -195,6 +203,9 @@ def _odds_from_period0(p0: list, *, mid: str, sport_id: int) -> list[RemoteOdds]
                         "bet_type": "spread",
                         "line": float(line),
                         "mid": mid,
+                        "event_home": event_home,
+                        "event_away": event_away,
+                        "event_league": event_league,
                         "sport_id": str(sport_id),
                         "site_code": "pinnacle",
                         "selections": {
@@ -208,7 +219,17 @@ def _odds_from_period0(p0: list, *, mid: str, sport_id: int) -> list[RemoteOdds]
             out.append(od)
 
     # 大小
-    tot_row = _pick_main_total(p0[1] if isinstance(p0[1], list) else [])
+    total_rows = p0[1] if isinstance(p0[1], list) else []
+    tot_row = _pick_main_total(total_rows)
+    if total_rows:
+        logger.info(
+            "pinnacle total raw mid=%s home=%s away=%s rows=%s selected=%s",
+            mid,
+            event_home,
+            event_away,
+            repr(total_rows[:8])[:1200],
+            repr(tot_row)[:300],
+        )
     if tot_row:
         over = _as_float(tot_row[2])
         under = _as_float(tot_row[3])
@@ -227,6 +248,9 @@ def _odds_from_period0(p0: list, *, mid: str, sport_id: int) -> list[RemoteOdds]
                         "bet_type": "total",
                         "line": float(line),
                         "mid": mid,
+                        "event_home": event_home,
+                        "event_away": event_away,
+                        "event_league": event_league,
                         "sport_id": str(sport_id),
                         "site_code": "pinnacle",
                         "selections": {
@@ -266,6 +290,9 @@ def _odds_from_period0(p0: list, *, mid: str, sport_id: int) -> list[RemoteOdds]
             data["_site"] = {
                 "bet_type": "moneyline",
                 "mid": mid,
+                "event_home": event_home,
+                "event_away": event_away,
+                "event_league": event_league,
                 "sport_id": str(sport_id),
                 "site_code": "pinnacle",
                 "selections": {
@@ -412,6 +439,9 @@ def parse_compact_events(
                         p0 if isinstance(p0, list) else [],
                         mid=mid,
                         sport_id=sport_id,
+                        event_home=home,
+                        event_away=away,
+                        event_league=league,
                     )
                     # 上下半场大小球
                     for _pk, _bt, _lbl in (("1", "first_half_total", "上半场"),
@@ -633,6 +663,17 @@ async def fetch_pinnacle_live_odds(
         if not await recover_pinnacle_blank_page(page, attempts=2):
             logger.warning("pinnacle odds aborted: blank page persists")
             return []
+    except Exception:
+        pass
+
+    # 公告、失败提示、版权/Cookie 等弹层会遮住列表并阻断 DOM 兜底；
+    # 逐个按提示词关闭，但保护确认投注与清空注单弹窗。
+    try:
+        from app.services.bookmakers.plugins.pinnacle.modals import (
+            dismiss_pinnacle_blocking_modals,
+        )
+
+        await dismiss_pinnacle_blocking_modals(page)
     except Exception:
         pass
 

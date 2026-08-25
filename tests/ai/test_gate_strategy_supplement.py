@@ -64,7 +64,7 @@ def _basketball_analysis_under(conf: float = 0.70, **kw) -> dict:
         "prediction": "under", "bet_type": "total",
         "confidence": conf, "odds": 1.85, "line": 170.5,
         "consensus_reached": True, "reasoning": "防守强",
-        "context_source": "none", "models_used": ["gpt"],
+        "context_source": "none", "models_used": ["deepseek"],
         "signal_review": {
             "triad_ready": True, "verdict": "supportive",
             "market_points": 5, "fundamental_points": 5, "conflict_points": 0,
@@ -79,7 +79,7 @@ def _basketball_analysis_over(conf: float = 0.70, **kw) -> dict:
         "prediction": "over", "bet_type": "total",
         "confidence": conf, "odds": 1.85, "line": 155.0,
         "consensus_reached": True, "reasoning": "进攻强",
-        "context_source": "none", "models_used": ["gpt"],
+        "context_source": "none", "models_used": ["deepseek"],
         "signal_review": {
             "triad_ready": True, "verdict": "supportive",
             "market_points": 5, "fundamental_points": 5, "conflict_points": 0,
@@ -194,7 +194,7 @@ class TestA5RiskPatterns:
             match = _football_match()
             a = {"prediction": "under", "bet_type": "total", "confidence": 0.70,
                  "odds": 1.80, "line": 2.5, "consensus_reached": True,
-                 "reasoning": "test", "context_source": "none", "models_used": ["gpt"]}
+                 "reasoning": "test", "context_source": "none", "models_used": ["deepseek"]}
             decision = await engine.evaluate_bet(
                 match_info=match, analysis=a,
                 user_balance=Decimal("1000"), daily_loss=Decimal("0"),
@@ -214,7 +214,7 @@ class TestA5RiskPatterns:
             match = _football_match()
             a = {"prediction": "under", "bet_type": "total", "confidence": 0.70,
                  "odds": 1.80, "line": 2.5, "consensus_reached": True,
-                 "reasoning": "test", "context_source": "none", "models_used": ["gpt"]}
+                 "reasoning": "test", "context_source": "none", "models_used": ["deepseek"]}
             decision = await engine.evaluate_bet(
                 match_info=match, analysis=a,
                 user_balance=Decimal("1000"), daily_loss=Decimal("0"),
@@ -356,7 +356,7 @@ class TestD1OverFootballLateDecay:
     async def test_football_over_late_decay_rejects(self):
         """足球 over 55'+ 余量薄时衰减模型应压缩预期导致拒绝。"""
         engine = _mk_engine()
-        # 55', 1-1 → total=2, line=3.0
+        # 55', 1-1 → total=2, line=2.95（低于高线硬上限，确保验证 D1 衰减）
         # needed=1.0 < 3.5 → 过 needed
         # P10: 40-55' 且 total=2 >= 2 且 line-total=1.0 <= 1.5
         # pace_proj=2/55*90=3.27 >= 3.0, pace_proj-line=0.27 <= 1.0 → P10 陷阱
@@ -371,13 +371,13 @@ class TestD1OverFootballLateDecay:
         # min(1.945, 0.892)=0.892
         # needed*pace_factor=1.0*1.05=1.05, 0.892 < 1.05 → D1 拒绝!
         match = _football_match(home_score=1, away_score=1, clock="55'",
-                                total_line=3.0)
+                                total_line=2.95)
         match["odds"] = {"under": 1.90, "over": 1.80}
         analysis = {
             "prediction": "over", "bet_type": "total",
-            "confidence": 0.72, "odds": 1.80, "line": 3.0,
+            "confidence": 0.72, "odds": 1.80, "line": 2.95,
             "consensus_reached": True, "reasoning": "进攻强",
-            "context_source": "none", "models_used": ["gpt"],
+            "context_source": "none", "models_used": ["deepseek"],
         }
         decision = await _eval(engine, match, analysis)
         assert not decision.should_bet
@@ -424,7 +424,7 @@ class TestD1UnderFootballMargin:
             "prediction": "under", "bet_type": "total",
             "confidence": 0.72, "odds": 1.80, "line": 2.5,
             "consensus_reached": True, "reasoning": "防守强",
-            "context_source": "none", "models_used": ["gpt"],
+            "context_source": "none", "models_used": ["deepseek"],
         }
         decision = await _eval(engine, match, analysis)
         assert "余量不足" not in decision.reasoning
@@ -453,7 +453,7 @@ class TestD1bProximityPass:
             "confidence": 0.71, "odds": 1.80, "line": 2.5,
             "consensus_reached": True, "reasoning": "防守强",
             "context_source": "ob_api",  # 有基本面 → required=0.65
-            "models_used": ["gpt"],
+            "models_used": ["deepseek"],
         }
         decision = await _eval(engine, match, analysis)
         # D1b: margin=1.5, required=0.65, +0.05=0.70, conf=0.71 >= 0.70 → 通过
@@ -470,27 +470,20 @@ class TestA3EVExemptionOver:
     @pytest.mark.asyncio
     async def test_ev_exemption_over_passes(self):
         """over 方向 EV 豁免：校准后 conf < 门槛但 ≥ EV 平衡时放行。"""
-        engine = _mk_engine(min_odds=1.40)
-        # over no_fund required=0.68, odds=1.50
+        engine = _mk_engine(min_conf=0.70, min_odds=1.40)
+        # 用户门槛 0.70，高于方向地板 0.68；校准后 conf=0.69 仍可满足 EV。
         # breakeven=1/1.50=0.6667, edge=max(0, 0.02)=0.02
-        # required_ev=0.6867, conf=0.67 < 0.68 但 >= 0.6867? No, 0.67 < 0.6867
-        # 用 odds=1.45: breakeven=0.6897, edge=0.02, required=0.7097 → 太高
-        # 用 odds=1.48: breakeven=0.6757, edge=0.02, required=0.6957
-        # conf=0.67 < 0.68, but 0.67 < 0.6957 → 仍不足
-        # over EV 豁免需要 conf >= breakeven + edge 且 conf < required
-        # required=0.68, breakeven+edge=1/odds+0.02
-        # 需要 1/odds+0.02 <= conf < 0.68
-        # odds=1.55: 1/1.55+0.02=0.6652, conf=0.67 >= 0.6652 and < 0.68 → 豁免!
+        # odds=1.55: 1/1.55+0.02≈0.665；0.69 ≥ EV 平衡且 < 用户门槛 0.70。
         analysis = {
             "prediction": "over", "bet_type": "total",
-            "confidence": 0.67, "odds": 1.55, "line": 3.0,
+            "confidence": 0.69, "odds": 1.55, "line": 2.75,
             "consensus_reached": True, "reasoning": "进攻强",
             "context_source": "none",
             "calibration_note": "校准映射",
-            "models_used": ["gpt"],
+            "models_used": ["deepseek"],
         }
         match = _football_match(home_score=1, away_score=1, clock="35'",
-                                total_line=3.0)
+                                total_line=2.75)
         match["odds"] = {"under": 1.90, "over": 1.55}
         decision = await _eval(engine, match, analysis)
         # EV 豁免放行 A3（后续闸门可能拒绝，但不应是"置信度不足"）
@@ -508,7 +501,7 @@ class TestA3EVExemptionOver:
             "consensus_reached": True, "reasoning": "进攻强",
             "context_source": "none",
             "calibration_note": "校准映射",
-            "models_used": ["gpt"],
+            "models_used": ["deepseek"],
         }
         match = _football_match(home_score=1, away_score=1, clock="35'",
                                 total_line=3.0)
@@ -527,7 +520,7 @@ class TestA3EVExemptionOver:
             "consensus_reached": True, "reasoning": "test",
             "context_source": "none",
             "calibration_note": "校准映射",
-            "models_used": ["gpt"],
+            "models_used": ["deepseek"],
         }
         match = _football_match()
         match["odds"] = {"under": 0.50, "over": 1.90}
@@ -547,7 +540,7 @@ class TestA3P9OverCapping:
             "prediction": "over", "bet_type": "total",
             "confidence": 0.75, "odds": 1.80, "line": 3.0,
             "consensus_reached": True, "reasoning": "进攻强",
-            "context_source": "none", "models_used": ["gpt"],
+            "context_source": "none", "models_used": ["deepseek"],
         }
         match = _football_match(home_score=1, away_score=1, clock="35'",
                                 total_line=3.0)
@@ -573,12 +566,12 @@ class TestB3bOverDirection:
         # conf=0.70 < 0.71 → B3b 拒绝
         analysis = {
             "prediction": "over", "bet_type": "total",
-            "confidence": 0.70, "odds": 1.90, "line": 3.0,
+            "confidence": 0.70, "odds": 1.90, "line": 2.75,
             "consensus_reached": True, "reasoning": "进攻强",
-            "context_source": "none", "models_used": ["gpt"],
+            "context_source": "none", "models_used": ["deepseek"],
         }
         match = _football_match(home_score=1, away_score=1, clock="35'",
-                                total_line=3.0)
+                                total_line=2.75)
         match["odds"] = {"under": 1.80, "over": 1.90}
         decision = await _eval(engine, match, analysis)
         assert not decision.should_bet
@@ -592,12 +585,12 @@ class TestB3bOverDirection:
         # 但 conf=0.72 < 0.73 → 不触发 P9
         analysis = {
             "prediction": "over", "bet_type": "total",
-            "confidence": 0.72, "odds": 1.90, "line": 3.0,
+            "confidence": 0.72, "odds": 1.90, "line": 2.75,
             "consensus_reached": True, "reasoning": "进攻强",
-            "context_source": "none", "models_used": ["gpt"],
+            "context_source": "none", "models_used": ["deepseek"],
         }
         match = _football_match(home_score=1, away_score=1, clock="35'",
-                                total_line=3.0)
+                                total_line=2.75)
         match["odds"] = {"under": 1.80, "over": 1.90}
         decision = await _eval(engine, match, analysis)
         assert "更高置信度" not in decision.reasoning
@@ -628,7 +621,7 @@ class TestBucketFactorCombos:
             "confidence": 0.70, "odds": 1.80, "line": 2.5,
             "consensus_reached": True, "reasoning": "test",
             "context_source": "none", "provider_code": "pinnacle",
-            "models_used": ["gpt"],
+            "models_used": ["deepseek"],
         }
         decision = await _eval(engine, _football_match(), analysis)
         if decision.should_bet:
@@ -653,7 +646,7 @@ class TestBucketFactorCombos:
             "confidence": 0.70, "odds": 1.80, "line": 2.5,
             "consensus_reached": True, "reasoning": "test",
             "context_source": "none", "provider_code": "pinnacle",
-            "models_used": ["gpt"],
+            "models_used": ["deepseek"],
         }
         decision = await _eval(engine, _football_match(), analysis)
         if decision.should_bet:
@@ -678,7 +671,7 @@ class TestBucketFactorCombos:
             "confidence": 0.70, "odds": 1.80, "line": 2.5,
             "consensus_reached": True, "reasoning": "test",
             "context_source": "none", "provider_code": "pinnacle",
-            "models_used": ["gpt"],
+            "models_used": ["deepseek"],
         }
         # 正常仓位（无 provider 调整）≈ 91.58（under 0.95 conf_scale × 0.964 risk_factor）
         # 1.1 加仓后 ≈ 100.7 → capped to 100
@@ -704,7 +697,7 @@ class TestBucketFactorCombos:
             "confidence": 0.70, "odds": 1.80, "line": 2.5,
             "consensus_reached": True, "reasoning": "test",
             "context_source": "none", "provider_code": "pinnacle",
-            "models_used": ["gpt"],
+            "models_used": ["deepseek"],
         }
         decision = await _eval(engine, _football_match(), analysis)
         if decision.should_bet:
@@ -729,7 +722,7 @@ class TestBucketFactorCombos:
             "confidence": 0.70, "odds": 1.80, "line": 2.5,
             "consensus_reached": True, "reasoning": "test",
             "context_source": "none", "provider_code": "pinnacle",
-            "models_used": ["gpt"],
+            "models_used": ["deepseek"],
         }
         decision = await _eval(engine, _football_match(), analysis)
         if decision.should_bet:
@@ -751,7 +744,7 @@ class TestStakeEdgeCases:
             "prediction": "under", "bet_type": "total",
             "confidence": 0.70, "odds": 1.80, "line": 2.5,
             "consensus_reached": True, "reasoning": "test",
-            "context_source": "none", "models_used": ["gpt"],
+            "context_source": "none", "models_used": ["deepseek"],
         }
         decision = await _eval(
             engine, _football_match(), analysis,
@@ -769,7 +762,7 @@ class TestStakeEdgeCases:
             "prediction": "under", "bet_type": "total",
             "confidence": 0.70, "odds": 1.80, "line": 2.5,
             "consensus_reached": True, "reasoning": "test",
-            "context_source": "none", "models_used": ["gpt"],
+            "context_source": "none", "models_used": ["deepseek"],
         }
         no_loss = await _eval(engine, _football_match(), analysis, daily_loss=Decimal("0"))
         with_loss = await _eval(engine, _football_match(), analysis, daily_loss=Decimal("300"))
@@ -786,7 +779,7 @@ class TestStakeEdgeCases:
             "prediction": "under", "bet_type": "total",
             "confidence": 0.70, "odds": 1.80, "line": 2.5,
             "consensus_reached": True, "reasoning": "test",
-            "context_source": "none", "models_used": ["gpt"],
+            "context_source": "none", "models_used": ["deepseek"],
         }
         exact = await _eval(engine, _football_match(), analysis, daily_loss=Decimal("500"))
         exceed = await _eval(engine, _football_match(), analysis, daily_loss=Decimal("1000"))

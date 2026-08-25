@@ -1,8 +1,10 @@
-"""GPT 分析引擎单元测试：缓存 + GPT 重试 + 篮球时间转换 + 信号函数。
+"""DeepSeek 分析引擎单元测试：缓存 + DeepSeek 重试 + 篮球时间转换 + 信号函数。
 
 对应 doc.md 第 4 章。
 """
 import pytest
+import json
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 from app.ai.analyzer import MatchAnalyzer
 
@@ -78,25 +80,25 @@ class TestAntiChaseSignal:
         assert result is not None
 
 
-class TestCallGpt:
-    """_call_gpt 错误处理。"""
+class TestCallDeepSeek:
+    """_call_deepseek 错误处理。"""
 
     def test_max_retries_is_2(self):
-        """GPT 重试次数为 2（非 3）。"""
+        """DeepSeek 重试次数为 2（非 3）。"""
         import inspect
-        src = inspect.getsource(MatchAnalyzer._call_gpt)
+        src = inspect.getsource(MatchAnalyzer._call_deepseek)
         assert "max_retries = 2" in src
 
     def test_empty_choices_raises(self):
         """空 choices 应 raise。"""
         import inspect
-        src = inspect.getsource(MatchAnalyzer._call_gpt)
+        src = inspect.getsource(MatchAnalyzer._call_deepseek)
         assert "choices" in src
 
     def test_timeout_no_retry(self):
         """超时不重试。"""
         import inspect
-        src = inspect.getsource(MatchAnalyzer._call_gpt)
+        src = inspect.getsource(MatchAnalyzer._call_deepseek)
         assert "timeout" in src.lower() or "timed out" in src.lower()
 
 
@@ -114,3 +116,80 @@ class TestCacheTtl:
         import inspect
         src = inspect.getsource(MatchAnalyzer.analyze_match)
         assert "line_tag" in src
+
+
+def _valid_nowscore_context():
+    def rows(totals):
+        return [{"home_goals": value, "away_goals": 0} for value in totals]
+
+    return {
+        "source": "nowscore",
+        "sport": "football",
+        "identity": {"validated": True},
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "h2h": {"matches": rows([2, 3, 4])},
+        "home_form": {"matches": rows([2, 3, 4])},
+        "away_form": {"matches": rows([1, 3, 4])},
+    }
+
+
+@pytest.mark.asyncio
+async def test_nowscore_gate_rejects_missing_context_before_model_call():
+    analyzer = MatchAnalyzer()
+    analyzer._call_deepseek = AsyncMock(side_effect=AssertionError("model must not be called"))
+
+    result = await analyzer.analyze_match(
+        {"id": 1, "sport": "football", "home_team": "A", "away_team": "B", "total_line": 2.5},
+        historical_data=None,
+        market_odds={"markets": {"total": {"line": 2.5, "odds": {"under": 1.9, "over": 1.9}}}},
+    )
+
+    assert result["prediction"] == "skip"
+    assert result["error"].startswith("nowscore_evidence_unusable:")
+    analyzer._call_deepseek.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_model_line_mismatch_is_rejected():
+    analyzer = MatchAnalyzer()
+    analyzer._call_deepseek = AsyncMock(return_value={
+        "content": json.dumps({
+            "prediction": "over",
+            "under_confidence": 0.35,
+            "over_confidence": 0.65,
+            "line": 2.5,
+            "reasoning": "test",
+        }),
+        "_meta": {"latency_ms": 1},
+    })
+    analyzer._build_historical_feedback = AsyncMock(return_value="")
+
+    result = await analyzer.analyze_match(
+        {"id": 2, "sport": "football", "home_team": "A", "away_team": "B", "total_line": 2.25},
+        historical_data=_valid_nowscore_context(),
+        market_odds={"markets": {"total": {"line": 2.25, "odds": {"under": 1.9, "over": 1.9}}}},
+    )
+
+    assert result["prediction"] == "skip"
+    assert result["error"] == "model_total_line_mismatch"
+    assert result["line"] == 2.25
+    assert result["model_line"] == 2.5
+
+
+@pytest.mark.asyncio
+async def test_structured_gate_requires_two_sided_total_odds_before_model():
+    analyzer = MatchAnalyzer()
+    analyzer._call_deepseek = AsyncMock(side_effect=AssertionError("model must not be called"))
+
+    result = await analyzer.analyze_match(
+        {
+            "id": 3, "sport": "football", "status": "upcoming",
+            "home_team": "A", "away_team": "B", "total_line": 2.5,
+        },
+        historical_data=_valid_nowscore_context(),
+        market_odds={"markets": {"total": {"line": 2.5, "odds": {"under": 1.9}}}},
+    )
+
+    assert result["prediction"] == "skip"
+    assert result["error"] == "total_feature_gate:missing_two_sided_total_odds"
+    analyzer._call_deepseek.assert_not_awaited()

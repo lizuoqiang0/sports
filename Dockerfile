@@ -1,5 +1,7 @@
-# 生产后端：无 Playwright 浏览器；依赖可缓存，日常启动不重建
-FROM python:3.12-slim AS runtime
+# 生产后端：无 Playwright 浏览器；依赖可缓存，日常启动不重建。
+# 默认使用 DaoCloud 国内镜像；私有镜像仓库可通过 BASE_IMAGE_REGISTRY 覆盖。
+ARG BASE_IMAGE_REGISTRY=docker.m.daocloud.io
+FROM ${BASE_IMAGE_REGISTRY}/library/python:3.12-slim AS runtime
 
 ARG PIP_INDEX_URL
 ARG DEBIAN_MIRROR

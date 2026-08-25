@@ -17,6 +17,9 @@ from app.services.bookmakers.plugins.ob.odds import sanitize_token
 from app.services.bookmakers.plugins.pinnacle.bet_ui import (
     ui_place_pinnacle_total as _ui_place_pinnacle_total,
 )
+from app.services.bookmakers.plugins.pinnacle.modals import (
+    cleanup_pinnacle_failed_slips,
+)
 from app.services.bookmakers.session_blob import apply_session_blob, is_session_blob
 from app.services.bookmakers.site_profiles import get_site_profile
 
@@ -113,8 +116,29 @@ async def place_site_bet(
     page=None,
     headed: bool = False,
     allow_launch: bool = False,
+    preview_only: bool = False,
 ) -> PlaceBetResult:
     code = (site_code or "").lower()
+    # 平博只能通过专用大小球 UI 下单。拒绝任何其它玩法，避免通用
+    # API/弱匹配把让球盘口误点成 under/over。
+    if code == "pinnacle":
+        if str(bet_type or "").lower() not in {"total"}:
+            return PlaceBetResult(ok=False, message="平博仅支持全场大小球（bet_type=total）")
+        # total 下单必须带当前盘口线；没有 line 时，DOM 兜底只能退化为
+        # 行/赔率弱匹配，极易把让球盘同名 under/over 点进投注单。
+        payload = odds_data if isinstance(odds_data, dict) else {}
+        site_meta = payload.get("_site") or payload.get("_pinnacle") or {}
+        if isinstance(site_meta, dict):
+            meta_bt = str(site_meta.get("bet_type") or "").strip().lower()
+            if meta_bt and meta_bt not in {"total", "totals", "ou"}:
+                return PlaceBetResult(ok=False, message="平博盘口元数据不是全场大小球，已阻止下单")
+        try:
+            meta_line = site_meta.get("line") if isinstance(site_meta, dict) else None
+            total_line = float(payload.get("line") or payload.get("total") or meta_line or 0)
+        except (TypeError, ValueError):
+            total_line = 0.0
+        if total_line <= 0:
+            return PlaceBetResult(ok=False, message="平博缺少当前全场大小球盘口线，已阻止下单")
     profile = get_site_profile(code)
     name = profile.get("name") or code
     token = sanitize_token(session_token)
@@ -175,6 +199,18 @@ async def place_site_bet(
             await page.goto(dest, wait_until="domcontentloaded", timeout=60000)
             await page.wait_for_timeout(1500)
 
+        if code == "pinnacle":
+            from app.services.bookmakers.plugins.pinnacle.venue import (
+                pinnacle_session_expired,
+            )
+
+            if await pinnacle_session_expired(page):
+                await cleanup_pinnacle_failed_slips(page)
+                return PlaceBetResult(
+                    ok=False,
+                    message="平博体育页当前为访客状态，已阻止下单；请重新验证登录",
+                )
+
         # 解析队名必须在盘口恢复之前（平博 board recovery 依赖 home/away）
         home, away = _parse_teams_from_external_id(match_external_id)
         # 队名 fallback：短格式 external_id（如 pinnacle:1634071712）无法解析队名，
@@ -187,7 +223,8 @@ async def place_site_bet(
         # 1) 页面内通用下注 POST：仅作探测；成功必须以余额扣减或明确订单号为准（禁止假成功）
         api_result = await page.evaluate(
             """async (args) => {
-              const { ref, selection, odds, stake, betType, matchId } = args;
+            const { ref, selection, odds, stake, betType, matchId, allowGenericApi } = args;
+              if (!allowGenericApi) return { ok: false, skipped: true };
               const tryUrls = [
                 '/api/bet', '/api/bet/place', '/bet/place', '/bet/order',
                 '/sports/bet', '/member/bet', '/wager/place',
@@ -225,6 +262,7 @@ async def place_site_bet(
                 "stake": float(stake),
                 "betType": bet_type,
                 "matchId": (match_external_id or "").split(":", 1)[-1],
+                "allowGenericApi": code != "pinnacle",
             },
         )
         if isinstance(api_result, dict) and api_result.get("ok"):
@@ -452,6 +490,14 @@ async def place_site_bet(
                 policy_dynamic, policy_cap, policy_balance = stake, stake, Decimal("0")
             # 页面读取到的余额优先于请求时的缓存余额。
             available_balance = bal_before if bal_before > 0 else policy_balance
+            site_meta = (odds_data or {}).get("_site") or {}
+            event_id = str(site_meta.get("mid") or "") if isinstance(site_meta, dict) else ""
+            native_aliases = tuple(
+                str(site_meta.get(key) or "").strip()
+                for key in ("event_home", "event_away")
+                if isinstance(site_meta, dict) and str(site_meta.get(key) or "").strip()
+            )
+            live_only = bool((odds_data or {}).get("_is_live", True))
             ui_ok, ui_detail, actual_stake, bet_ref = await _ui_place_pinnacle_total(
                 page,
                 home=home,
@@ -461,20 +507,47 @@ async def place_site_bet(
                 stake=stake,
                 line=line,
                 sport=sport,
+                event_id=event_id,
+                team_aliases=native_aliases,
+                live_only=live_only,
                 dynamic_stake=policy_dynamic,
                 stake_cap=policy_cap,
                 available_balance=available_balance if available_balance > 0 else None,
+                preview_only=bool(preview_only),
             )
             logger.info("pinnacle ui place ok=%s detail=%s bet_ref=%s bt=%s", ui_ok, ui_detail, bet_ref, bt)
+            raw_ui_detail = str(ui_detail or "")
+            # preview_ready intentionally keeps the filled slip visible.  Every
+            # other failure must leave Pinnacle empty, including early failures
+            # such as wrong sport/page before bet_ui reaches its local cleanup.
+            if not ui_ok and not str(ui_detail or "").startswith("preview_ready|"):
+                cleanup_ok, cleanup_detail = await cleanup_pinnacle_failed_slips(page)
+                ui_detail = (
+                    f"{ui_detail or 'ui_miss'}|cleanup:"
+                    f"{'verified' if cleanup_ok else 'unverified'}:{cleanup_detail}"
+                )
+            if preview_only and str(ui_detail or "").startswith("preview_ready|"):
+                return PlaceBetResult(
+                    ok=False,
+                    message=f"平博 UI 预览已就绪（金额 {actual_stake}，未提交订单）|{ui_detail}",
+                    balance_after=bal_before,
+                    actual_stake=actual_stake,
+                )
+            if preview_only:
+                return PlaceBetResult(
+                    ok=False,
+                    message=f"平博 UI 预览失败（未提交订单）|{str(ui_detail or 'ui_miss')[:3000]}",
+                    balance_after=bal_before,
+                )
             # 赔率变动策略拒绝：直接返回可读原因（≥1.7 接受 / <1.7 放弃）
-            if (not ui_ok) and ui_detail and "odds_change_reject" in str(ui_detail):
-                reason = str(ui_detail).split("|", 1)[-1] if "|" in str(ui_detail) else str(ui_detail)
+            if (not ui_ok) and "odds_change_reject" in raw_ui_detail:
+                reason = raw_ui_detail.split("|", 1)[-1] if "|" in raw_ui_detail else raw_ui_detail
                 return PlaceBetResult(
                     ok=False,
                     message=f"平博放弃下单：{reason}",
                     balance_after=bal_before,
                 )
-            if not ui_ok and ui_detail in {
+            if not ui_ok and raw_ui_detail in {
                 "requested_stake_exceeds_strategy_cap",
                 "site_minimum_exceeds_strategy_cap",
                 "site_minimum_exceeds_available_balance",
@@ -488,7 +561,7 @@ async def place_site_bet(
                 }
                 return PlaceBetResult(
                     ok=False,
-                    message=stake_messages[ui_detail],
+                    message=stake_messages[raw_ui_detail],
                     balance_after=bal_before,
                 )
         else:
@@ -561,15 +634,38 @@ async def place_site_bet(
                 effective_stake,
                 ui_detail,
             )
+            cleanup_detail = ""
+            cleanup_status = ""
+            if code == "pinnacle":
+                cleanup_ok, cleanup_detail = await cleanup_pinnacle_failed_slips(page)
+                cleanup_status = (
+                    "失败注单已清除并验证为空"
+                    if cleanup_ok
+                    else "失败注单清除未能验证"
+                )
+                if not cleanup_ok:
+                    logger.error(
+                        "pinnacle no-debit cleanup failed: %s", cleanup_detail
+                    )
             return PlaceBetResult(
                 ok=False,
                 message=(
                     f"{name} 页面已点投注但余额未扣减（{bal_before}→{bal_after}），"
-                    f"未记成功。detail={ui_detail}"
+                    f"未记成功；{cleanup_status}。detail={ui_detail}"
+                    f"|cleanup={cleanup_detail}"
                 ),
                 balance_after=bal_after if bal_after > 0 else bal_before,
             )
 
+        if code == "pinnacle":
+            return PlaceBetResult(
+                ok=False,
+                message=(
+                    "平博 UI 自动下单失败；未产生成功订单，失败注单已执行清理。"
+                    f"stage={str(ui_detail or 'ui_miss')[:1000]}"
+                ),
+                balance_after=bal_before,
+            )
         if not ref:
             return PlaceBetResult(
                 ok=False,
@@ -591,6 +687,11 @@ async def place_site_bet(
             balance_after=bal_before,
         )
     except Exception as e:
+        if code == "pinnacle" and page is not None:
+            try:
+                await cleanup_pinnacle_failed_slips(page)
+            except Exception:
+                logger.exception("pinnacle exception cleanup failed")
         logger.exception("place_site_bet failed %s", code)
         return PlaceBetResult(ok=False, message=f"{name} 下单异常: {e}")
     finally:

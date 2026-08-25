@@ -312,9 +312,16 @@ function MatchCard({ match, onClick }) {
             <div className="flex gap-2">
               {(() => {
                 const total = match.odds.find(o => o.bet_type === 'total' || o.bet_type === 'Total')
-                if (!total || total.odds_data?.under == null) return null
+                if (!total || (total.odds_data?.under == null && total.odds_data?.over == null)) return null
                 return (
-                  <OddsChip label={`小球 ${total.total ?? ''}`} value={total.odds_data.under} />
+                  <>
+                    {total.odds_data?.under != null && (
+                      <OddsChip label={`小球 ${total.total ?? ''}`} value={total.odds_data.under} />
+                    )}
+                    {total.odds_data?.over != null && (
+                      <OddsChip label={`大球 ${total.total ?? ''}`} value={total.odds_data.over} />
+                    )}
+                  </>
                 )
               })()}
             </div>

@@ -85,7 +85,7 @@ async def run_all():
         "line": 2.5,
         "consensus_reached": True,
         "reasoning": "双方近期防守稳固，小球概率较高",
-        "models_used": ["gpt"],
+        "models_used": ["deepseek"],
     }
 
     # ═══════════════════════════════════════════════════════════════

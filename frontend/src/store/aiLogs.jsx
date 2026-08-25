@@ -147,7 +147,7 @@ export function ingestAiEventLog(detail) {
     const skipped = data?.status === 'skipped' || data?.selection === 'skip' || !data?.selection
     const sel = skipped ? '跳过' : String(data.selection)
     const market = String(data?.bet_type || 'total')
-    const marketLabel = market === 'total' ? '全场小球' : market || '-'
+    const marketLabel = market === 'total' ? '全场大小球' : market || '-'
     const tag = skipped ? '跳过' : (data?.should_bet ? '✓推荐' : _fmtWinRate(_num(data?.confidence, 0) * 100))
     const reason = skipped ? _shortReason(data?.reasoning) : ''
     pushLogOnce(
@@ -166,7 +166,7 @@ export function ingestAiEventLog(detail) {
     for (const item of Array.isArray(data?.analysis_summary) ? data.analysis_summary : []) {
       const key = `${eventKey}:analysis:${item.match_id || `${item.home_team || ''}-${item.away_team || ''}`}:${item.selection || ''}:${item.bet_type || ''}`
       const market = String(item.bet_type || '')
-      const marketLabel = market === 'total' ? '全场小球' : market || '-'
+      const marketLabel = market === 'total' ? '全场大小球' : market || '-'
       const skipped = item.status === 'skipped' || item.selection === 'skip' || !item.selection
       const selection = skipped ? '跳过' : String(item.selection)
       const tag = _analysisTag(item)
@@ -187,7 +187,7 @@ export function ingestAiEventLog(detail) {
     for (const item of Array.isArray(data?.analysis_summary) ? data.analysis_summary : []) {
       const key = `${eventKey}:analysis:${item.match_id || `${item.home_team || ''}-${item.away_team || ''}`}:${item.selection || ''}:${item.bet_type || ''}`
       const market = String(item.bet_type || '')
-      const marketLabel = market === 'total' ? '全场小球' : market || '-'
+      const marketLabel = market === 'total' ? '全场大小球' : market || '-'
       const skipped = item.status === 'skipped' || item.selection === 'skip' || !item.selection
       const selection = skipped ? '跳过' : String(item.selection)
       const tag = _analysisTag(item)

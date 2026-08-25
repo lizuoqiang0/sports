@@ -3,7 +3,7 @@
 # OB Sports 一键部署脚本（合并 prod_up.sh）
 #
 # 用法:
-#   bash scripts/quick.sh                # 日常部署（语法检查→构建→重建→清缓存→健康检查）
+#   bash scripts/quick.sh                # 日常部署（语法检查→构建→重建→清临时缓存→就绪检查）
 #   bash scripts/quick.sh --init        # 首次部署/全量启动（.env→数据目录→镜像→Browser Gate→全容器）
 #   bash scripts/quick.sh --no-build    # 跳过构建，仅强制重建容器
 #   bash scripts/quick.sh --with-ai     # 同时启动 AI 引擎
@@ -22,6 +22,10 @@ cd "$ROOT"
 
 export DOCKER_BUILDKIT=1
 export COMPOSE_DOCKER_CLI_BUILD=1
+# Dockerfile 与 Compose 服务的统一基础镜像源。默认 DaoCloud 国内镜像；
+# 私有仓库可在 .env / shell 中设置 BASE_IMAGE_REGISTRY 覆盖。
+BASE_IMAGE_REGISTRY="${BASE_IMAGE_REGISTRY:-docker.m.daocloud.io}"
+export BASE_IMAGE_REGISTRY
 
 # ── 颜色 ──
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'
@@ -55,7 +59,7 @@ for arg in "$@"; do
       cat <<'EOF'
 OB Sports 一键部署脚本
 
-  bash scripts/quick.sh                日常部署（构建+重建+清缓存+健康检查）
+  bash scripts/quick.sh                日常部署（全量语法检查+构建+重建+清临时缓存+就绪检查）
   bash scripts/quick.sh --init         首次部署/全量启动（.env+数据目录+Browser Gate+frontend）
   bash scripts/quick.sh --no-build     跳过构建，仅强制重建容器
   bash scripts/quick.sh --with-ai      同时启动 AI 引擎
@@ -103,39 +107,34 @@ wait_container_healthy() {
 }
 
 clear_redis_cache() {
-  step "清除 Redis 旧缓存"
-  docker exec ob-redis redis-cli DEL \
-    "ai:calibration:v1" \
-    "ai:patterns:v1" \
-    "ai:risk_tuning:v1" \
-    "bets:stats:recent" \
-    2>/dev/null && ok "缓存已清除" || info "Redis 未就绪，跳过"
+  step "清除 Redis 临时推荐缓存"
+  # 校准结果、风险调优和模式是生产学习状态，部署时不得删除。
+  # 仅清除可由新代码重新生成的推荐/上下文/结算统计缓存。
+  if ! docker exec ob-redis redis-cli PING >/dev/null 2>&1; then
+    info "Redis 未就绪，跳过"
+    return 0
+  fi
+  local pattern keys
+  for pattern in "ai:recs:*" "ai:match_ctx:*" "ai:deepseek:*"; do
+    keys="$(docker exec ob-redis redis-cli --scan --pattern "$pattern" 2>/dev/null || true)"
+    if [[ -n "$keys" ]]; then
+      # Redis key 由系统生成，不含空格；逐个删除避免参数长度/注入问题。
+      while IFS= read -r key; do
+        [[ -n "$key" ]] && docker exec ob-redis redis-cli DEL "$key" >/dev/null
+      done <<< "$keys"
+    fi
+  done
+  docker exec ob-redis redis-cli DEL "bets:stats:recent" >/dev/null 2>&1 || true
+  ok "临时缓存已清除（校准/风险调优状态保留）"
 }
 
 syntax_check() {
   step "Python 语法检查"
-  local files=(
-    app/ai/strategy.py
-    app/ai/auto_better.py
-    app/ai/analyzer.py
-    app/ai/bet_executor.py
-    app/ai/strategy_gates.py
-    app/api/bets.py
-    app/api/ai_bets.py
-    app/config.py
-    app/core/convert.py
-  )
-  local all_ok=true
-  for f in "${files[@]}"; do
-    if python3 -c "import ast; ast.parse(open('$f').read())" 2>/dev/null; then
-      ok "$f"
-    else
-      fail "$f 语法错误"
-      all_ok=false
-    fi
-  done
-  if [[ "$all_ok" == "false" ]]; then
-    echo -e "\n${RED}语法检查未通过，终止部署${NC}"
+  # 覆盖所有生产 Python 源码，避免新增模块绕过旧的硬编码清单。
+  if python3 -m compileall -q app scripts; then
+    ok "app/ 与 scripts/ 全量语法通过"
+  else
+    fail "Python 语法检查未通过，终止部署"
     exit 1
   fi
 }
@@ -143,22 +142,24 @@ syntax_check() {
 build_images() {
   step "重建 Docker 镜像"
   if [[ "$FORCE_BUILD" == "1" ]]; then
-    docker compose build --no-cache backend 2>&1 | grep -E '(DONE|Built|ERROR)' || true
-    ok "镜像构建完成"
+    # 不再通过 grep 管道吞掉 docker build 的退出码；失败必须中止生产部署。
+    # frontend 使用独立 Node/Nginx 镜像，必须与后端一起构建。ai-engine 复用 backend 镜像。
+    docker compose build --no-cache backend frontend
+    ok "backend/frontend 镜像构建完成（ai-engine 复用 backend 镜像）"
   else
     info "跳过构建（--no-build）"
   fi
 }
 
 recreate_containers() {
-  local services=("backend")
+  local services=("backend" "frontend")
   [[ "$WITH_AI" == "1" ]] && services+=("ai-engine")
 
   step "强制重建容器: ${services[*]}"
   if [[ "$WITH_AI" == "1" ]]; then
-    docker compose --profile ai up -d --force-recreate "${services[@]}" 2>&1 | tail -8
+    docker compose --profile ai up -d --force-recreate "${services[@]}"
   else
-    docker compose up -d --force-recreate "${services[@]}" 2>&1 | tail -8
+    docker compose up -d --force-recreate "${services[@]}"
   fi
   ok "容器已重建"
 }
@@ -168,7 +169,7 @@ show_status() {
   docker compose ps 2>/dev/null
   echo
   info "前端:  http://localhost:3000"
-  info "API:   http://localhost:8000/docs"
+  info "API:   http://localhost:8000/ready"
   info "Gate:  http://localhost:9277/health"
   echo
   info "日志: docker logs ob-backend --tail 50 -f"
@@ -194,7 +195,7 @@ stop_all() {
 
 restart_containers() {
   step "重启容器（不重建镜像）"
-  docker compose restart backend 2>&1 | tail -3
+  docker compose restart backend frontend
   docker compose --profile ai restart ai-engine 2>/dev/null \
     || docker compose restart ai-engine 2>/dev/null \
     || true
@@ -208,11 +209,11 @@ tail_logs() {
 
 pull_bases() {
   step "预拉基础镜像（并行）"
-  docker pull postgres:16-alpine &
-  docker pull redis:7-alpine &
-  docker pull python:3.12-slim &
-  docker pull nginx:1.27-alpine &
-  docker pull node:20-alpine &
+  docker pull "$BASE_IMAGE_REGISTRY/library/postgres:16-alpine" &
+  docker pull "$BASE_IMAGE_REGISTRY/library/redis:7-alpine" &
+  docker pull "$BASE_IMAGE_REGISTRY/library/python:3.12-slim" &
+  docker pull "$BASE_IMAGE_REGISTRY/library/nginx:1.27-alpine" &
+  docker pull "$BASE_IMAGE_REGISTRY/library/node:20-alpine" &
   wait
   ok "基础镜像就绪"
 }
@@ -247,11 +248,15 @@ init_environment() {
 
   # 缺基础镜像时先拉
   local need_pull=0
-  for img in postgres:16-alpine redis:7-alpine python:3.12-slim nginx:1.27-alpine; do
+  for img in \
+    "$BASE_IMAGE_REGISTRY/library/postgres:16-alpine" \
+    "$BASE_IMAGE_REGISTRY/library/redis:7-alpine" \
+    "$BASE_IMAGE_REGISTRY/library/python:3.12-slim" \
+    "$BASE_IMAGE_REGISTRY/library/nginx:1.27-alpine"; do
     docker image inspect "$img" >/dev/null 2>&1 || need_pull=1
   done
   [[ "$FORCE_BUILD" == "1" ]] && {
-    docker image inspect node:20-alpine >/dev/null 2>&1 || need_pull=1
+    docker image inspect "$BASE_IMAGE_REGISTRY/library/node:20-alpine" >/dev/null 2>&1 || need_pull=1
   }
   [[ "$need_pull" == "1" ]] && pull_bases
 
@@ -320,7 +325,7 @@ case "$ACTION" in
     ;;
   restart)
     restart_containers
-    wait_healthy "Backend" "http://127.0.0.1:8000/health" 30
+    wait_healthy "Backend" "http://127.0.0.1:8000/ready" 90
     show_status
     ;;
   deploy)
@@ -332,7 +337,7 @@ case "$ACTION" in
       clear_redis_cache
       start_full_stack
       step "等待服务健康"
-      wait_healthy "Backend" "http://127.0.0.1:8000/health" 60
+      wait_healthy "Backend" "http://127.0.0.1:8000/ready" 90
       show_status
       [[ "$SHOW_LOGS" == "1" ]] && tail_logs
       echo
@@ -346,7 +351,7 @@ case "$ACTION" in
       clear_redis_cache
       recreate_containers
       step "等待服务健康"
-      wait_healthy "Backend" "http://127.0.0.1:8000/health" 60
+      wait_healthy "Backend" "http://127.0.0.1:8000/ready" 90
       show_status
       [[ "$SHOW_LOGS" == "1" ]] && tail_logs
       echo

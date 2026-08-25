@@ -64,7 +64,7 @@ class TestA3Confidence:
         analysis = {
             "prediction": "under", "bet_type": "total",
             "confidence": 0.30, "odds": 1.85, "line": 2.5,
-            "consensus_reached": True, "reasoning": "test", "models_used": ["gpt"],
+            "consensus_reached": True, "reasoning": "test", "models_used": ["deepseek"],
         }
         engine = StrategyEngine(mock_strategy_config, user_id=1)
         decision = await engine.evaluate_bet(

@@ -95,6 +95,10 @@ def apply_odds_version(
         old_total=getattr(current, "total", None),
         new_total=total,
     ):
+        # 赔率未变时也要刷新站点内部定位元数据。平博 UI 下单依赖最新
+        # mid/原生队名；只比较公开赔率会令历史行永久缺失这些信息。
+        if isinstance(odds_data, dict) and dict(getattr(current, "odds_data", None) or {}) != odds_data:
+            current.odds_data = dict(odds_data)
         return current, False
 
     close_at = now.replace(tzinfo=None) if getattr(now, "tzinfo", None) else now

@@ -3,7 +3,7 @@
 
 直接抓取并缓存：
 - 分析页：积分排名、对赛往绩、近期战绩、联赛走势、伤停、战绩特征、数据对比
-- 走势页：各公司初指/赛前指数
+- 页面确实存在时才采集各公司初指；盘路表现表与赔率表严格分离
 
 最终上下文落 Redis，供 AI 只读实时盘口 + 基本面。
 """
@@ -123,6 +123,10 @@ _ALIAS_CANDIDATE_HASH_KEY = "nowscore:alias_candidates:data"
 _ALIAS_OVERRIDE_HASH_KEY = "nowscore:alias_overrides:data"
 _ALIAS_AUDIT_LOG_KEY = "nowscore:alias_audit_logs"
 _ALIAS_CANDIDATE_MIN_SCORE = 0.35
+# 低于此分数的候选只能进入待审核列表，不能自动成为正式别名。
+# 0.68 左右的“最佳候选”可能只是同联赛/同姓球队，自动生效会把
+# NowScore 的基本面串到另一场比赛，进而误导大小球分析。
+_ALIAS_AUTO_APPROVE_MIN_SCORE = 0.75
 _ALIAS_OVERRIDE_CACHE_TTL = 60
 _ALIAS_AUDIT_LOG_LIMIT = 300
 _NOWSCORE_TEAM_ALIAS_GROUPS: dict[str, tuple[tuple[str, ...], ...]] = {
@@ -305,7 +309,28 @@ async def _record_alias_candidate(
         current["away_variants"] = _dedupe_keep_order(list(current.get("away_variants") or []) + away_variants)[:8]
         await cache.hset(_ALIAS_CANDIDATE_HASH_KEY, candidate_key, current)
 
-        # 自动生效：候选别名同时写入正式别名，无需手动确认
+        # 只有高置信候选才允许自动生效；低分候选保留在审计/待审核列表，
+        # 不能把相似但不相同的球队映射写入运行时索引。
+        if float(best_score) < _ALIAS_AUTO_APPROVE_MIN_SCORE:
+            logger.info(
+                "nowscore: alias candidate pending review | %s vs %s -> %s vs %s | score=%.3f",
+                home, away, candidate_home, candidate_away, float(best_score),
+            )
+            await _emit_alias_audit_log(
+                "candidate_pending_review",
+                actor="system",
+                payload={
+                    "record_id": candidate_key,
+                    "sport": _sport_cache_key(sport),
+                    "source_home": home,
+                    "source_away": away,
+                    "candidate_home": candidate_home,
+                    "candidate_away": candidate_away,
+                    "best_score": float(best_score),
+                },
+            )
+            return
+
         override = _build_alias_override_record(
             {
                 "id": candidate_key,
@@ -381,6 +406,15 @@ async def _get_runtime_alias_index(
         raw = await cache.hgetall(_ALIAS_OVERRIDE_HASH_KEY)
         for item in raw.values():
             if not isinstance(item, dict):
+                continue
+            # 兼容历史版本写入的低分 auto 别名：不删除审计记录，但不再
+            # 进入运行时匹配索引；只有人工批准或达到高置信自动阈值才可用。
+            approved_by = str(item.get("approved_by") or "").strip().lower()
+            try:
+                item_score = float(item.get("best_score") or 0.0)
+            except (TypeError, ValueError):
+                item_score = 0.0
+            if approved_by == "auto" and item_score < _ALIAS_AUTO_APPROVE_MIN_SCORE:
                 continue
             item_sport = _sport_cache_key(str(item.get("sport") or "football"))
             bucket = index_by_sport.setdefault(item_sport, {})
@@ -1066,11 +1100,12 @@ async def _find_schedule_id(
             logger.info("nowscore: matched %s vs %s -> sid=%s", home, away, sid)
             return sid
 
-    # 2. 模糊匹配：取名字中连续 2+ 字符进行匹配
+    # 2. 模糊匹配：必须双方都命中且对阵整体相似度达标，禁止仅凭短片段直接选场
     for sid, title in titles.items():
         if (
             any(_fuzzy_team_match(v, title) for v in home_variants)
             and any(_fuzzy_team_match(v, title) for v in away_variants)
+            and _best_title_pair_score(home_variants, away_variants, title) >= 0.72
         ):
             logger.info("nowscore: fuzzy matched %s vs %s -> sid=%s", home, away, sid)
             return sid
@@ -1083,7 +1118,7 @@ async def _find_schedule_id(
         if score > best_score:
             best_sid = sid
             best_score = score
-    if best_sid is not None and best_score >= 0.65:
+    if best_sid is not None and best_score >= 0.72:
         logger.info(
             "nowscore: pair matched %s vs %s -> sid=%s score=%.3f",
             home,
@@ -1093,23 +1128,8 @@ async def _find_schedule_id(
         )
         return best_sid
 
-    # 3. 单字匹配（中文球队名取每个字检查，过滤常见无意义字符）
-    _COMMON_CHARS = set("FCfc队女()（）男女队足球俱乐部体育股份有限")
-    for sid, title in titles.items():
-        for home_variant in home_variants:
-            for away_variant in away_variants:
-                home_chars = [c for c in home_variant if c.strip() and c not in _COMMON_CHARS]
-                away_chars = [c for c in away_variant if c.strip() and c not in _COMMON_CHARS]
-                # 根据名字长度自适应阈值：长名字要求 3 字，短名字要求 2 字
-                home_thresh = min(3, len(home_chars))
-                away_thresh = min(3, len(away_chars))
-                if home_thresh >= 2 and away_thresh >= 2:
-                    home_match = sum(1 for c in home_chars if c in title) >= home_thresh
-                    away_match = sum(1 for c in away_chars if c in title) >= away_thresh
-                    if home_match and away_match:
-                        logger.info("nowscore: char matched %s vs %s -> sid=%s", home, away, sid)
-                        return sid
-
+    # 不再使用“共有几个汉字”自动匹配：同城队、青年队和预备队很容易因此串场。
+    # 低分候选只写审计记录，等待别名确认，绝不进入 AI 上下文。
     if best_sid is not None:
         await _record_alias_candidate(
             sport=sport,
@@ -1210,6 +1230,54 @@ async def _get_match_title(schedule_id: int, sport: str = "football") -> str:
     except Exception:
         pass
     return ""
+
+
+async def _build_schedule_identity(
+    schedule_id: int,
+    *,
+    requested_home: str,
+    requested_away: str,
+    sport: str,
+    fallback_title: str = "",
+) -> dict[str, Any]:
+    """用 NowScore 赛程源的主客队校验 scheduleId，阻止错场数据进入 AI。"""
+    feed = await _get_schedule_feed_matches(sport)
+    meta = feed.get(int(schedule_id)) if isinstance(feed, dict) else None
+    matched_home = str((meta or {}).get("home_team") or "").strip()
+    matched_away = str((meta or {}).get("away_team") or "").strip()
+    if not matched_home or not matched_away:
+        matched_home, matched_away = _extract_title_teams(fallback_title)
+
+    runtime_alias_index = await _get_runtime_alias_index(sport)
+    home_variants = _team_alias_variants(requested_home, sport, runtime_alias_index)
+    away_variants = _team_alias_variants(requested_away, sport, runtime_alias_index)
+
+    direct_home = max((_team_similarity(v, matched_home) for v in home_variants), default=0.0)
+    direct_away = max((_team_similarity(v, matched_away) for v in away_variants), default=0.0)
+    swap_home = max((_team_similarity(v, matched_away) for v in home_variants), default=0.0)
+    swap_away = max((_team_similarity(v, matched_home) for v in away_variants), default=0.0)
+    direct_score = (direct_home + direct_away) / 2.0
+    swapped_score = (swap_home + swap_away) / 2.0
+    orientation = "swapped" if swapped_score > direct_score else "direct"
+    pair_score = max(direct_score, swapped_score)
+    weakest_team_score = min(swap_home, swap_away) if orientation == "swapped" else min(direct_home, direct_away)
+    validated = bool(
+        matched_home
+        and matched_away
+        and pair_score >= 0.72
+        and weakest_team_score >= 0.55
+    )
+    return {
+        "validated": validated,
+        "method": "nowscore_schedule_feed" if meta else "analysis_title",
+        "orientation": orientation,
+        "pair_score": round(pair_score, 4),
+        "weakest_team_score": round(weakest_team_score, 4),
+        "requested_home": requested_home,
+        "requested_away": requested_away,
+        "matched_home": matched_home,
+        "matched_away": matched_away,
+    }
 
 
 # ── 数据抓取 ────────────────────────────────────────────────────────────
@@ -1472,10 +1540,10 @@ def _parse_h2h(html: str, home_team: str = "", away_team: str = "") -> dict[str,
 
     # 方式1：用表格检测（近10场 或 日期+比分 表头）+ _parse_form_row 解析
     for tbl in tables:
-        if not tbl or len(tbl) <= 3:
+        if not tbl or len(tbl) <= 1:
             continue
         header = " ".join(tbl[0]) if tbl[0] else ""
-        if ("近10场" in header or ("日期" in header and "比分" in header)) and len(tbl) > 3:
+        if "近10场" in header or ("日期" in header and "比分" in header):
             for row in tbl[1:]:
                 parsed = _parse_form_row(row)
                 if parsed:
@@ -1505,6 +1573,15 @@ def _parse_h2h(html: str, home_team: str = "", away_team: str = "") -> dict[str,
         if key not in seen:
             seen.add(key)
             unique.append(m)
+
+    if home_team and away_team:
+        verified_rows = []
+        for row in unique:
+            home_side = _resolve_team_perspective(row, home_team)
+            away_side = _resolve_team_perspective(row, away_team)
+            if home_side and away_side and home_side != away_side:
+                verified_rows.append(row)
+        unique = verified_rows
 
     if not unique:
         return {"matches": [], "note": "未找到历史交锋数据"}
@@ -1586,25 +1663,43 @@ def _parse_recent_form(
         if not tbl:
             continue
         header = " ".join(tbl[0]) if tbl[0] else ""
-        if ("近10场" in header or ("日期" in header and "比分" in header)) and len(tbl) > 3:
+        if ("近10场" in header or ("日期" in header and "比分" in header)) and len(tbl) > 1:
             form_tables.append(tbl)
 
-    # form_tables[0] = H2H, form_tables[1] = 主队近况, form_tables[2] = 客队近况
-    idx = 1 if team_side == "home" else 2
-    if idx >= len(form_tables):
+    # 页面在 H2H 样本不足时会省略/缩短首表，固定用第 2/3 张表会把客队近况算到主队。
+    # 逐表统计目标队出现次数，选择覆盖最多的近期表。
+    tbl = None
+    if team_name:
+        best_count = 0
+        for candidate in form_tables:
+            count = 0
+            for row in candidate[1:]:
+                parsed = _parse_form_row(row)
+                if parsed and _resolve_team_perspective(parsed, team_name):
+                    count += 1
+            if count > best_count:
+                best_count = count
+                tbl = candidate
+    if tbl is None:
+        idx = 1 if team_side == "home" else 2
+        if idx < len(form_tables):
+            tbl = form_tables[idx]
+    if tbl is None:
         return {"matches": [], "note": f"未找到{'主队' if team_side == 'home' else '客队'}近期战绩"}
 
-    tbl = form_tables[idx]
     matches = []
     for row in tbl[1:]:
         parsed = _parse_form_row(row)
         if not parsed:
             continue
+        perspective = _resolve_team_perspective(parsed, team_name)
+        if team_name and perspective is None:
+            # 表格顺序或页面结构变化时宁可丢弃，也不能把另一支球队的战绩算到目标队。
+            continue
         home_goals = parsed.get("home_goals")
         away_goals = parsed.get("away_goals")
         result = ""
         if home_goals is not None and away_goals is not None:
-            perspective = _resolve_team_perspective(parsed, team_name)
             if perspective == "home":
                 result = "胜" if home_goals > away_goals else ("平" if home_goals == away_goals else "负")
             elif perspective == "away":
@@ -1932,22 +2027,64 @@ def _parse_named_rows(tables: list[list[list[str]]]) -> list[dict[str, Any]]:
 
 
 def _parse_odds_trend_tables(html: str) -> dict[str, Any]:
-    """解析赛前指数/各公司初指/盘路走势。"""
-    tables = _tables_after_marker(html, "赛前指数", max_tables=1)
-    if not tables:
-        tables = _tables_with_keywords(_parse_tables(html), ("初指", "初盘", "盘口"))
-    if not tables:
-        tables = _tables_with_keywords(_parse_tables(html), ("赔率", "亚盘", "大小", "欧赔", "盘路"))
-    if not tables:
-        # 盘路走势：分析页中的赢/走/输与小球统计
-        tables = _tables_after_marker(html, "盘路走势", max_tables=6)
-    if not tables:
-        return {"tables": [], "initial_odds": []}
-    named = _parse_named_rows(tables)
+    """严格区分“真实赔率表”和“历史盘路表现表”。
+
+    赛果表也常包含“让球/大小”列，不能仅凭“大小”二字认定为初盘。
+    真实赔率表必须同时出现公司维度和初盘/即时盘维度。
+    """
+    all_tables = _parse_tables(html)
+    company_markers = (
+        "公司", "bet365", "澳门", "皇冠", "伟德", "易胜博", "利记",
+        "interwetten", "立博", "威廉希尔", "明陞", "12bet", "18bet",
+    )
+    phase_markers = ("初指", "初盘", "即时", "即盘", "终盘", "早盘")
+    market_markers = ("赔率", "欧赔", "亚盘", "让球", "大小", "大球", "小球")
+
+    market_tables: list[list[list[str]]] = []
+    performance_tables: list[list[list[str]]] = []
+    for table in all_tables:
+        text = _table_text(table).lower()
+        has_company = any(marker.lower() in text for marker in company_markers)
+        has_phase = any(marker in text for marker in phase_markers)
+        has_market = any(marker in text for marker in market_markers)
+        if has_company and has_phase and has_market:
+            market_tables.append(table)
+            continue
+        # “赢/走/输 + 大球/小球”是历史表现，不是当前或初始赔率。
+        if (
+            ("盘路走势" in text or all(marker in text for marker in ("赢", "走", "输")))
+            and ("大球" in text or "小球" in text or "大%" in text)
+        ):
+            performance_tables.append(table)
+
+    if not performance_tables and "盘路走势" in html:
+        candidates = _tables_after_marker(html, "盘路走势", max_tables=6)
+        for table in candidates:
+            text = _table_text(table)
+            if "赢" in text and "输" in text and ("大" in text or "小" in text):
+                performance_tables.append(table)
+
+    market_named = _parse_named_rows(market_tables)
+    performance_named = _parse_named_rows(performance_tables)
     return {
-        "tables": named,
-        "initial_odds": named,
-        "note": "赛前指数（欧赔/亚盘/大小）已抓取",
+        # tables 保留兼容性，但明确仅表示盘路表现，绝不再被当作市场初指。
+        "tables": performance_named,
+        "initial_odds": market_named,
+        "market_odds": {
+            "available": bool(market_named),
+            "tables": market_named,
+            "source": "nowscore_analysis_page",
+        },
+        "performance": {
+            "available": bool(performance_named),
+            "tables": performance_named,
+            "source": "nowscore_analysis_page",
+        },
+        "note": (
+            "已抓取真实公司初盘/即时盘表"
+            if market_named
+            else "当前 NowScore 页面未提供可验证的公司初盘；盘路表现仅作基本面"
+        ),
     }
 
 
@@ -2004,6 +2141,7 @@ def _build_context_payload(
     standings: Optional[dict[str, Any]] = None,
     analysis_extra: Optional[dict[str, Any]] = None,
     trend_data: Optional[dict[str, Any]] = None,
+    identity: Optional[dict[str, Any]] = None,
 ) -> Optional[dict[str, Any]]:
     analysis_tables = analysis_tables if analysis_tables is not None else _parse_tables(analysis_html)
     qingbao_tables = qingbao_tables if qingbao_tables is not None else _parse_tables(qingbao_html)
@@ -2040,6 +2178,12 @@ def _build_context_payload(
             sport, schedule_id, home_team, away_team, title,
         )
         return None
+    if not isinstance(identity, dict) or identity.get("validated") is not True:
+        logger.warning(
+            "nowscore context rejected by identity check: sport=%s sid=%s home=%s away=%s identity=%s",
+            sport, schedule_id, home_team, away_team, identity or {},
+        )
+        return None
 
     # 合并 analysis_extra 中的所有表
     analysis_all_tables = []
@@ -2054,6 +2198,19 @@ def _build_context_payload(
         "home_team": home_team,
         "away_team": away_team,
         "match_title": title,
+        "identity": identity,
+        "source_pages": {
+            "analysis": (
+                f"{_BASE}/AnalyLq/Analysis/{schedule_id}.htm"
+                if "basket" in (sport or "").lower()
+                else f"{_BASE}/Analy/Analysis/{schedule_id}.htm"
+            ),
+            "intelligence": (
+                f"{_BASE}/AnalyLq/Shijian/{schedule_id}.htm"
+                if "basket" in (sport or "").lower()
+                else f"{_BASE}/mvc/soccer/qingbao?scheduleId={schedule_id}"
+            ),
+        },
         "analysis": {
             "analysis_tables": analysis_all_tables,
             "injuries": analysis_extra.get("injuries") or [],
@@ -2099,23 +2256,40 @@ async def fetch_match_context_via_nowscore(
         logger.warning("nowscore: both pages empty for sid=%s", schedule_id)
         return None
 
+    title = await _get_match_title(schedule_id, sport)
+    identity = await _build_schedule_identity(
+        schedule_id,
+        requested_home=home_team,
+        requested_away=away_team,
+        sport=sport,
+        fallback_title=title,
+    )
+    if identity.get("validated") is not True:
+        logger.warning(
+            "nowscore context rejected before parse by identity check: sid=%s identity=%s",
+            schedule_id, identity,
+        )
+        return None
+    # 历史表使用 NowScore 自己的标准队名解析主客视角，避免投注平台译名差异影响胜负/排名。
+    parse_home_team = str(identity.get("matched_home") or home_team)
+    parse_away_team = str(identity.get("matched_away") or away_team)
+
     # 3. 解析数据（预解析 tables 避免重复调用 _parse_tables）
     analysis_tables = _parse_tables(analysis_html)
     qingbao_tables = _parse_tables(qingbao_html)
 
-    h2h = _parse_h2h(analysis_html, home_team, away_team)
-    home_form = _parse_recent_form(analysis_html, "home", team_name=home_team, _tables=analysis_tables)
-    away_form = _parse_recent_form(analysis_html, "away", team_name=away_team, _tables=analysis_tables)
+    h2h = _parse_h2h(analysis_html, parse_home_team, parse_away_team)
+    home_form = _parse_recent_form(analysis_html, "home", team_name=parse_home_team, _tables=analysis_tables)
+    away_form = _parse_recent_form(analysis_html, "away", team_name=parse_away_team, _tables=analysis_tables)
     standings = _parse_standings(
         analysis_html,
         qingbao_html,
         _analysis_tables=analysis_tables,
         _qingbao_tables=qingbao_tables,
-        home_team=home_team,
-        away_team=away_team,
+        home_team=parse_home_team,
+        away_team=parse_away_team,
     )
 
-    title = await _get_match_title(schedule_id, sport)
     if not _context_matches_declared_sport(
         sport=sport,
         title=title,
@@ -2159,6 +2333,7 @@ async def fetch_match_context_via_nowscore(
         standings=standings,
         analysis_extra=analysis_extra,
         trend_data=trend_data,
+        identity=identity,
     )
     if not ctx:
         return None
@@ -2248,6 +2423,19 @@ async def _parse_one_schedule(
     )
 
     title = await _get_match_title(schedule_id, sport)
+    identity = await _build_schedule_identity(
+        schedule_id,
+        requested_home=home_team,
+        requested_away=away_team,
+        sport=sport,
+        fallback_title=title,
+    )
+    if identity.get("validated") is not True:
+        logger.warning(
+            "nowscore prefetch rejected before parse by identity check: sid=%s identity=%s",
+            schedule_id, identity,
+        )
+        return None
     if not _context_matches_declared_sport(
         sport=sport,
         title=title,
@@ -2290,6 +2478,7 @@ async def _parse_one_schedule(
         standings=standings,
         analysis_extra=analysis_extra,
         trend_data=trend_data,
+        identity=identity,
     )
     if not ctx:
         return None

@@ -12,6 +12,7 @@
 """
 import sys
 import pytest
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 from decimal import Decimal
 
@@ -25,11 +26,30 @@ import app.core.cache  # noqa: E402 — 确保模块可被 patch 定位
 from app.ai.strategy import BetDecision, StrategyConfig
 from app.ai.bet_executor import (
     BetExecResult,
+    _place_failure_is_retryable,
     execute_bet,
     get_best_market_pack,
     get_odds_row,
     mark_bet_pending,
 )
+
+
+def test_only_pre_submit_transient_failures_are_retried():
+    assert _place_failure_is_retryable("浏览器网关正忙，请稍后")
+    assert _place_failure_is_retryable("网络超时")
+    assert not _place_failure_is_retryable("row_not_found:tokHit=[]")
+    assert not _place_failure_is_retryable("页面已点投注但余额未扣减")
+    assert not _place_failure_is_retryable("wrong_slip_blocked")
+
+
+def test_pinnacle_order_lookup_rejects_stale_or_non_live_odds():
+    source = Path("app/ai/bet_executor.py").read_text(encoding="utf-8")
+    get_row = source.split("async def get_odds_row", 1)[1].split(
+        "async def mark_bet_pending", 1
+    )[0]
+    assert "timedelta(minutes=5)" in get_row
+    assert "Odds.is_live.is_(True)" in get_row
+    assert "Odds.valid_from >= fresh_after" in get_row
 
 
 # ── fixtures ──
@@ -594,7 +614,7 @@ class TestBetFailure:
 
     @pytest.mark.asyncio
     async def test_all_retries_exhausted(self, mock_user, mock_match, strat_cfg, decision_under):
-        """全部重试用尽后失败。"""
+        """维护/DOM 等非瞬时失败不盲目重复下单。"""
         db = MagicMock()
         db.in_transaction = MagicMock(return_value=False)
 
@@ -632,7 +652,7 @@ class TestBetFailure:
 
         assert not result.ok
         assert "站点维护中" in result.message
-        assert connector.place_bet.call_count == 2  # 1 次初始 + 1 次重试
+        assert connector.place_bet.call_count == 1
         # 失败通知已发送
         notify.assert_called_once()
         assert notify.call_args[0][1] == "bet_failed"

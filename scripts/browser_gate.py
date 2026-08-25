@@ -86,7 +86,7 @@ def _hook_pinnacle_bet_capture(page) -> None:
         return
     _bet_capture_hooked.add(key)
 
-    def _on_response(resp):
+    async def _on_response(resp):
         try:
             req = resp.request
             if req.method.upper() != "POST":
@@ -104,8 +104,7 @@ def _hook_pinnacle_bet_capture(page) -> None:
                 if body:
                     f.write(f"  req_body={body[:2000]}\n")
                 try:
-                    # 同步读取响应体（小响应可接受）
-                    rb = resp.text()[:2000] if resp.status < 400 else ""
+                    rb = (await resp.text())[:2000] if resp.status < 400 else ""
                     if rb:
                         f.write(f"  resp_body={rb}\n")
                 except Exception:
@@ -161,6 +160,14 @@ async def _keep_sessions_refresh_loop() -> None:
                     # 平博页挂下单接口抓包（一次性任务，见 _hook_pinnacle_bet_capture）
                     if code == "pinnacle" and sess.page and not sess.page.is_closed():
                         _hook_pinnacle_bet_capture(sess.page)
+                        try:
+                            from app.services.bookmakers.plugins.pinnacle.modals import (
+                                dismiss_pinnacle_blocking_modals,
+                            )
+
+                            await dismiss_pinnacle_blocking_modals(sess.page)
+                        except Exception:
+                            pass
                     # 平博 SPA 白屏检测：白屏时余额/采盘全废且易把场馆余额误读为 0。
                     # 白屏属于渲染崩溃，reload 是唯一恢复手段（正常页面绝不触发）。
                     if code == "pinnacle" and sess.page and not sess.page.is_closed():
@@ -363,6 +370,13 @@ class BetPlaceRequest(BaseModel):
     odds_data: dict = Field(default_factory=dict)
     headed: bool = False
     site_code: str = "ob"
+    preview_only: bool = False
+
+
+class BetCleanupRequest(BaseModel):
+    base_url: str
+    session_token: str
+    site_code: str = "pinnacle"
 
 
 class BetHistoryRequest(BaseModel):
@@ -443,6 +457,12 @@ async def login(req: LoginRequest):
                     from app.services.bookmakers.venue_entry import is_in_sportsbook
 
                     can_reuse = await is_in_sportsbook(existing.page)
+                    if can_reuse and site_code == "pinnacle":
+                        from app.services.bookmakers.plugins.pinnacle.venue import (
+                            pinnacle_session_expired,
+                        )
+
+                        can_reuse = not await pinnacle_session_expired(existing.page)
                 except Exception:
                     can_reuse = False
             if can_reuse:
@@ -702,6 +722,21 @@ async def _run_odds_sync(req: OddsSyncRequest):
                     "lane": lane.key,
                 }
 
+        if sess and site_code == "pinnacle":
+            from app.services.bookmakers.plugins.pinnacle.venue import (
+                pinnacle_session_expired,
+            )
+
+            if await pinnacle_session_expired(sess.page):
+                return {
+                    "ok": False,
+                    "auth_required": True,
+                    "message": "平博体育页当前为访客状态，请重新验证登录",
+                    "matches": [],
+                    "refreshed": False,
+                    "lane": lane.key,
+                }
+
         async def _fetch_and_yield():
             """采集包裹：等待期间若下单/登录到来，主动放弃让路。"""
             task = asyncio.create_task(_fetch_with_session(sess.page if sess else None))
@@ -915,6 +950,7 @@ async def _run_odds_sync(req: OddsSyncRequest):
                 "away_score": int(m.away_score or 0),
                 "clock": m.clock or "",
                 "period": m.period or "",
+                "data_quality": dict(getattr(m, "data_quality", {}) or {}),
                 "odds_list": [
                     {
                         "bet_type": o.bet_type,
@@ -1515,6 +1551,18 @@ async def _scrape_balance_from_page(
         # 场馆外（大厅/中心钱包）一律不采，避免把中心余额当可投注余额
         return 0.0, False
 
+    if code == "pinnacle":
+        try:
+            from app.services.bookmakers.plugins.pinnacle.venue import (
+                pinnacle_session_expired,
+            )
+
+            if await pinnacle_session_expired(page):
+                logger.warning("balance scrape pinnacle rejected: sportsbook is in guest state")
+                return 0.0, False
+        except Exception:
+            return 0.0, False
+
     try:
         main_url = page.url or ""
     except Exception:
@@ -2082,8 +2130,7 @@ async def odds_sync_live(req: OddsSyncRequest):
     return await _run_odds_sync(req)
 
 
-@app.post("/bet/place")
-async def bet_place(req: BetPlaceRequest):
+async def _bet_place(req: BetPlaceRequest, *, preview_only: bool = False):
     from decimal import Decimal
 
     from app.services.bookmakers import site_bet as _site_bet_mod
@@ -2122,18 +2169,22 @@ async def bet_place(req: BetPlaceRequest):
                 "message": "无有效长连接浏览器，请先验证登录并进入场馆（禁止另开窗口下单）",
                 "lane": lane.key,
             }
-        plug = get_plugin(site_code)
-        result = await plug.place_bet(
-            page,
-            base_url=req.base_url,
-            session_token=token,
-            match_external_id=req.match_external_id,
-            selection=req.selection,
-            odds=float(req.odds),
-            stake=Decimal(str(req.stake)),
-            bet_type=req.bet_type,
-            odds_data=req.odds_data or {},
-        )
+        result = None
+        # Preview must never enter a plugin implementation: a future plugin may
+        # submit internally instead of returning None for the shared UI path.
+        if not preview_only:
+            plug = get_plugin(site_code)
+            result = await plug.place_bet(
+                page,
+                base_url=req.base_url,
+                session_token=token,
+                match_external_id=req.match_external_id,
+                selection=req.selection,
+                odds=float(req.odds),
+                stake=Decimal(str(req.stake)),
+                bet_type=req.bet_type,
+                odds_data=req.odds_data or {},
+            )
         if result is None:
             result = await place_site_bet(
                 site_code=site_code,
@@ -2147,6 +2198,7 @@ async def bet_place(req: BetPlaceRequest):
                 odds_data=req.odds_data or {},
                 page=page,
                 headed=False,
+                preview_only=bool(preview_only),
             )
     except Exception as e:
         return {"ok": False, "message": f"下单异常: {e}", "lane": lane.key}
@@ -2154,14 +2206,142 @@ async def bet_place(req: BetPlaceRequest):
         lane.busy_op = None
         lane.clear_bet_priority()
         lane.lock.release()
+    preview_ready = bool(
+        preview_only
+        and "UI 预览已就绪" in str(getattr(result, "message", "") or "")
+    )
     return {
         "ok": result.ok,
+        "preview_ready": preview_ready,
         "message": result.message,
         "external_bet_id": result.external_bet_id,
         "balance_after": float(result.balance_after or 0),
+        "actual_stake": float(getattr(result, "actual_stake", 0) or 0),
         "site_code": site_code,
         "lane": lane.key,
     }
+
+
+@app.post("/bet/place")
+async def bet_place(req: BetPlaceRequest):
+    # The production route always reaches the normal confirmation flow.
+    return await _bet_place(req, preview_only=False)
+
+
+@app.post("/bet/preview")
+async def bet_preview(req: BetPlaceRequest):
+    """Fill a verified Pinnacle slip but never click submit/confirm."""
+    if (req.site_code or "").lower() != "pinnacle":
+        return {"ok": False, "preview_ready": False, "message": "UI 预览仅支持平博"}
+    return await _bet_place(req, preview_only=True)
+
+
+@app.post("/bet/cleanup")
+async def bet_cleanup(req: BetCleanupRequest):
+    """Safely cancel confirmation and clear all Pinnacle slip entries."""
+    if (req.site_code or "").lower() != "pinnacle":
+        return {"ok": False, "message": "注单清理仅支持平博"}
+    token = sanitize_token(req.session_token)
+    if not token:
+        return {"ok": False, "message": "缺少 session token"}
+    lane = await _get_lane(req.base_url, "pinnacle")
+    try:
+        await asyncio.wait_for(lane.lock.acquire(), timeout=30.0)
+    except asyncio.TimeoutError:
+        return {"ok": False, "busy": True, "message": "平博浏览器正忙，未执行注单清理"}
+    lane.busy_op = "bet_cleanup"
+    try:
+        sess = site_sessions.find(base_url=req.base_url, site_code="pinnacle")
+        page = sess.page if sess and sess.page and not sess.page.is_closed() else None
+        if page is None:
+            return {"ok": False, "message": "无有效平博长连接，无法清理注单"}
+        from app.services.bookmakers.plugins.pinnacle.modals import (
+            cleanup_pinnacle_failed_slips,
+        )
+
+        ok, detail = await cleanup_pinnacle_failed_slips(page)
+        return {"ok": bool(ok), "message": detail, "site_code": "pinnacle"}
+    finally:
+        lane.busy_op = None
+        lane.lock.release()
+
+
+@app.post("/bet/pinnacle-total-candidates")
+async def pinnacle_total_candidates(req: BetCleanupRequest):
+    """Read a few visible full-game total candidates for safe preview rehearsal."""
+    if (req.site_code or "").lower() != "pinnacle":
+        return {"ok": False, "message": "仅支持平博"}
+    if not sanitize_token(req.session_token):
+        return {"ok": False, "message": "缺少 session token"}
+    lane = await _get_lane(req.base_url, "pinnacle")
+    try:
+        await asyncio.wait_for(lane.lock.acquire(), timeout=30.0)
+    except asyncio.TimeoutError:
+        return {"ok": False, "busy": True, "message": "平博浏览器正忙"}
+    lane.busy_op = "preview_probe"
+    try:
+        sess = site_sessions.find(base_url=req.base_url, site_code="pinnacle")
+        page = sess.page if sess and sess.page and not sess.page.is_closed() else None
+        if page is None:
+            return {"ok": False, "message": "无有效平博长连接", "candidates": []}
+        from app.services.bookmakers.plugins.pinnacle.modals import (
+            dismiss_pinnacle_blocking_modals,
+        )
+        from app.services.bookmakers.plugins.pinnacle.venue import (
+            pinnacle_session_expired,
+        )
+
+        if await pinnacle_session_expired(page):
+            return {"ok": False, "message": "平博体育页当前为访客状态", "candidates": []}
+        await dismiss_pinnacle_blocking_modals(page)
+        rows = await page.evaluate(
+            r"""() => {
+              const visible = (el) => {
+                try {
+                  const st = getComputedStyle(el), r = el.getBoundingClientRect();
+                  return st.display !== 'none' && st.visibility !== 'hidden'
+                    && st.opacity !== '0' && r.width > 40 && r.height > 20;
+                } catch (e) { return false; }
+              };
+              const results = [], seen = new Set();
+              const totalRe = /(?:^|\s)(\d+(?:\.\d+)?(?:\s*-\s*\d+(?:\.\d+)?)?)\s+(\d{1,2}\.\d{2,3})\s*(?:小|Under)\s*(\d{1,2}\.\d{2,3})/ig;
+              for (const el of document.querySelectorAll('article, tr, li, section, div')) {
+                if (!visible(el)) continue;
+                const raw = String(el.innerText || '').replace(/[\u200e\u200f]/g, '').trim();
+                if (raw.length < 30 || raw.length > 700 || !/\bvs\b/i.test(raw)) continue;
+                if (/投注单|总注金|最低投注|球队总得分|主队总|客队总|team\s*total/i.test(raw)) continue;
+                const lines = raw.split(/\n+/).map((x) => x.replace(/\s+/g, ' ').trim()).filter(Boolean);
+                let home = '', away = '';
+                for (const lineText of lines) {
+                  const pair = lineText.match(/^(.{2,60}?)\s+vs\s+(.{2,60}?)$/i);
+                  if (pair) { home = pair[1].trim(); away = pair[2].trim(); break; }
+                }
+                if (!home || !away) continue;
+                totalRe.lastIndex = 0;
+                let match = null, current;
+                while ((current = totalRe.exec(raw))) match = current;
+                if (!match) continue;
+                const points = String(match[1]).split('-').map(Number).filter(Number.isFinite);
+                const line = points.length ? points.reduce((a, b) => a + b, 0) / points.length : NaN;
+                const over = Number(match[2]), under = Number(match[3]);
+                if (!(line > 0 && over > 1.01 && under > 1.01)) continue;
+                const key = `${home}|${away}|${line}`;
+                if (seen.has(key)) continue;
+                seen.add(key);
+                results.push({ home, away, line, over, under, sample: raw.slice(0, 240) });
+              }
+              return results.slice(0, 20);
+            }"""
+        )
+        return {
+            "ok": True,
+            "message": f"发现 {len(rows or [])} 个可预览全场大小球",
+            "candidates": list(rows or []),
+            "url": str(page.url or "")[:160],
+        }
+    finally:
+        lane.busy_op = None
+        lane.lock.release()
 
 
 @app.post("/bets/history")

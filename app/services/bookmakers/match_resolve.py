@@ -297,6 +297,50 @@ async def _apply_score_clock(match: Match, rm) -> None:
         extra["period"] = period
     elif rm.status != "live":
         extra.pop("period", None)
+    # 保留每个真实站点最近一次采集质量，供 AI 在“盘口/比分/NowScore”复核时审计。
+    # 不把它写成单一 source，避免 OB 与平博轮询互相覆盖。
+    ext = str(getattr(rm, "external_id", "") or "")
+    provider = ext.split(":", 1)[0].lower() if ":" in ext else ""
+    quality = getattr(rm, "data_quality", None)
+    if provider == "ob" and not isinstance(quality, dict):
+        quality = {}
+    # 兼容尚未重启的 Browser Gate：从本轮 RemoteMatch 的 total 行即时重建
+    # 质量快照，保证新 AI 闸门不依赖 Gate 进程版本。
+    if provider == "ob" and isinstance(quality, dict) and not quality:
+        total_rows = [
+            row for row in (getattr(rm, "odds_list", None) or [])
+            if str(getattr(row, "bet_type", "") or "").lower() == "total"
+        ]
+        total_row = total_rows[0] if total_rows else None
+        total_data = getattr(total_row, "odds_data", None) if total_row else None
+        def _valid_side(value) -> bool:
+            try:
+                return float(value or 0) > 1.0
+            except (TypeError, ValueError):
+                return False
+        quality = {
+            "source": "ob_api",
+            "external_id": ext,
+            "match_id": ext.split(":", 1)[-1] if ":" in ext else ext,
+            "sport_valid": str(getattr(rm, "sport", "") or "").lower() in {"football", "basketball"},
+            "score_available": True,
+            "clock_available": bool(clock) if str(getattr(rm, "status", "") or "").lower() == "live" else True,
+            "full_time_total": bool(total_row),
+            "total_two_sided": bool(
+                isinstance(total_data, dict)
+                and _valid_side(getattr(total_row, "total", 0))
+                and _valid_side(total_data.get("over"))
+                and _valid_side(total_data.get("under"))
+            ),
+        }
+    if provider and isinstance(quality, dict) and quality:
+        snapshots = dict(extra.get("provider_snapshots") or {})
+        snapshots[provider] = {
+            **quality,
+            "captured_at": datetime.now(timezone.utc).isoformat(),
+            "external_id": ext,
+        }
+        extra["provider_snapshots"] = snapshots
     match.extra_data = extra
     # 完场降级，避免「进行中」残留旧赛
     rm_status_l = str(getattr(rm, "status", "") or "").lower()

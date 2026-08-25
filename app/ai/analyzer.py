@@ -1,7 +1,7 @@
 """
-AI 赛事分析引擎 - GPT 单模型分析
+AI 赛事分析引擎 - DeepSeek 单模型分析
 
-仅做小球(total/under)分析。
+仅做全场大小球(total/under/over)分析。
 """
 from __future__ import annotations
 
@@ -78,7 +78,7 @@ def _flatten_market_odds(market_odds: Optional[dict]) -> dict[str, float]:
     """把嵌套 markets 或扁平 odds 合成 selection->odds 映射。"""
     if not market_odds:
         return {}
-    if "under" in market_odds:
+    if any(k in market_odds for k in ("under", "over")):
         out = {}
         for k, v in market_odds.items():
             if str(k).startswith("_") or k in ("markets", "line", "total", "spread"):
@@ -136,12 +136,36 @@ def _line_for_pick(market_odds: Optional[dict], match_info: Optional[dict], bet_
                     return float(entry["line"])
                 except (TypeError, ValueError):
                     pass
+        direct_entry = market_odds.get(bet_type)
+        if isinstance(direct_entry, dict) and direct_entry.get("line") is not None:
+            try:
+                return float(direct_entry["line"])
+            except (TypeError, ValueError):
+                pass
+        if bet_type == "total" and market_odds.get("line") is not None:
+            try:
+                return float(market_odds["line"])
+            except (TypeError, ValueError):
+                pass
     info = match_info or {}
     if bet_type == "total":
         return info.get("total_line") or info.get("line")
     if bet_type == "spread":
         return info.get("spread_line") or info.get("handicap_line")
     return None
+
+
+def _line_source_for_pick(market_odds: Optional[dict], match_info: Optional[dict]) -> str:
+    if isinstance(market_odds, dict):
+        markets = market_odds.get("markets") if isinstance(market_odds.get("markets"), dict) else {}
+        total = markets.get("total") if isinstance(markets.get("total"), dict) else {}
+        direct = market_odds.get("total") if isinstance(market_odds.get("total"), dict) else {}
+        if total.get("line") is not None or direct.get("line") is not None or market_odds.get("line") is not None:
+            return "bookmaker_market_total"
+    info = match_info if isinstance(match_info, dict) else {}
+    if info.get("total_line") is not None or info.get("line") is not None:
+        return "bookmaker_match_snapshot"
+    return "missing"
 
 
 def _recent_matches(bucket: Optional[dict], limit: int = 6) -> list[dict]:
@@ -158,7 +182,7 @@ def _recent_matches(bucket: Optional[dict], limit: int = 6) -> list[dict]:
 
 
 class MatchAnalyzer:
-    """GPT 单模型分析引擎。"""
+    """DeepSeek 单模型分析引擎。"""
 
     def __init__(self):
         self.client: Optional[AsyncOpenAI] = None
@@ -166,11 +190,11 @@ class MatchAnalyzer:
         self._init_client()
 
     def _init_client(self):
-        api_key = (settings.GPT_API_KEY or "").strip()
-        base_url = (settings.GPT_BASE_URL or "").strip()
-        model = (settings.GPT_MODEL or "").strip()
+        api_key = (settings.DEEPSEEK_API_KEY or "").strip()
+        base_url = (settings.DEEPSEEK_BASE_URL or "").strip()
+        model = (settings.DEEPSEEK_MODEL or "").strip()
         if not api_key or not model:
-            logger.warning("GPT 未配置：缺少 API_KEY 或 MODEL")
+            logger.warning("DeepSeek 未配置：缺少 API_KEY 或 MODEL")
             self.client = None
             self.model = ""
             return
@@ -181,7 +205,7 @@ class MatchAnalyzer:
             max_retries=0,
         )
         self.model = model
-        logger.info("GPT model ready: %s (%s)", model, base_url)
+        logger.info("DeepSeek model ready: %s (%s)", model, base_url)
 
     async def analyze_match(
         self,
@@ -190,6 +214,69 @@ class MatchAnalyzer:
         market_odds: Optional[dict] = None,
     ) -> dict:
         from app.services.fixture_key import fixture_key as _fixture_key
+        from app.services.nowscore_evidence import (
+            build_total_market_evidence,
+            evidence_gate_reason,
+        )
+        from app.ai.total_features import build_total_feature_matrix
+
+        authoritative_line = _line_for_pick(market_odds, match_info, "total")
+        authoritative_line_source = _line_source_for_pick(market_odds, match_info)
+        evidence = build_total_market_evidence(
+            historical_data,
+            line=authoritative_line,
+            sport=str(match_info.get("sport") or "football"),
+            line_source=authoritative_line_source,
+            max_age_sec=int(getattr(settings, "NOWSCORE_MAX_CONTEXT_AGE_SEC", 21600) or 21600),
+            min_form_samples=int(getattr(settings, "NOWSCORE_MIN_FORM_SAMPLES", 3) or 3),
+        )
+        if isinstance(historical_data, dict):
+            historical_data = copy.deepcopy(historical_data)
+            historical_data["total_market_evidence"] = evidence
+
+        feature_matrix = build_total_feature_matrix(
+            match_info,
+            market_odds,
+            historical_data,
+            line=authoritative_line,
+            line_source=authoritative_line_source,
+        )
+        if isinstance(historical_data, dict):
+            historical_data["total_feature_matrix"] = feature_matrix
+
+        if bool(getattr(settings, "AI_REQUIRE_NOWSCORE_CONTEXT", True)):
+            gate_reason = evidence_gate_reason(evidence)
+            if gate_reason:
+                logger.warning(
+                    "[AI分析] NowScore证据闸门拒绝 match=%s %s vs %s line=%s reason=%s",
+                    match_info.get("id"), match_info.get("home_team"),
+                    match_info.get("away_team"), authoritative_line, gate_reason,
+                )
+                result = self._fallback_result(
+                    "NowScore数据未通过球队/球种/时效/样本/盘口校验，禁止模型猜测",
+                    error=gate_reason,
+                )
+                result["line"] = authoritative_line
+                result["line_source"] = authoritative_line_source
+                result["nowscore_evidence"] = evidence
+                return result
+        if bool(getattr(settings, "AI_REQUIRE_STRUCTURED_TOTAL_FEATURES", True)):
+            feature_gates = feature_matrix.get("gates") if isinstance(feature_matrix.get("gates"), dict) else {}
+            if feature_gates.get("analysis_ready") is not True:
+                failures = [str(x) for x in (feature_gates.get("hard_failures") or []) if str(x)]
+                logger.warning(
+                    "[AI分析] 结构化特征闸门拒绝 match=%s failures=%s",
+                    match_info.get("id"), failures,
+                )
+                result = self._fallback_result(
+                    "大小球结构化数据不完整，缺少有效比赛时间、双边赔率或基本面证据",
+                    error="total_feature_gate:" + ",".join(failures),
+                )
+                result["line"] = authoritative_line
+                result["line_source"] = authoritative_line_source
+                result["nowscore_evidence"] = evidence
+                result["total_feature_matrix"] = feature_matrix
+                return result
 
         fk = (match_info.get("fixture_key") or "").strip()
         if not fk:
@@ -211,22 +298,17 @@ class MatchAnalyzer:
                 start_time=st,
             )
         sport = str(match_info.get("sport") or "football").lower()
-        # 盘口线量化到 0.5 档进缓存 key：滚球 2.5→2.75 的小幅漂移不换 key，避免缓存全失效重打 LLM
-        raw_line = (
-            match_info.get("total_line")
-            or match_info.get("spread_line")
-            or match_info.get("line")
-            or 0
-        )
+        # 精确盘口进入缓存键；2.25/2.5/2.75 必须是不同分析快照。
+        raw_line = authoritative_line
         try:
-            line_tag = round(float(raw_line) * 2) / 2 if raw_line else ""
+            line_tag = f"{float(raw_line):.3f}" if raw_line is not None else ""
         except (TypeError, ValueError):
             line_tag = str(raw_line)
         # 加入当前总进球数：滚球比分变化（0-0→1-0）必须触发重新分析
         _hs = match_info.get("home_score")
         _as = match_info.get("away_score")
         _total_goals = int((_hs or 0) + (_as or 0)) if _hs is not None or _as is not None else "x"
-        cache_key = f"ai:gpt:v2:{fk}:{sport}:{line_tag}:g{_total_goals}"
+        cache_key = f"ai:deepseek:v2:{fk}:{sport}:{line_tag}:g{_total_goals}"
         # 缓存策略：滚球（有比分）禁用缓存强制实时分析，赛前（无比分）允许缓存
         # 滚球比分/盘口变化快，旧缓存的 reasoning 会过时；赛前数据稳定可复用
         is_live = _hs is not None or _as is not None
@@ -234,9 +316,7 @@ class MatchAnalyzer:
             cached = await cache.get_json(cache_key) if not is_live else None
             if cached and cached.get("models_used") and not cached.get("error"):
                 # ── 缓存校验：比分/盘口/时间变化超过阈值则不使用缓存 ──
-                # 缓存 key 按 line_tag(0.5档) + total_goals 量化，
-                # 但同一 key 下盘口可能从 3.0 漂移到 3.25（同量化为 3.0），
-                # 比分从 0-1 变成 1-0（同 g1）— reasoning 中的盘口/比分描述会过时。
+                # 比分从 0-1 变成 1-0（同 g1）时 reasoning 仍可能过时。
                 cached_line = cached.get("line")
                 cached_conf = cached.get("confidence", 0)
                 current_line_f = None
@@ -244,11 +324,11 @@ class MatchAnalyzer:
                     current_line_f = float(raw_line) if raw_line else None
                 except (TypeError, ValueError):
                     pass
-                # 盘口线漂移 >0.3 球 → 缓存失效（需重新分析）
+                # 防御旧版本缓存：盘口线有任何有效档位变化就失效。
                 line_stale = (
                     cached_line is not None
                     and current_line_f is not None
-                    and abs(float(cached_line) - current_line_f) > 0.3
+                    and abs(float(cached_line) - current_line_f) > 0.001
                 )
                 # 缓存中的比对快照 vs 当前实际比分
                 cached_hs = cached.get("_cached_home_score")
@@ -306,15 +386,15 @@ class MatchAnalyzer:
         )
 
         try:
-            timeout = float(settings.GPT_TIMEOUT_SEC)
-            # 加载历史胜率反馈注入 system prompt，帮助 GPT 从过去的错误中学习
+            timeout = float(settings.DEEPSEEK_TIMEOUT_SEC)
+            # 加载历史胜率反馈注入 system prompt，帮助 DeepSeek 从过去的错误中学习
             system_extra = await self._build_historical_feedback(match_info)
-            raw = await asyncio.wait_for(self._call_gpt(prompt, system_extra), timeout=timeout)
+            raw = await asyncio.wait_for(self._call_deepseek(prompt, system_extra), timeout=timeout)
             content = raw.get("content", "")
             parsed = self._parse_analysis_result(content)
 
             # ── 双向置信度提取 ──
-            # GPT 同时输出 under_confidence 和 over_confidence，取更强方向作为最终 prediction。
+            # DeepSeek 同时输出 under_confidence 和 over_confidence，取更强方向作为最终 prediction。
             # 这确保每场比赛都分析了大小球两个方向，而非只看一个方向。
             under_conf_raw = parsed.get("under_confidence")
             over_conf_raw = parsed.get("over_confidence")
@@ -330,7 +410,7 @@ class MatchAnalyzer:
 
             bt = "total"
 
-            # 如果 GPT 提供了双向置信度，取更强方向
+            # 如果 DeepSeek 提供了双向置信度，取更强方向
             if under_conf is not None and over_conf is not None:
                 if under_conf < 0.30 and over_conf < 0.30:
                     pred = "skip"
@@ -342,17 +422,20 @@ class MatchAnalyzer:
                 parsed["_under_conf"] = under_conf
                 parsed["_over_conf"] = over_conf
             else:
-                # 向后兼容：GPT 未提供双向置信度时，回退到 prediction 字段
+                # 向后兼容：DeepSeek 未提供双向置信度时，回退到 prediction 字段
                 pred = normalize_prediction(parsed.get("prediction"), bet_type="total")
 
             if pred not in ("under", "over", "skip"):
                 # 精简 prompt 重试：原始输出可能因 max_tokens 截断或格式偏差导致无效
                 # 用极简 prompt 重试一次，只要求核心字段，大幅降低 token 消耗
                 logger.warning(
-                    "[AI分析] GPT 返回无效结果，尝试精简 prompt 重试 match=%s | bt=%s pred=%s",
+                    "[AI分析] DeepSeek 返回无效结果，尝试精简 prompt 重试 match=%s | bt=%s pred=%s",
                     match_info.get("id"), parsed.get("bet_type"), parsed.get("prediction"),
                 )
-                retry_parsed = await self._retry_with_minimal_prompt(match_info, market_odds, system_extra)
+                retry_parsed = await self._retry_with_minimal_prompt(
+                    match_info, market_odds, system_extra,
+                    evidence=evidence, feature_matrix=feature_matrix,
+                )
                 if retry_parsed:
                     parsed = retry_parsed
                     # 重新提取双向置信度
@@ -382,17 +465,17 @@ class MatchAnalyzer:
 
             if pred not in ("under", "over", "skip"):
                 logger.warning(
-                    "[AI分析] GPT 最终返回无效结果 match=%s | bt=%s pred=%s",
+                    "[AI分析] DeepSeek 最终返回无效结果 match=%s | bt=%s pred=%s",
                     match_info.get("id"), parsed.get("bet_type"), parsed.get("prediction"),
                 )
                 return self._fallback_result(
-                    f"GPT返回无效结果: bet_type={parsed.get('bet_type')!r} pred={parsed.get('prediction')!r}",
+                    f"DeepSeek返回无效结果: bet_type={parsed.get('bet_type')!r} pred={parsed.get('prediction')!r}",
                     error="invalid_result",
                 )
 
             if pred == "skip":
                 logger.info(
-                    "[AI分析] GPT 判定跳过 match=%s | reasoning=%s",
+                    "[AI分析] DeepSeek 判定跳过 match=%s | reasoning=%s",
                     match_info.get("id"), (parsed.get("reasoning") or "")[:120],
                 )
                 skip_result = {
@@ -405,9 +488,12 @@ class MatchAnalyzer:
                     "value_bets": [],
                     "risk_level": "high",
                     "consensus_reached": False,
-                    "models_used": ["gpt"],
+                    "models_used": ["deepseek"],
                     "models_failed": [],
                     "neg_cached": True,
+                    "line_source": authoritative_line_source,
+                    "nowscore_evidence": evidence,
+                    "total_feature_matrix": feature_matrix,
                 }
                 # skip 也写负缓存：滚球晚段大量 skip，不缓存则每轮 120s 重复打 LLM
                 try:
@@ -432,15 +518,33 @@ class MatchAnalyzer:
 
             line = parsed.get("line")
             try:
-                line_f = float(line) if line is not None and line != "" else None
+                model_line = float(line) if line is not None and line != "" else None
             except (TypeError, ValueError):
-                line_f = None
-            if line_f is None:
-                line_f = _line_for_pick(market_odds, match_info, bt)
+                model_line = None
+            line_f = authoritative_line
+            if (
+                model_line is not None
+                and line_f is not None
+                and abs(model_line - float(line_f)) > 0.001
+            ):
+                logger.warning(
+                    "[AI分析] 模型盘口不一致，拒绝结果 match=%s model_line=%s bookmaker_line=%s",
+                    match_info.get("id"), model_line, line_f,
+                )
+                mismatch = self._fallback_result(
+                    "DeepSeek返回盘口与投注平台当前盘口不一致，禁止使用该预测",
+                    error="model_total_line_mismatch",
+                )
+                mismatch["line"] = line_f
+                mismatch["model_line"] = model_line
+                mismatch["line_source"] = authoritative_line_source
+                mismatch["nowscore_evidence"] = evidence
+                mismatch["total_feature_matrix"] = feature_matrix
+                return mismatch
 
             latency_ms = float((raw.get("_meta") or {}).get("latency_ms") or 0)
 
-            # 单模型模式：GPT 返回 under/over 即视为共识达成
+            # 单模型模式：DeepSeek 返回 under/over 即视为共识达成
             consensus_reached = pred in ("under", "over")
 
             analysis = {
@@ -461,9 +565,12 @@ class MatchAnalyzer:
                 "value_bets": (parsed.get("value_bets") or [])[:5],
                 "risk_level": parsed.get("risk_level", "medium"),
                 "consensus_reached": consensus_reached,
-                "models_used": ["gpt"],
+                "models_used": ["deepseek"],
                 "models_failed": [],
                 "analyzed_at": datetime.now(timezone.utc).isoformat(),
+                "line_source": authoritative_line_source,
+                "nowscore_evidence": evidence,
+                "total_feature_matrix": feature_matrix,
             }
 
             od = _odds_for_pick(market_odds, bt, pred)
@@ -482,10 +589,10 @@ class MatchAnalyzer:
             # 升盘型 over 约束：数学调整型升盘 → over conf 封顶 0.62
             analysis = self._apply_line_up_constraint(analysis, match_info, market_odds)
 
-            # ── 历史结果校准：基于实际投注胜率校准 GPT 置信度 ──
+            # ── 历史结果校准：基于实际投注胜率校准 DeepSeek 置信度 ──
             analysis = await self._apply_historical_calibration(analysis, match_info)
 
-            # 单模型模式：GPT 返回小球即为最终共识。
+            # 单模型模式：DeepSeek 返回 under/over 即为最终共识。
 
             # 简洁单行分析日志
             _hd = historical_data if isinstance(historical_data, dict) else {}
@@ -552,20 +659,23 @@ class MatchAnalyzer:
                     mid, pred, bt,
                     float(analysis.get("confidence") or 0),
                     float(analysis.get("odds") or 0),
-                    [{"model": "gpt", "ok": True}],
+                    [{"model": "deepseek", "ok": True}],
                 )
 
             return analysis
 
         except asyncio.TimeoutError:
             logger.warning(
-                "[AI分析] GPT 超时 match=%s timeout=%.0fs，尝试精简 prompt 重试",
+                "[AI分析] DeepSeek 超时 match=%s timeout=%.0fs，尝试精简 prompt 重试",
                 match_info.get("id"), timeout,
             )
             # 超时后用精简 prompt 重试：更短 prompt + 更少 tokens + 更短超时
             # system_extra 在 wait_for 之前已构建，超时时仍可用
             _timeout_extra = locals().get("system_extra", "")
-            retry_parsed = await self._retry_with_minimal_prompt(match_info, market_odds, _timeout_extra)
+            retry_parsed = await self._retry_with_minimal_prompt(
+                match_info, market_odds, _timeout_extra,
+                evidence=evidence, feature_matrix=feature_matrix,
+            )
             if retry_parsed:
                 logger.info(
                     "[AI分析] 精简 prompt 重试成功（超时恢复）match=%s",
@@ -610,10 +720,13 @@ class MatchAnalyzer:
                         "over_confidence": round(float(over_conf), 4) if over_conf is not None else None,
                         "reasoning": (retry_parsed.get("reasoning") or "精简prompt重试结果")[:800],
                         "consensus_reached": True,
-                        "models_used": ["gpt"],
+                        "models_used": ["deepseek"],
                         "models_failed": [],
                         "analyzed_at": datetime.now(timezone.utc).isoformat(),
                         "timeout_retry": True,
+                        "line_source": authoritative_line_source,
+                        "nowscore_evidence": evidence,
+                        "total_feature_matrix": feature_matrix,
                     }
                     if od > 1:
                         analysis["odds"] = od
@@ -632,21 +745,27 @@ class MatchAnalyzer:
                         match_info.get("id"),
                     )
                     return self._fallback_result(
-                        "GPT精简重试判定skip", error="gpt_timeout_retry_skip",
+                        "DeepSeek精简重试判定skip", error="deepseek_timeout_retry_skip",
                     )
             logger.warning(
                 "[AI分析] 精简 prompt 重试仍失败 match=%s，改用盘口启发式",
                 match_info.get("id"),
             )
-            return self._fallback_result("AI分析超时，改用盘口启发式", error="gpt_timeout")
+            return self._fallback_result("AI分析超时，改用盘口启发式", error="deepseek_timeout")
         except Exception as e:
-            logger.error("[AI分析] GPT 失败 match=%s: %s", match_info.get("id"), e)
+            logger.error("[AI分析] DeepSeek 失败 match=%s: %s", match_info.get("id"), e)
             return self._fallback_result(f"AI分析暂不可用: {e}", error=str(e))
 
     async def _retry_with_minimal_prompt(
-        self, match_info: dict, market_odds: Optional[dict], system_extra: str = "",
+        self,
+        match_info: dict,
+        market_odds: Optional[dict],
+        system_extra: str = "",
+        *,
+        evidence: Optional[dict] = None,
+        feature_matrix: Optional[dict] = None,
     ) -> Optional[dict]:
-        """精简 prompt 重试：原始输出无效/超时时，用极简 prompt 再调一次 GPT。
+        """精简 prompt 重试：原始输出无效/超时时，用极简 prompt 再调一次 DeepSeek。
 
         只要求 under_confidence / over_confidence / reasoning 三个核心字段，
         max_tokens 降到 512，大幅降低截断和格式偏差概率。
@@ -659,7 +778,8 @@ class MatchAnalyzer:
         """
         if not self.client or not self.model:
             return None
-        total_line = match_info.get("total_line") or match_info.get("line") or "?"
+        total_line = _line_for_pick(market_odds, match_info, "total")
+        total_line = total_line if total_line is not None else "?"
         hs = match_info.get("home_score")
         aws = match_info.get("away_score")
         score_str = f"{hs}-{aws}" if hs is not None else "未知"
@@ -671,14 +791,16 @@ class MatchAnalyzer:
             f"赛事: {match_info.get('home_team', '?')} vs {match_info.get('away_team', '?')} | "
             f"联赛: {league} | 球种: {sport} | 比分: {score_str} | 盘口线: {total_line}\n"
             f"请只输出以下JSON（不要多余字段，不要markdown）:\n"
+            f"结构化特征矩阵: {json.dumps(feature_matrix or {}, ensure_ascii=False, separators=(',', ':'))[:3200]}\n"
             '{"under_confidence": 0.0-1.0, "over_confidence": 0.0-1.0, '
             '"reasoning": "一句话理由", "risk_level": "low/medium/high"}\n'
             "规则: under_confidence 和 over_confidence 都必须给出(0.0-1.0)，"
-            "都低于0.30表示skip。只输出JSON。"
+            "都低于0.30表示skip。必须以给定盘口线和特征矩阵为准；至少两个独立维度同向，"
+            "存在hard_failures或方向冲突则skip。只输出JSON。"
         )
         try:
-            timeout = min(float(settings.GPT_TIMEOUT_SEC), 30.0)
-            raw = await asyncio.wait_for(self._call_gpt(mini_prompt, system_extra), timeout=timeout)
+            timeout = min(float(settings.DEEPSEEK_TIMEOUT_SEC), 30.0)
+            raw = await asyncio.wait_for(self._call_deepseek(mini_prompt, system_extra), timeout=timeout)
             content = raw.get("content", "")
             parsed = self._parse_analysis_result(content)
             # 只要有 under_confidence 或 over_confidence 就算成功
@@ -698,15 +820,15 @@ class MatchAnalyzer:
             logger.warning("[AI分析] 精简 prompt 重试失败 match=%s: %s", match_info.get("id"), e)
             return None
 
-    async def _call_gpt(self, prompt: str, system_extra: str = "") -> dict:
-        """调用 GPT 模型，返回 content 和 _meta 信息。429/529/空响应指数退避，超时重试1次。
+    async def _call_deepseek(self, prompt: str, system_extra: str = "") -> dict:
+        """调用 DeepSeek 模型，返回 content 和 _meta 信息。429/529/空响应指数退避，超时重试1次。
 
         Args:
             prompt: 用户 prompt
             system_extra: 注入到 system prompt 末尾的额外上下文（如历史胜率反馈）
         """
         if not self.client or not self.model:
-            raise RuntimeError("GPT 模型未配置")
+            raise RuntimeError("DeepSeek 模型未配置")
         _system_content = (
             "你是专业体育赛事滚球大小球分析师。只输出JSON。\n"
             "## 核心原则\n"
@@ -744,14 +866,14 @@ class MatchAnalyzer:
                     response_format={"type": "json_object"},
                 )
                 if not response.choices:
-                    raise RuntimeError("GPT 返回空 choices（内容可能被安全过滤）")
+                    raise RuntimeError("DeepSeek 返回空 choices（内容可能被安全过滤）")
                 content = response.choices[0].message.content or ""
                 if content.strip():
                     break
                 # 空内容（上游流被截断，latency~2s 快速返回）：与 529 同样退避重试
                 if attempt < max_retries:
                     backoff = 2 ** attempt  # 1, 2
-                    logger.warning("[GPT] 空响应 content_len=0，%ds 后重试 (attempt %d/%d)", backoff, attempt + 1, max_retries)
+                    logger.warning("[DeepSeek] 空响应 content_len=0，%ds 后重试 (attempt %d/%d)", backoff, attempt + 1, max_retries)
                     await asyncio.sleep(backoff)
                     continue
                 break  # 最后一次仍为空，交给上层无效结果兜底
@@ -761,7 +883,7 @@ class MatchAnalyzer:
                 if "timeout" in err_str or "timed out" in err_str or "apitimeout" in type(e).__name__.lower():
                     if attempt == 0:
                         logger.warning(
-                            "[GPT] 超时，降配重试 (max_tokens %d→%d) (attempt 1/%d)",
+                            "[DeepSeek] 超时，降配重试 (max_tokens %d→%d) (attempt 1/%d)",
                             settings.LLM_MAX_TOKENS, cur_max_tokens, max_retries,
                         )
                         await asyncio.sleep(0.5)
@@ -774,19 +896,19 @@ class MatchAnalyzer:
                 ):
                     if attempt < max_retries:
                         backoff = 2 ** attempt  # 1, 2
-                        logger.warning("[GPT] %s 限流/过载，%ds 后重试 (attempt %d/%d)", "429" if "429" in err_str else "529", backoff, attempt + 1, max_retries)
+                        logger.warning("[DeepSeek] %s 限流/过载，%ds 后重试 (attempt %d/%d)", "429" if "429" in err_str else "529", backoff, attempt + 1, max_retries)
                         await asyncio.sleep(backoff)
                         continue
                     raise
                 # 其他错误：最多重试 1 次
                 if attempt == 0:
-                    logger.debug("GPT first call failed (%s), retry", e)
+                    logger.debug("DeepSeek first call failed (%s), retry", e)
                     await asyncio.sleep(0.5)
                     continue
                 raise
         elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
-        logger.info("[GPT] 调用完成 latency=%dms content_len=%d", int(elapsed_ms), len(content))
-        return {"content": content, "_meta": {"latency_ms": elapsed_ms, "model": "gpt"}}
+        logger.info("[DeepSeek] 调用完成 latency=%dms content_len=%d", int(elapsed_ms), len(content))
+        return {"content": content, "_meta": {"latency_ms": elapsed_ms, "model": "deepseek"}}
 
     def _apply_context_quality_cap(
         self, analysis: dict, historical_data: Optional[dict]
@@ -1021,10 +1143,10 @@ class MatchAnalyzer:
         return analysis
 
     async def _build_historical_feedback(self, match_info: dict) -> str:
-        """构建历史胜率反馈文本，注入 GPT system prompt。
+        """构建历史胜率反馈文本，注入 DeepSeek system prompt。
 
         从 recent_betting_stats 获取近7天按方向/运动/置信度/盘口线区间的实际胜率，
-        让 GPT 知道自己哪些预测区间准确、哪些偏差大，从而自我校正。
+        让 DeepSeek 知道自己哪些预测区间准确、哪些偏差大，从而自我校正。
         """
         try:
             from app.services.bet_settlement import recent_betting_stats
@@ -1124,7 +1246,7 @@ class MatchAnalyzer:
             return ""
 
     async def _apply_historical_calibration(self, analysis: dict, match_info: dict) -> dict:
-        """基于历史投注结果校准 GPT 置信度。
+        """基于历史投注结果校准 DeepSeek 置信度。
 
         在所有静态约束（context_cap / signal_review / market_constraint / line_up_constraint）
         之后生效，用实际胜率数据做最后一层校准。
@@ -1207,17 +1329,25 @@ class MatchAnalyzer:
     def _trend_page_signal(trend: Any) -> dict[str, Any]:
         if not isinstance(trend, dict):
             return {"supportive": False, "points": 0, "reason": ""}
-        tables = trend.get("tables") if isinstance(trend.get("tables"), list) else []
-        initial_odds = trend.get("initial_odds") if isinstance(trend.get("initial_odds"), list) else []
-        if not tables and not initial_odds:
+        performance = trend.get("performance") if isinstance(trend.get("performance"), dict) else {}
+        market_odds = trend.get("market_odds") if isinstance(trend.get("market_odds"), dict) else {}
+        tables = performance.get("tables") if isinstance(performance.get("tables"), list) else []
+        if not tables and isinstance(trend.get("tables"), list):
+            tables = trend.get("tables") or []
+        market_tables = market_odds.get("tables") if isinstance(market_odds.get("tables"), list) else []
+        if not tables and not market_tables:
             return {"supportive": False, "points": 0, "reason": ""}
         points = 1
-        if len(tables) >= 2 or len(initial_odds) >= 2:
+        if len(tables) >= 2 or len(market_tables) >= 2:
             points += 1
         return {
             "supportive": True,
             "points": points,
-            "reason": "走势页已抓取初指/赛前指数",
+            "reason": (
+                "NowScore盘路表现已采集；公司赔率表也已验证"
+                if market_tables
+                else "NowScore盘路表现已采集（不作为初盘）"
+            ),
         }
 
     @staticmethod
@@ -1237,13 +1367,8 @@ class MatchAnalyzer:
         ctx = historical_data if isinstance(historical_data, dict) else {}
         quality = ctx.get("quality") if isinstance(ctx.get("quality"), dict) else {}
         completeness = _to_float(quality.get("completeness"), 0.0)
-        has_fundamentals = (
-            str(quality.get("source") or ctx.get("source") or "none").strip().lower() != "none"
-            and completeness >= 0.55
-            and bool((ctx.get("trend") or {}).get("initial_odds") or (ctx.get("trend") or {}).get("tables"))
-            and bool((ctx.get("home_form") or {}).get("matches") or (ctx.get("away_form") or {}).get("matches"))
-            and bool((ctx.get("standings") or {}).get("home") or (ctx.get("standings") or {}).get("away"))
-        )
+        evidence = ctx.get("total_market_evidence") if isinstance(ctx.get("total_market_evidence"), dict) else {}
+        has_fundamentals = evidence.get("usable") is True
         return {
             "has_opening": has_opening,
             "has_live_market": has_live_market,
@@ -1280,7 +1405,7 @@ class MatchAnalyzer:
             return {"supportive": False, "conflict": False, "points": 0, "reason": ""}
 
         line_delta = cur_line - open_line
-        under_odds = _to_float(current_odds.get("under"), 0.0)
+        selected_odds = _to_float(current_odds.get(selection), 0.0)
 
         supportive = False
         conflict = False
@@ -1294,10 +1419,18 @@ class MatchAnalyzer:
             elif line_delta >= 0.25:
                 conflict = True
                 reasons.append(f"盘口从{open_line:.2f}升到{cur_line:.2f}")
+        elif selection == "over":
+            if line_delta >= 0.25:
+                supportive = True
+                points += 2
+                reasons.append(f"初指{open_line:.2f}升至即时{cur_line:.2f}")
+            elif line_delta <= -0.25:
+                conflict = True
+                reasons.append(f"盘口从{open_line:.2f}降到{cur_line:.2f}")
 
-        if selection == "under" and under_odds <= 1.0:
+        if selection in ("under", "over") and selected_odds <= 1.0:
             conflict = True
-            reasons.append("小球赔率无效")
+            reasons.append("当前方向赔率无效")
 
         return {
             "supportive": supportive,
@@ -1340,6 +1473,10 @@ class MatchAnalyzer:
             return {"supportive": True, "conflict": False, "points": 2, "reason": f"实时节奏低于盘口预期 {abs(delta):.2f} 球"}
         if selection == "under" and delta >= conflict_delta:
             return {"supportive": False, "conflict": True, "points": 0, "reason": f"实时节奏快于盘口预期 {delta:.2f} 球"}
+        if selection == "over" and delta >= conflict_delta:
+            return {"supportive": True, "conflict": False, "points": 2, "reason": f"实时节奏高于盘口预期 {delta:.2f} 球"}
+        if selection == "over" and delta <= -support_delta:
+            return {"supportive": False, "conflict": True, "points": 0, "reason": f"实时节奏低于盘口预期 {abs(delta):.2f} 球"}
         return {"supportive": False, "conflict": False, "points": 0, "reason": ""}
 
     @staticmethod
@@ -1412,8 +1549,33 @@ class MatchAnalyzer:
         analysis_signal = self._analysis_page_signal(ctx.get("analysis"))
         trend_signal = self._trend_page_signal(ctx.get("trend"))
         triad_status = self._market_triad_status(market_odds, ctx)
-        opening_live_signal = self._opening_live_signal(market_odds, selection=selection, bet_type=bet_type)
-        pace_signal = self._live_pace_signal(info, selection=selection, bet_type=bet_type, line=line)
+        feature_matrix = ctx.get("total_feature_matrix") if isinstance(ctx.get("total_feature_matrix"), dict) else {}
+        if feature_matrix:
+            matrix_market = feature_matrix.get("asian_total_market") if isinstance(feature_matrix.get("asian_total_market"), dict) else {}
+            matrix_market_direction = str(matrix_market.get("direction") or "neutral").lower()
+            opening_live_signal = {
+                "supportive": matrix_market_direction == selection,
+                "conflict": matrix_market_direction == "conflict" or matrix_market_direction in ("under", "over") and matrix_market_direction != selection,
+                "points": 2,
+                "reason": (
+                    f"亚洲大小球方向={matrix_market_direction}，初盘{matrix_market.get('opening_line')}→"
+                    f"即时{matrix_market.get('line')}，类型={matrix_market.get('line_move_type')}"
+                ),
+            }
+            matrix_pace = feature_matrix.get("pace") if isinstance(feature_matrix.get("pace"), dict) else {}
+            matrix_pace_direction = str(matrix_pace.get("direction") or "neutral").lower()
+            pace_signal = {
+                "supportive": matrix_pace_direction == selection,
+                "conflict": matrix_pace_direction in ("under", "over") and matrix_pace_direction != selection,
+                "points": 2,
+                "reason": (
+                    f"进球节奏方向={matrix_pace_direction}，调整后投影{matrix_pace.get('adjusted_projection')}，"
+                    f"盘口{matrix_pace.get('line')}，可靠度={matrix_pace.get('reliability')}"
+                ),
+            }
+        else:
+            opening_live_signal = self._opening_live_signal(market_odds, selection=selection, bet_type=bet_type)
+            pace_signal = self._live_pace_signal(info, selection=selection, bet_type=bet_type, line=line)
         anti_chase_signal = self._anti_chase_signal(info, market_odds, ctx, selection=selection, bet_type=bet_type)
 
         market_points = 0
@@ -1461,6 +1623,25 @@ class MatchAnalyzer:
                 fundamental_points += 2
             elif completeness >= 0.30:
                 fundamental_points += 1
+
+        exact_evidence = ctx.get("total_market_evidence") if isinstance(ctx.get("total_market_evidence"), dict) else {}
+        evidence_consensus = exact_evidence.get("consensus") if isinstance(exact_evidence.get("consensus"), dict) else {}
+        evidence_direction = str(evidence_consensus.get("direction") or "neutral").lower()
+        if exact_evidence.get("usable") is True:
+            if evidence_direction == selection:
+                fundamental_points += 3
+                support_reasons.append(
+                    f"NowScore历史样本按当前精确盘口{_to_float(line, 0.0):g}重算后支持{selection}"
+                    if line is not None else f"NowScore精确盘口样本支持{selection}"
+                )
+            elif evidence_direction in ("under", "over") and evidence_direction != selection:
+                conflict_points += 3
+                conflict_reasons.append(
+                    f"NowScore精确盘口样本方向为{evidence_direction}，与模型{selection}冲突"
+                )
+            if evidence_consensus.get("home_away_conflict") is True:
+                conflict_points += 2
+                conflict_reasons.append("NowScore主客队近期大小球样本明显冲突")
 
         form_signal = self._recent_form_signal(ctx, sport=sport, selection=selection, bet_type=bet_type, line=line)
         if form_signal["supportive"]:
@@ -1513,7 +1694,8 @@ class MatchAnalyzer:
             if analysis_signal.get("reason"):
                 support_reasons.append(analysis_signal["reason"])
         if trend_signal["supportive"]:
-            market_points += int(trend_signal.get("points") or 0)
+            # NowScore 盘路是历史基本面，不能计入投注平台盘口分。
+            fundamental_points += int(trend_signal.get("points") or 0)
             if trend_signal.get("reason"):
                 support_reasons.append(trend_signal["reason"])
 
@@ -1648,6 +1830,11 @@ class MatchAnalyzer:
                 signals.append("supportive")
             elif direction == "line_up":
                 signals.append("adverse")
+        elif bet_type == "total" and selection == "over":
+            if direction == "line_up":
+                signals.append("supportive")
+            elif direction == "line_down":
+                signals.append("adverse")
         try:
             sel_delta = float(odds_delta.get(selection)) if selection in odds_delta else None
         except (TypeError, ValueError):
@@ -1709,6 +1896,12 @@ class MatchAnalyzer:
             elif selection == "under" and avg_total >= float(line) + conflict_gap:
                 conflict = True
                 reason = f"近况总进球均值 {avg_total:.2f} 偏高"
+            elif selection == "over" and avg_total >= float(line) + support_gap:
+                supportive = True
+                reason = f"近况总进球均值 {avg_total:.2f} 高于盘口 {float(line):.2f}"
+            elif selection == "over" and avg_total <= float(line) - conflict_gap:
+                conflict = True
+                reason = f"近况总进球均值 {avg_total:.2f} 偏低"
         return {"supportive": supportive, "conflict": conflict, "reason": reason}
 
     @staticmethod
@@ -1928,7 +2121,11 @@ class MatchAnalyzer:
         historical_data: Optional[dict],
         market_odds: Optional[dict],
     ) -> str:
-        # 压缩全量数据，控制 prompt 在 8KB 以内
+        # 先从完整上下文派生统计，再压缩原始明细；不能先删除 summary 后再计算。
+        raw_h2h = historical_data.get("h2h") if isinstance(historical_data, dict) else None
+        precomputed_stat_signals = self._build_statistical_signals(
+            historical_data, market_odds, match_info, raw_h2h,
+        )
         historical_data = self._compact_historical_data(historical_data)
         sport = str(match_info.get("sport") or "football").lower()
 
@@ -1962,11 +2159,21 @@ class MatchAnalyzer:
                 away_form = away_form or rf.get("away")
 
             # 收集核心分析维度
-            dim_data["历史交锋"] = h2h_block
-            dim_data["球队近期状态"] = {"home": home_form, "away": away_form} if (home_form or away_form) else None
-            dim_data["联赛积分排名"] = historical_data.get("standings") or None
-            dim_data["分析页"] = historical_data.get("analysis") or None
-            dim_data["走势页"] = historical_data.get("trend") or None
+            dim_data["历史交锋"] = bool(isinstance(h2h_block, dict) and h2h_block.get("matches"))
+            dim_data["球队近期状态"] = bool(
+                isinstance(home_form, dict) and home_form.get("matches")
+                and isinstance(away_form, dict) and away_form.get("matches")
+            )
+            standings_ctx = historical_data.get("standings") if isinstance(historical_data.get("standings"), dict) else {}
+            dim_data["联赛积分排名"] = bool(standings_ctx.get("home") or standings_ctx.get("away"))
+            analysis_ctx = historical_data.get("analysis") if isinstance(historical_data.get("analysis"), dict) else {}
+            dim_data["分析页"] = any(
+                analysis_ctx.get(key) for key in ("injuries", "features", "compare", "analysis_tables")
+            )
+            trend_ctx = historical_data.get("trend") if isinstance(historical_data.get("trend"), dict) else {}
+            dim_data["盘路表现"] = (
+                trend_ctx.get("performance") or trend_ctx.get("tables") or None
+            )
 
         # 盘口维度
         has_markets = isinstance(market_odds, dict) and bool(market_odds.get("markets") or any(
@@ -1980,7 +2187,7 @@ class MatchAnalyzer:
         dim_lines = []
         dim_available = 0
         dim_names = [
-            "历史交锋", "球队近期状态", "联赛积分排名", "分析页", "走势页", "亚洲盘", "盘口变化",
+            "历史交锋", "球队近期状态", "联赛积分排名", "分析页", "盘路表现", "亚洲盘", "盘口变化",
         ]
         for dn in dim_names:
             dv = dim_data.get(dn)
@@ -2027,12 +2234,32 @@ class MatchAnalyzer:
                 prompt += f"\n## 分析页额外数据\n{json.dumps(analysis_data, ensure_ascii=False, separators=(',', ':'))}\n"
             trend_data = historical_data.get("trend")
             if trend_data:
-                prompt += f"\n## 走势页数据（各公司初指）\n{json.dumps(trend_data, ensure_ascii=False, separators=(',', ':'))}\n"
+                prompt += (
+                    "\n## NowScore盘路表现（不是投注平台实时盘口）\n"
+                    f"{json.dumps(trend_data, ensure_ascii=False, separators=(',', ':'))}\n"
+                )
+
+            feature_matrix = historical_data.get("total_feature_matrix")
+            exact_evidence = historical_data.get("total_market_evidence")
+            if exact_evidence and not feature_matrix:
+                prompt += (
+                    "\n## NowScore 历史样本对当前盘口的精确对照\n"
+                    f"{json.dumps(exact_evidence, ensure_ascii=False, separators=(',', ':'))}\n"
+                    "> 规则：line 仅来自投注平台当前全场大小球盘口；所有历史样本均按该精确线重新统计。"
+                    "不得把 NowScore 盘路表解释成投注平台初盘或即时盘。\n"
+                )
+
+            if feature_matrix:
+                prompt += (
+                    "\n## 全场大小球结构化特征矩阵（最高优先级）\n"
+                    f"{json.dumps(feature_matrix, ensure_ascii=False, separators=(',', ':'))}\n"
+                    "> 判断顺序：先检查 gates，再看 match_state 比赛阶段，然后分别判断亚洲盘口、"
+                    "实时节奏和 NowScore 基本面。至少两个独立维度同向且无硬冲突才可选择 under/over；"
+                    "否则必须 skip。不得自行改写矩阵中的比赛时间、比分、盘口或赔率。\n"
+                )
 
         # 统计信号汇总：预计算量化指标注入 prompt，减少 LLM 主观偏差
-        stat_signals = self._build_statistical_signals(
-            historical_data, market_odds, match_info, h2h_block
-        )
+        stat_signals = precomputed_stat_signals
         if stat_signals:
             prompt += f"\n## 统计信号（预计算量化指标，须结合分析）\n{json.dumps(stat_signals, ensure_ascii=False, separators=(',', ':'))}\n"
 
@@ -2054,17 +2281,17 @@ class MatchAnalyzer:
                 if k in market_odds
             }
 
-        total_line = match_info.get("total_line") or match_info.get("line")
+        total_line = _line_for_pick(market_odds, match_info, "total")
         prompt += (
-            "\n## 投注市场（全场大小球 / 上下半场大小球）\n"
-            "- 分析全场大小球(total)和上下半场大小球(first_half_total/second_half_total)的 under 与 over 两个方向\n"
+            "\n## 投注市场（全场大小球）\n"
+            "- 只分析全场大小球(total)的 under 与 over 两个方向\n"
             "- 其他玩法(胜负/让球/特殊盘/串关)一律不分析不下注\n"
             "- over 与 under 是对称的独立分析：哪边信号强判哪边，都不足则 skip\n"
             f"- 盘口线 total_line: {total_line if total_line is not None else '未知'}"
             f"{score_hint}\n"
         )
         flat = _flatten_market_odds(market_odds)
-        # 分析时刻快照：明确声明当前比分和盘口线，防止 GPT 使用历史中间版本
+        # 分析时刻快照：明确声明当前比分和盘口线，防止 DeepSeek 使用历史中间版本
         hs_val = match_info.get("home_score")
         as_val = match_info.get("away_score")
         total_goals_now = int((hs_val or 0) + (as_val or 0)) if hs_val is not None or as_val is not None else None
@@ -2247,9 +2474,9 @@ class MatchAnalyzer:
 
 ## 输出格式（严格JSON）
 {{
-    "bet_type": "total | first_half_total | second_half_total",
+    "bet_type": "total",
     "prediction": "under | over | skip",
-    "line": null,
+    "line": {json.dumps(total_line)},
     "confidence": 0.0-1.0,
     "under_confidence": 0.0-1.0,
     "over_confidence": 0.0-1.0,
@@ -2259,14 +2486,15 @@ class MatchAnalyzer:
     "key_factors": ["因素1", "因素2", "因素3"],
     "risk_level": "low/medium/high",
     "value_bets": [
-        {{"selection": "under或over", "bet_type": "total | first_half_total | second_half_total", "reason": "为什么有价值"}}
+        {{"selection": "under或over", "bet_type": "total", "reason": "为什么有价值"}}
     ]
 }}
 
 注意：
 - 必须同时给出 under_confidence 和 over_confidence（0.0-1.0），分别量化两个方向的信号强度
 - prediction 取 under_confidence 和 over_confidence 中更高的一方（都不足0.30则 skip）
-- skip 时 confidence=0.0；bet_type 只能是 total/first_half_total/second_half_total
+- skip 时 confidence=0.0；bet_type 只能是 total
+- line 必须原样返回上方投注平台 total_line，不得改成初盘、历史盘口或四舍五入后的值
 - **reasoning 必须以「当前比分: X-X (总进球X球)，即时盘口线: X.XX」开头**，数字必须与上方提供的「当前总得分」「盘口线 total_line」完全一致，禁止使用盘口历史中的中间版本值
 - reasoning 必须包含具体数字；只输出JSON。
 """
@@ -2565,9 +2793,9 @@ class MatchAnalyzer:
         if m:
             result["prediction"] = m.group(1).lower()
 
-        # bet_type: total/first_half_total/second_half_total
+        # bet_type: total
         m = re.search(
-            r'"bet_type"\s*:\s*"?(total|first_half_total|second_half_total)"?',
+            r'"bet_type"\s*:\s*"?(total)"?',
             text, re.IGNORECASE,
         )
         if m:
@@ -2578,6 +2806,14 @@ class MatchAnalyzer:
         if m:
             try:
                 result["confidence"] = float(m.group(1))
+            except ValueError:
+                pass
+
+        # line: 必须保留精确四分之一盘口，供权威盘口一致性校验
+        m = re.search(r'"line"\s*:\s*([0-9.]+)', text)
+        if m:
+            try:
+                result["line"] = float(m.group(1))
             except ValueError:
                 pass
 
@@ -2678,14 +2914,16 @@ class MatchAnalyzer:
                 hw = summary.get("home_wins") or 0
                 d = summary.get("draws") or 0
                 aw = summary.get("away_wins") or 0
-                signals["h2h_baseline"] = {
+                h2h_signal = {
                     "played": played,
                     "home_win_rate": round(hw / played, 3),
                     "draw_rate": round(d / played, 3),
                     "away_win_rate": round(aw / played, 3),
                     "avg_total_goals": summary.get("avg_total_goals", 0),
-                    "under_2_5_rate": summary.get("under_2_5_rate", 0),
                 }
+                if sport not in ("basketball", "basket"):
+                    h2h_signal["under_2_5_rate"] = summary.get("under_2_5_rate", 0)
+                signals["h2h_baseline"] = h2h_signal
 
         # --- 2b. 近期状态进球统计 ---
         if isinstance(historical_data, dict):
@@ -2694,12 +2932,14 @@ class MatchAnalyzer:
                 if isinstance(form, dict):
                     fs = form.get("summary") or {}
                     if fs:
-                        signals[f"{side}_form_stats"] = {
+                        form_signal = {
                             "played": fs.get("played", 0),
                             "win_rate": fs.get("win_rate", 0),
                             "avg_total_goals": fs.get("avg_total_goals", 0),
-                            "under_2_5_rate": fs.get("under_2_5_rate", 0),
                         }
+                        if sport not in ("basketball", "basket"):
+                            form_signal["under_2_5_rate"] = fs.get("under_2_5_rate", 0)
+                        signals[f"{side}_form_stats"] = form_signal
             # 综合两队近期进球预期
             hf = (signals.get("home_form_stats") or {}).get("avg_total_goals", 0)
             af = (signals.get("away_form_stats") or {}).get("avg_total_goals", 0)
@@ -2824,8 +3064,8 @@ class MatchAnalyzer:
         aws = match_info.get("away_score")
         if hs is not None or aws is not None:
             current_total = int((hs or 0) + (aws or 0))
-            total_line_val = match_info.get("total_line") or match_info.get("line")
-            if total_line_val:
+            total_line_val = _line_for_pick(market_odds, match_info, "total")
+            if total_line_val is not None:
                 try:
                     tl = float(total_line_val)
                     # 尝试从 clock 解析已进行分钟数
@@ -2962,8 +3202,8 @@ class MatchAnalyzer:
         # --- 6. 盘口线 vs 历史交锋均值偏差 ---
         h2h_avg = (signals.get("h2h_baseline") or {}).get("avg_total_goals", 0)
         form_avg = signals.get("form_combined_expected_goals", 0)
-        total_line_val2 = match_info.get("total_line") or match_info.get("line")
-        if total_line_val2 and (h2h_avg or form_avg):
+        total_line_val2 = _line_for_pick(market_odds, match_info, "total")
+        if total_line_val2 is not None and (h2h_avg or form_avg):
             try:
                 tl2 = float(total_line_val2)
                 deviations = {}

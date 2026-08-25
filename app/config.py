@@ -93,19 +93,19 @@ class Settings(BaseSettings):
     # 用 Any：避免 pydantic-settings 在 validator 前对 list 强制 json.loads。
     CORS_ORIGINS: Any = []
 
-    # --- GPT API（唯一模型） ---
-    GPT_API_KEY: Optional[str] = None
-    GPT_BASE_URL: str = "https://xfastapi.ai/v1"
-    GPT_MODEL: str = "gpt-5.6-terra"
+    # --- DeepSeek API（唯一模型，OpenAI-compatible 接口） ---
+    DEEPSEEK_API_KEY: Optional[str] = None
+    DEEPSEEK_BASE_URL: str = "https://api.deepseek.com/v1"
+    DEEPSEEK_MODEL: str = "deepseek-chat"
 
     # --- AI 分析配置 ---
-    GPT_TIMEOUT_SEC: float = 45.0          # 单次 GPT 分析总超时（外层 wait_for）
-    LLM_CLIENT_TIMEOUT_SEC: float = 50.0   # OpenAI 客户端超时（须 ≥ GPT_TIMEOUT_SEC）
-    LLM_MAX_TOKENS: int = 3072              # GPT 最大输出 tokens（确保多维度JSON不被截断）
-    LLM_DEFAULT_CONFIDENCE: float = 0.33    # GPT 未返回置信度时的默认值
-    LLM_TEMPERATURE: float = 0.35           # GPT 温度（0.2太低导致模板化，0.35平衡稳定与差异化）
+    DEEPSEEK_TIMEOUT_SEC: float = 90.0      # 单次 DeepSeek 分析总超时（含一次降配重试）
+    LLM_CLIENT_TIMEOUT_SEC: float = 50.0    # OpenAI-compatible 客户端超时
+    LLM_MAX_TOKENS: int = 3072              # DeepSeek 最大输出 tokens
+    LLM_DEFAULT_CONFIDENCE: float = 0.33    # DeepSeek 未返回置信度时的默认值
+    LLM_TEMPERATURE: float = 0.25           # 降低随机性，减少滚球分析的方向漂移
     LLM_CACHE_TTL: int = 600               # 10分钟
-    AI_SKIP_CACHE_TTL: int = 180           # GPT 判 skip 的负缓存（略超 120s 轮询间隔，跨轮生效）
+    AI_SKIP_CACHE_TTL: int = 180           # DeepSeek 判 skip 的负缓存
     LLM_NEG_CACHE_TTL: int = 150           # 无共识结果负缓存（略超轮询间隔）
     H2H_MAX_MATCHES: int = 3               # 历史交锋最多保留场次
     FORM_MAX_MATCHES: int = 3               # 近况最多保留场次
@@ -118,7 +118,7 @@ class Settings(BaseSettings):
     AI_SCAN_INTERVAL_SEC: int = 120        # AI 引擎扫描间隔（秒，有候选时）
     AI_RECS_LIMIT: int = 80                # 推荐页分析上限
     AI_LIVE_SCAN_LIMIT: int = 120          # 自动引擎扫描上限
-    AI_ANALYZE_CONCURRENCY: int = 8        # GPT 分析并发数
+    AI_ANALYZE_CONCURRENCY: int = 8        # DeepSeek 分析并发数
     AI_IDLE_RESCAN_SEC: int = 30           # 空轮快扫间隔（无候选时，捕捉刚开赛）
     AI_SKIP_COOLDOWN_SEC: int = 300        # 同场 LLM skip 冷却（避免 TTL 内重复调用）
     AI_ENABLE_OVER: bool = True            # 大球 over 下单开关（已启用：over 与 under 对等参与闸门评估）
@@ -128,6 +128,10 @@ class Settings(BaseSettings):
     NOWSCORE_PROXY_URL: str = ""
     AI_MATCH_CONTEXT_IN_BATCH: bool = True
     AI_MATCH_CONTEXT_TTL_SEC: int = 21600  # 6h
+    AI_REQUIRE_NOWSCORE_CONTEXT: bool = True  # 大小球分析必须有通过校验的 NowScore 证据
+    AI_REQUIRE_STRUCTURED_TOTAL_FEATURES: bool = True  # 必须有双边赔率；滚球必须有可解析比赛时间
+    NOWSCORE_MIN_FORM_SAMPLES: int = 3        # 主客队近期样本最低场数
+    NOWSCORE_MAX_CONTEXT_AGE_SEC: int = 21600 # AI 可使用的 NowScore 数据最大年龄
 
     # === 投注规则 ===
     MIN_BET_AMOUNT: float = 100.0

@@ -63,7 +63,7 @@ def _analysis_under(conf: float = 0.65, **kw) -> dict:
         "consensus_reached": True,
         "reasoning": "双方防守稳固",
         "context_source": "none",
-        "models_used": ["gpt"],
+        "models_used": ["deepseek"],
     }
     a.update(kw)
     return a
@@ -80,7 +80,7 @@ def _analysis_over(conf: float = 0.65, **kw) -> dict:
         "consensus_reached": True,
         "reasoning": "双方进攻强势",
         "context_source": "none",
-        "models_used": ["gpt"],
+        "models_used": ["deepseek"],
     }
     a.update(kw)
     return a

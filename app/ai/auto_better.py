@@ -3,7 +3,7 @@ AI 自动投注引擎 - 主调度器
 
 工作流程:
 1. 定时扫描 OB / 平博 各自滚球（足球/篮球）赛事
-2. 用 LLM + 盘口矩阵分析全场小球
+2. 用 DeepSeek + 盘口矩阵分析全场大小球
 3. 策略引擎评估投注决策
 4. 自动执行真实下单（人工模式仅推荐；每轮最多 N 单、不同比赛）
 5. 风控监控 (止损/止盈/限额)
@@ -401,8 +401,8 @@ class AIBettingEngine:
                 under_conf = float(analysis_obj.get("under_confidence") or 0)
                 over_conf = float(analysis_obj.get("over_confidence") or 0)
 
-                # GPT prediction confidence 是对推荐方向的"官方"置信度，
-                # 可能与 under_confidence/over_confidence 不一致（GPT 输出差异）。
+                # DeepSeek prediction confidence 是对推荐方向的"官方"置信度，
+                # 可能与 under_confidence/over_confidence 不一致（DeepSeek 输出差异）。
                 # 对预测方向取 max(prediction_conf, direction_conf) 保证一致性，
                 # 避免已通过的单被双向重评用更低置信度拒绝。
                 pred_conf = float(analysis_obj.get("confidence") or 0)
@@ -878,6 +878,17 @@ class AIBettingEngine:
                 "total_line": total_line,
                 "home_score": getattr(m, "home_score", None),
                 "away_score": getattr(m, "away_score", None),
+                "status": (
+                    m.status.value if hasattr(m.status, "value") else str(m.status or "")
+                ),
+                "period": (
+                    (m.extra_data or {}).get("period") or (m.extra_data or {}).get("status_text") or ""
+                    if isinstance(m.extra_data, dict) else ""
+                ),
+                "clock": (
+                    (m.extra_data or {}).get("clock") or (m.extra_data or {}).get("timer") or (m.extra_data or {}).get("time") or ""
+                    if isinstance(m.extra_data, dict) else ""
+                ),
             })
 
         # 扫描上限按「同场」计；保持刚开赛优先顺序取组
@@ -1142,7 +1153,7 @@ async def analyze_and_recommend(
     strat_override=None,
 ) -> dict:
     """
-    AI 推荐：OB / 平博单边 · 足球胜负/让球/大小 · 篮球全场大小。
+    AI 推荐：OB / 平博单边 · 足球/篮球仅全场大小球。
 
     shared_analysis / shared_ctx：跨站同场复用，跳过 LLM（分析结果共享）。
     注意：LLM 可能耗时数十秒，必须先释放 DB 连接，避免 idle_in_transaction 杀连接。
@@ -1227,8 +1238,9 @@ async def analyze_and_recommend(
             "provider_code": site_hint,
             "fixture_key": fk,
             "extra_data": dict(match.extra_data or {}) if isinstance(match.extra_data, dict) else {},
+            "status": match_status,
         }
-        # 足球：胜负/让球/大小；篮球：大小
+        # 足球/篮球均只取全场大小球；让球/胜负数据仅用于过滤，绝不生成下注决策。
         from app.ai.market_recommend import load_all_market_odds_pack
 
         odds_pack = await load_all_market_odds_pack(
@@ -1260,6 +1272,7 @@ async def analyze_and_recommend(
             if isinstance(extra, dict):
                 match_info["period"] = extra.get("period") or extra.get("status_text")
                 match_info["clock"] = extra.get("clock") or extra.get("timer") or extra.get("time")
+                match_info["provider_snapshots"] = dict(extra.get("provider_snapshots") or {})
         except Exception:
             pass
 
@@ -1273,7 +1286,7 @@ async def analyze_and_recommend(
         if skip_why:
             await db.commit()
             reason_map = {
-                "score_exceeds_line": "当前比分已超过小球盘口，跳过分析",
+                "score_exceeds_line": "当前比分已超过全场大小球盘口，跳过分析",
                 "ending_soon": "比赛预计 10 分钟内结束，跳过分析",
                 "china_match": "中国赛事已过滤，跳过分析",
             }
@@ -1355,6 +1368,13 @@ async def analyze_and_recommend(
                     ctx = {}
 
         historical_pack = {
+            "schedule_id": ctx.get("schedule_id"),
+            "sport": ctx.get("sport") or match_info.get("sport"),
+            "home_team": ctx.get("home_team") or match_info.get("home_team"),
+            "away_team": ctx.get("away_team") or match_info.get("away_team"),
+            "match_title": ctx.get("match_title") or "",
+            "identity": ctx.get("identity") or {},
+            "source_pages": ctx.get("source_pages") or {},
             "h2h": ctx.get("h2h") or {},
             "home_form": ctx.get("home_form") or {},
             "away_form": ctx.get("away_form") or {},
@@ -1695,7 +1715,7 @@ async def analyze_and_recommend(
             },
             "current_odds": {
                 k: v for k, v in (market_odds_flat or {}).items()
-                if k == "under" and isinstance(v, (int, float))
+                if k in ("under", "over") and isinstance(v, (int, float))
             },
             "best_by_selection": mkt_pack.get("best_by_selection") or {},
             "odds_by_provider": mkt_pack.get("odds_by_provider") or {},

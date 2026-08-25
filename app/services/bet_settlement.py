@@ -2,7 +2,7 @@
 
 修复背景：下单时 actual_payout 被直接写成 potential_payout（未结算即记满额赔付），
 导致系统无法区分输赢、无法统计真实胜率。本服务：
-1. 比赛结束后按 小球线 vs 全场总得分 判定 赢/输/走水；
+1. 比赛结束后按 大小球线 vs 全场总得分 判定 赢/输/走水；
 2. 赢 → actual_payout = stake * odds；输 → 0；走水 → 退本金 stake；
 3. 提供近期真实胜率统计，供策略层自适应调整阈值。
 """
@@ -82,7 +82,7 @@ async def settle_finished_bets(*, limit: int = 200) -> int:
                 .where(
                     Bet.settled_at.is_(None),
                     Bet.status == BetStatus.SUCCESS,
-                    Bet.bet_type == BetType.TOTAL,  # 仅小球参与比分结算
+                    Bet.bet_type == BetType.TOTAL,  # 仅全场大小球参与比分结算
                     Match.status.in_(
                         [MatchStatus.FINISHED, MatchStatus.CANCELLED, MatchStatus.POSTPONED]
                     ),
@@ -287,7 +287,7 @@ async def recent_betting_stats(
             pb["won"] += 1
         elif payout < stake - 1e-9:
             pb["lost"] += 1
-        # 站点×小球方向细分。
+        # 站点×大小球方向细分。
         psb = _bucket(pb.setdefault("by_selection", {}), sel_l)
         psb["settled"] += 1
         psb.setdefault("stake", 0.0)

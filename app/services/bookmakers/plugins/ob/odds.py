@@ -311,6 +311,33 @@ def parse_asian_line(hv: Any) -> Optional[float]:
         return None
 
 
+def _total_line_is_plausible(total: Optional[float], sport: str = "football") -> bool:
+    """拒绝把空线、让球线或错误球种的数值当成全场大小球。"""
+    if total is None:
+        return False
+    try:
+        value = float(total)
+    except (TypeError, ValueError):
+        return False
+    if (sport or "").lower() in ("basketball", "2"):
+        return 40.0 <= value <= 400.0
+    return 0.25 <= value <= 15.0
+
+
+def _selection_ref_is_usable(ref: dict, *, mid: str, csid: str) -> bool:
+    """下单所需的 OB 原生定位参数必须齐全；缺失时只允许展示，不允许下注。"""
+    if not isinstance(ref, dict):
+        return False
+    if not all(str(ref.get(key) or "").strip() for key in ("oid", "hid", "mid")):
+        return False
+    if str(ref.get("mid")) != str(mid):
+        return False
+    # 旧的单元 fixture/兼容调用没有 csid；真实 OB rows 有 csid 时必须一致。
+    if csid and (not str(ref.get("csid") or "").strip() or str(ref.get("csid")) != str(csid)):
+        return False
+    return True
+
+
 def _moneyline_from_hps(
     hps: list, *, mid: str = "", csid: str = "", tid: str = "", match_type: int = 1
 ) -> Optional[RemoteOdds]:
@@ -420,12 +447,22 @@ def _spread_from_hps(
 
 
 def _total_from_hps(
-    hps: list, *, mid: str = "", csid: str = "", tid: str = "", match_type: int = 1
+    hps: list, *, mid: str = "", csid: str = "", tid: str = "", match_type: int = 1,
+    sport: str = "football",
 ) -> Optional[RemoteOdds]:
     for block in hps:
         if not isinstance(block, dict):
             continue
-        if str(block.get("hpid")) != "2" and "大小" not in str(block.get("hpn") or ""):
+        hpn = str(block.get("hpn") or "")
+        # hpid 在不同 OB 版本并不稳定；文案明确标记半场时，绝不能把它
+        # 当成全场 total（否则会以半场线去调用全场下注接口）。
+        if (
+            "上半场" in hpn
+            or "下半场" in hpn
+            or ("半场" in hpn and "全场" not in hpn)
+        ):
+            continue
+        if str(block.get("hpid")) != "2" and "大小" not in hpn:
             continue
         for line in block.get("hl") or []:
             if not isinstance(line, dict):
@@ -433,7 +470,10 @@ def _total_from_hps(
             odds_data: dict[str, Any] = {}
             selections: dict[str, dict] = {}
             hv = str(line.get("hv") or "").strip()
-            total = parse_asian_line(hv) or 0.0
+            total = parse_asian_line(hv)
+            # OB 的全场线必须是当前球种的合理大小球线；解析失败不能回退为 0。
+            if not _total_line_is_plausible(total, sport):
+                continue
             hid = str(line.get("hid") or "")
             hpid = str(block.get("hpid") or "2")
             # hs: 0 开盘；非 0 常为锁盘/关盘，跳过以免下单 0402008
@@ -445,7 +485,7 @@ def _total_from_hps(
                 if ol.get("os") not in (1, "1", None, 0, "0"):
                     continue
                 price = ov_to_decimal(ol.get("ov"))
-                if price is None:
+                if price is None or price <= 1.0 or price > 100.0:
                     continue
                 ot = str(ol.get("ot") or "").lower()
                 on = str(ol.get("on") or "")
@@ -469,15 +509,23 @@ def _total_from_hps(
                     "tid": tid,
                     "match_type": match_type,
                 }
-            if "over" in odds_data and "under" in odds_data:
+            if (
+                "over" in odds_data
+                and "under" in odds_data
+                and _selection_ref_is_usable(selections.get("over") or {}, mid=mid, csid=csid)
+                and _selection_ref_is_usable(selections.get("under") or {}, mid=mid, csid=csid)
+            ):
                 odds_data["_ob"] = {
                     "mid": mid,
                     "csid": csid,
                     "tid": tid,
                     "match_type": match_type,
+                    "market": "full_time_total",
+                    "source": "ob_api",
+                    "line_raw": hv,
                     "selections": selections,
                 }
-                return RemoteOdds(bet_type="total", odds_data=odds_data, total=total)
+                return RemoteOdds(bet_type="total", odds_data=odds_data, total=float(total))
     return None
 
 
@@ -620,7 +668,9 @@ def parse_matches_pb(rows: list, *, limit: int = 800) -> list[RemoteMatch]:
         sp = _spread_from_hps(hps, mid=mid, csid=csid, tid=tid, match_type=match_type)
         if sp:
             odds_list.append(sp)
-        tot = _total_from_hps(hps, mid=mid, csid=csid, tid=tid, match_type=match_type)
+        tot = _total_from_hps(
+            hps, mid=mid, csid=csid, tid=tid, match_type=match_type, sport=sport
+        )
         if tot:
             odds_list.append(tot)
         # 上下半场大小球
@@ -654,6 +704,18 @@ def parse_matches_pb(rows: list, *, limit: int = 800) -> list[RemoteMatch]:
                 away_score=away_score,
                 clock=clock,
                 period=period,
+                data_quality={
+                    "source": "ob_api",
+                    "external_id": f"ob:{mid}",
+                    "match_id": mid,
+                    "sport_valid": sport in SUPPORTED_SPORTS,
+                    "score_available": bool(row.get("msc")) or status == "upcoming",
+                    "clock_available": bool(clock) if status == "live" else True,
+                    "full_time_total": bool(tot),
+                    "total_two_sided": bool(
+                        tot and "over" in (tot.odds_data or {}) and "under" in (tot.odds_data or {})
+                    ),
+                },
             )
         )
         if len(out) >= limit:

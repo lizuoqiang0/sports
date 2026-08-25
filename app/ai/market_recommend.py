@@ -1,15 +1,15 @@
-"""盘口推荐：OB/平博单边，仅生成全场小球推荐。"""
+"""盘口推荐：OB/平博单边，仅生成全场大小球推荐。"""
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Optional
 
 from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.user import BetType, Odds
+from app.models.user import BetType, Match, Odds
 from app.services.bookmakers.catalog import BOOKMAKER_CATALOG, provider_name
 from app.services.provider_utils import best_by_selection, code_by_provider
 
@@ -23,6 +23,7 @@ ALIAS = {
 
 SEL_LABELS = {
     "under": "小球",
+    "over": "大球",
     "home": "主",
     "away": "客",
     "draw": "平",
@@ -206,6 +207,12 @@ async def load_market_matrix(
                 Odds.match_id.in_(match_ids),
                 Odds.bet_type == enum,
                 Odds.valid_to.is_(None),
+                # AI 与自动下单必须消费同一轮实时快照；长期悬挂的 valid_to=NULL
+                # 旧行不能继续参与方向判断或跨站比价。
+                Odds.is_live.is_(True),
+                Odds.valid_from >= (
+                    datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=5)
+                ),
             )
         ).order_by(
             # canonical 站的行优先（盘口线以其为准），同站内最新行优先
@@ -214,6 +221,50 @@ async def load_market_matrix(
         )
     )
     matrix: dict[str, dict[str, float]] = {}
+    rows = list(result.scalars().all())
+    # OB 的采集快照是盘口与赛事身份的最终质量门。历史版本可能留下
+    # valid_to=NULL 的半场/锁盘 TOTAL；只要快照明确不满足“全场 + 双向”，
+    # 即使数据库行仍存在，也不能进入 AI 矩阵或下单候选。
+    quality_by_match: dict[int, dict[str, Any]] = {}
+    try:
+        qres = await db.execute(
+            select(Match.id, Match.external_id, Match.extra_data).where(
+                Match.id.in_(match_ids)
+            )
+        )
+        for mid, external_id, extra_data in qres.all():
+            ext = str(external_id or "").lower()
+            if not ext.startswith("ob:"):
+                continue
+            snapshots = extra_data.get("provider_snapshots") if isinstance(extra_data, dict) else None
+            snapshot = snapshots.get("ob") if isinstance(snapshots, dict) else None
+            if isinstance(snapshot, dict):
+                quality_by_match[int(mid)] = snapshot
+    except Exception:
+        # 兼容旧测试/旧数据库结构；没有快照时仍由其它实时闸门校验。
+        quality_by_match = {}
+    # 盘口线是分析的锚点：优先使用当前 match（通常是用户选中的站点）的线，
+    # 只有同一条线才允许跨站比价，防止 OB 2.5 的赔率搭配到平博 2.75 的线。
+    anchor_line: float | None = None
+    for row in rows:
+        if int(getattr(row, "match_id", 0) or 0) != int(match_id):
+            continue
+        try:
+            value = float(row.total if bt == "total" else row.spread)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            anchor_line = value
+            break
+    if anchor_line is None:
+        for row in rows:
+            try:
+                value = float(row.total if bt == "total" else row.spread)
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                anchor_line = value
+                break
     spread_line = 0.0
     total_line = 0.0
     sel_allow = {
@@ -224,13 +275,37 @@ async def load_market_matrix(
         "spread": ("home", "away"),
     }.get(bt, ())
 
-    for row in result.scalars().all():
+    for row in rows:
         pname = ALIAS.get(str(row.provider or ""), str(row.provider or ""))
         if pname not in allowed:
             code = code_by_provider(pname) or ""
             pname = provider_name(code) if code in BOOKMAKER_CATALOG else pname
         if pname not in allowed:
             continue
+        if pname == "OB体育":
+            snapshot = quality_by_match.get(int(getattr(row, "match_id", 0) or 0))
+            if snapshot and (
+                snapshot.get("full_time_total") is not True
+                or snapshot.get("total_two_sided") is not True
+            ):
+                logger.info(
+                    "skip incomplete OB total snapshot match=%s full_time=%s two_sided=%s",
+                    getattr(row, "match_id", None),
+                    snapshot.get("full_time_total"),
+                    snapshot.get("total_two_sided"),
+                )
+                continue
+        if anchor_line is not None:
+            try:
+                row_line = float(row.total if bt == "total" else row.spread)
+            except (TypeError, ValueError):
+                row_line = None
+            if row_line is None or abs(row_line - anchor_line) > 0.01:
+                logger.info(
+                    "skip mismatched %s line provider=%s match=%s row_line=%s anchor=%s",
+                    bt, pname, getattr(row, "match_id", None), row_line, anchor_line,
+                )
+                continue
         # 线取「首个非空行」并锁定（查询已按 canonical 站优先 + 最新行排序）：
         # 原先每行无条件覆盖（最后一行=兄弟站最旧行胜出），会使 AI 分析用的线
         # 与最终下单行的线错配，半分之差即可翻转 won/push

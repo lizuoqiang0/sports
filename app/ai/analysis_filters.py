@@ -40,9 +40,12 @@ def usable_total_odds(odds_map: Any) -> list[float]:
     if not isinstance(odds_map, dict):
         return []
     out: list[float] = []
-    x = _as_eu_odds(odds_map.get("under"))
-    if x is not None:
-        out.append(x)
+    # 大小球两边都可成为 AI 候选；只看 under 会把 over-only 的平博/OB
+    # 盘口在扫描阶段误判为“无可用赔率”，从而根本进不了分析与闸门。
+    for selection in ("under", "over"):
+        x = _as_eu_odds(odds_map.get(selection))
+        if x is not None:
+            out.append(x)
     return out
 
 
@@ -69,7 +72,7 @@ def total_odds_meet_min(
     floor: float = DEFAULT_MIN_ODDS,
     ceiling: float | None = DEFAULT_MAX_ODDS,
 ) -> bool:
-    """小球赔率落在配置区间内才值得分析。"""
+    """全场大小球任一方向赔率落在配置区间内才值得分析。"""
     return any(
         odds_in_configured_range(v, min_odds=floor, max_odds=ceiling)
         for v in usable_total_odds(odds_map)
@@ -135,7 +138,7 @@ def skip_reason_for_match(
         return "league_blacklisted"
 
     sport_l = str(sport or "").lower()
-    # 只分析有小球赔率(TOTAL under)的比赛——全场小球或上下半场小球
+    # 只分析有全场大小球赔率(TOTAL under/over)的比赛。
     # 足球和篮球都强制 require_total_only：无 TOTAL 赔率的比赛直接跳过
     check = total_odds_meet_min
     if odds_map is not None and not check(odds_map, floor=min_odds, ceiling=max_odds):
@@ -289,7 +292,7 @@ async def enrich_recs_skip_from_db(
             if isinstance(odata, dict):
                 prev = odds_by.get(mid_i) or {}
                 merged = dict(prev)
-                for k in ("under",):
+                for k in ("under", "over"):
                     if odata.get(k) is not None:
                         merged[k] = odata.get(k)
                 odds_by[mid_i] = merged

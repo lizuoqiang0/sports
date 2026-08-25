@@ -48,6 +48,8 @@ class RemoteMatch:
     away_score: int = 0
     clock: str = ""  # e.g. "67:12"
     period: str = ""  # e.g. "下半场" / "地图2"
+    # 采集层质量快照。保持可选，兼容旧连接器与 Gate 返回格式。
+    data_quality: dict[str, Any] = field(default_factory=dict)
 
 
 class BookmakerConnector(ABC):

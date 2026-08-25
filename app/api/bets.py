@@ -140,14 +140,14 @@ async def place_bet(
 
     sel = str(req.selection or "").lower()
     bt = str(req.bet_type or "").lower()
-    # 只投全场小球：OB/平博下单链路仅对该方向做过可靠性验证。
+    # 只投全场大小球；让球、胜负、半场及特殊玩法一律拒绝。
     if bt != "total":
         raise HTTPException(
             status_code=400,
-            detail="仅支持全场小球（bet_type=total）",
+            detail="仅支持全场大小球（bet_type=total）",
         )
-    if sel != "under":
-        raise HTTPException(status_code=400, detail="仅支持小球选项（selection=under）")
+    if sel not in {"under", "over"}:
+        raise HTTPException(status_code=400, detail="仅支持大小球选项（selection=under/over）")
 
     # 2. 解析目标站点并获取赔率
     from app.core.crypto import decrypt_secret
@@ -226,6 +226,18 @@ async def place_bet(
     if not odds_obj:
         raise HTTPException(status_code=404, detail="赔率不存在")
 
+    # 指定站点时绝不拿另一站的 total 行去调用本站连接器；两站盘口线可能
+    # 不同，串用会导致实际点击/结算与用户确认的站点不一致。
+    provider_aliases = {
+        "pinnacle": {"平博", "pinnacle"},
+        "ob": {"ob体育", "ob sports", "ob"},
+    }.get(provider_code, {str(provider_label).strip().lower()} if provider_label else set())
+    if provider_label and str(odds_obj.provider or "").strip().lower() not in provider_aliases:
+        raise HTTPException(
+            status_code=409,
+            detail=f"{provider_label} 当前没有可用的全场大小球赔率，已阻止跨站下单",
+        )
+
     raw_odds = (odds_obj.odds_data or {}).get(sel)
     if raw_odds is None or isinstance(raw_odds, (dict, list)):
         raise HTTPException(status_code=400, detail=f"无效选项: {req.selection}")
@@ -278,7 +290,7 @@ async def place_bet(
                         if raw_odds is None or isinstance(raw_odds, (dict, list)):
                             raise HTTPException(
                                 status_code=409,
-                                detail="自动同步后未获取到可下注的小球赔率",
+                                detail="自动同步后未获取到可下注的全场大小球赔率",
                             )
                         current_odds = float(raw_odds)
                         fresh_at = match.updated_at or odds_obj.valid_from
@@ -395,6 +407,14 @@ async def place_bet(
         "bet_type": req.bet_type if isinstance(req.bet_type, str) else str(req.bet_type),
         "odds_data": dict(odds_obj.odds_data or {}),
     }
+    # 平博 UI 路径必须拿到本站当前 total line；Odds.total 是结构化字段，
+    # 不保证一定重复写入 odds_data，因此在下单 payload 中显式补齐。
+    if bt == "total" and odds_obj.total is not None:
+        try:
+            place_payload["odds_data"]["line"] = float(odds_obj.total)
+            place_payload["odds_data"]["total"] = float(odds_obj.total)
+        except (TypeError, ValueError):
+            pass
     # 真实站点可能在投注单中返回更高的最低投注额。允许平博在“本场动态
     # 仓位”与“单笔最大金额”之间安全调整，并把余额作为第三道硬上限。
     place_payload["odds_data"]["_stake_policy"] = {
@@ -420,11 +440,8 @@ async def place_bet(
     # 结算用盘口线
     line_val = None
     try:
-        bt = str(bet_type_val).lower()
-        if bt == "total" and odds_obj.total is not None:
+        if odds_obj.total is not None:
             line_val = float(odds_obj.total)
-        elif bt == "spread" and odds_obj.spread is not None:
-            line_val = float(odds_obj.spread)
         elif isinstance(odds_obj.odds_data, dict) and odds_obj.odds_data.get("line") is not None:
             line_val = float(odds_obj.odds_data.get("line"))
     except Exception:

@@ -1,7 +1,7 @@
 """置信度校准 + 高风险模式检测：基于历史投注结果闭环优化 AI 分析精度。
 
 核心功能：
-1. ConfidenceCalibrator — 按 0.05 宽度分桶，统计每桶实际胜率，将 GPT 原始置信度
+1. ConfidenceCalibrator — 按 0.05 宽度分桶，统计每桶实际胜率，将 DeepSeek 原始置信度
    映射到实际胜率，消除「高置信低胜率」的反向相关。
 2. LossPatternAnalyzer — 多维度（运动×方向×线距×时段×赔率×置信度）检测历史
    亏损模式，返回高风险组合供策略闸门拦截。
@@ -31,8 +31,9 @@ _RISK_TUNING_CACHE_KEY = "ai:risk_tuning:v2"
 
 # 置信度分桶宽度（0.05→0.10：每日注单量有限，宽桶增加每桶样本量，提升校准有效性）
 _CONF_BUCKET_WIDTH = 0.10
-# 每桶最低样本数（5→4：降低门槛使校准更早生效，配合宽桶提升覆盖率）
-_MIN_BUCKET_SAMPLES = 4
+# 每桶最低样本数：避免 4 注全胜就把 0.50 置信度抬到 0.65，造成过拟合。
+# 需要至少 8 个已结算样本才允许改变模型置信度。
+_MIN_BUCKET_SAMPLES = 8
 # 模式检测：最低样本 + 最低亏损率（5→6 提高可靠性，0.60→0.65 降低误报）
 _MIN_PATTERN_SAMPLES = 6
 _PATTERN_LOSS_RATE_THRESHOLD = 0.65  # 亏损率 ≥65% 判定为高风险模式
@@ -184,7 +185,7 @@ def calibrate_confidence(
     selection: str,
     calibration_table: dict,
 ) -> tuple[float, str]:
-    """将 GPT 原始置信度校准到实际胜率。
+    """将 DeepSeek 原始置信度校准到实际胜率。
 
     策略:
     1. 找到 raw_conf 所在分桶
@@ -367,7 +368,9 @@ async def load_risk_patterns(user_id: Optional[int] = None) -> list[dict]:
                 "won": d["won"],
                 "loss_rate": round(loss_rate, 4),
                 "win_rate": round(d["won"] / n, 4),
-                "action": "reject" if loss_rate >= 0.70 else "warn",
+                # 阈值与 _PATTERN_LOSS_RATE_THRESHOLD 保持一致；原先这里写
+                # 0.70，导致 15 注 5 胜（胜率33%）只生成 warn、闸门完全不拦。
+                "action": "reject" if loss_rate >= _PATTERN_LOSS_RATE_THRESHOLD else "warn",
                 **meta,
             }
             patterns.append(p)

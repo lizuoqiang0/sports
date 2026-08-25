@@ -30,6 +30,15 @@ async def scrape_pinnacle_live_text(page, *, url_sport: str = "", limit: int = 8
     队名在比分/节次/分钟之后，常用 LTR(\\u200e) 分隔；联赛在比分之前。
     """
     try:
+        from app.services.bookmakers.plugins.pinnacle.modals import (
+            dismiss_pinnacle_blocking_modals,
+        )
+
+        await dismiss_pinnacle_blocking_modals(page)
+    except Exception:
+        pass
+
+    try:
         rows = await page.evaluate(
             """(sportHint) => {
               const rawBody = (document.body && document.body.innerText) || '';

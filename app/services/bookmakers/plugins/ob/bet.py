@@ -16,7 +16,7 @@ from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
 from app.services.bookmakers.base import PlaceBetResult
-from app.services.bookmakers.plugins.ob.odds import sanitize_token
+from app.services.bookmakers.plugins.ob.odds import parse_asian_line, sanitize_token
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +74,13 @@ async def place_ybty_bet(
     """
     allow_launch=False（默认）：无 page 时直接失败，禁止另开窗口。
     """
+    # OB 账号在本产品只允许全场大小球；在最底层再次拦截，避免人工 API
+    # 或旧版调用方把让球/独赢单送到真实站点。
+    if str(bet_type or "").strip().lower() != "total":
+        return PlaceBetResult(ok=False, message="OB仅支持全场大小球（bet_type=total）")
+    if str(selection or "").strip().lower() not in {"under", "over"}:
+        return PlaceBetResult(ok=False, message="OB仅支持大小球方向（under/over）")
+
     token = sanitize_token(session_token)
     if not token or not base_url:
         return PlaceBetResult(ok=False, message="缺少 OB 会话，请先在站点配置验证登录")
@@ -85,6 +92,19 @@ async def place_ybty_bet(
             message="盘口缺少真实投注参数(oid/hid)，请先「同步全部」刷新赔率后再下单",
             balance_after=Decimal("0"),
         )
+
+    meta = (odds_data or {}).get("_ob") if isinstance(odds_data, dict) else {}
+    if isinstance(meta, dict):
+        market = str(meta.get("market") or "").strip().lower()
+        if market and market not in {"full_time_total", "total", "ou"}:
+            return PlaceBetResult(ok=False, message="OB盘口不是全场大小球，已阻止下单")
+    try:
+        requested_line = float((odds_data or {}).get("line") or (odds_data or {}).get("total") or 0)
+        ref_line = parse_asian_line(ref.get("hv")) or 0.0
+    except (TypeError, ValueError):
+        requested_line = ref_line = 0.0
+    if requested_line <= 0 or ref_line <= 0 or abs(requested_line - ref_line) > 0.01:
+        return PlaceBetResult(ok=False, message="OB全场大小球盘口线与原生投注参数不一致，已阻止下单")
 
     from app.services.bookmakers.odds_change import (
         ODDS_CHANGE_ACCEPT_FLOOR,
