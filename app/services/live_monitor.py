@@ -9,7 +9,7 @@ import logging
 from datetime import datetime, timezone
 
 from app.database import AsyncSessionLocal
-from sqlalchemy import text
+from sqlalchemy import select, text
 
 logger = logging.getLogger("app.services.live_monitor")
 
@@ -127,15 +127,16 @@ async def _check_odds_quality(db):
     return rows, issues
 
 
-async def _check_ai_engine_status():
-    """检查 AI 引擎运行状态和 Redis 锁。"""
+async def _check_ai_engine_status(user_id: int | None = None):
+    """检查指定用户的 AI 引擎运行状态和 Redis 锁。"""
     from app.core.cache import cache
 
     issues = []
     engine_status = {"running": False, "lock": None}
     try:
-        running = await cache.get("ai:engine:running:1")
-        lock = await cache.get("ai:engine:lock:1")
+        uid = int(user_id or 0)
+        running = await cache.get(f"ai:engine:running:{uid}") if uid else None
+        lock = await cache.get(f"ai:engine:lock:{uid}") if uid else None
         engine_status = {
             "running": bool(running),
             "lock": str(lock)[:12] if lock else None,
@@ -200,7 +201,19 @@ async def monitor_cycle():
         spread_ok = sum(1 for r in odds if r[7] or r[6])
         monitor_data["odds"] = {"total": len(odds), "total_complete": total_ok, "spread_complete": spread_ok}
 
-    engine_issues, engine_status = await _check_ai_engine_status()
+    # 监控必须读取实际启用 AI 的用户；固定查 user=1 会把 user=6 的运行状态
+    # 永久误报为“未运行”，掩盖引擎停机/锁竞争问题。
+    from app.models.user import User
+    async with AsyncSessionLocal() as db:
+        active_user_id = (
+            await db.execute(
+                select(User.id)
+                .where(User.ai_enabled == True)  # noqa: E712
+                .order_by(User.id)
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+    engine_issues, engine_status = await _check_ai_engine_status(active_user_id)
     monitor_data["engine"] = engine_status
 
     gate_issues = await _check_strategy_gates()

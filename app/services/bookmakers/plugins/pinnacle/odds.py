@@ -653,15 +653,15 @@ async def fetch_pinnacle_live_odds(
     except Exception:
         return []
 
-    # 白屏检测：SPA 渲染崩溃时 evaluate 会失败/返回空，先恢复再采盘
-    # （正常页面无副作用：检测通过立即返回，不触发 reload）
+    # 采盘前统一处理 2FA/公告遮挡、维护页与 SPA 白屏。正常页面无副作用；
+    # 仅检测到异常时才 reload/goto。
     try:
         from app.services.bookmakers.plugins.pinnacle.venue import (
-            recover_pinnacle_blank_page,
+            ensure_pinnacle_page_ready,
         )
 
-        if not await recover_pinnacle_blank_page(page, attempts=2):
-            logger.warning("pinnacle odds aborted: blank page persists")
+        if not await ensure_pinnacle_page_ready(page, attempts=2, venue_url=page.url or ""):
+            logger.warning("pinnacle odds aborted: page recovery failed")
             return []
     except Exception:
         pass

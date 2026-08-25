@@ -83,6 +83,7 @@ async def pinnacle_page_is_blank(page) -> bool:
             return False
         state = await page.evaluate(
             """() => {
+                // PINNACLE_BLANK_STATE
                 const body = document.body;
                 if (!body) return {ready: document.readyState, textLength: 0, hasVisibleControl: false};
                 const hasVisibleControl = [...document.querySelectorAll(
@@ -110,9 +111,23 @@ async def pinnacle_page_is_blank(page) -> bool:
 
 
 async def recover_pinnacle_blank_page(page, *, attempts: int = 3, venue_url: str = "") -> bool:
-    """白屏时重载并复检；reload 失败则 goto 直达场馆 URL 兜底。"""
+    """白屏时重载并复检；仍白屏时强制 goto 滚球直达页兜底。"""
     if not await pinnacle_page_is_blank(page):
         return True
+
+    current_url = ""
+    try:
+        current_url = str(page.url or "")
+    except Exception:
+        pass
+    recovery_urls: list[str] = []
+    for candidate in (venue_url, current_url):
+        value = str(candidate or "").strip()
+        if value and "/compact/sports/" in value.lower() and value not in recovery_urls:
+            recovery_urls.append(value)
+    for candidate in pinnacle_live_sport_urls(page_url=venue_url or current_url):
+        if candidate not in recovery_urls:
+            recovery_urls.append(candidate)
 
     total_attempts = max(1, int(attempts))
     for attempt in range(1, total_attempts + 1):
@@ -127,17 +142,26 @@ async def recover_pinnacle_blank_page(page, *, attempts: int = 3, venue_url: str
             await page.wait_for_timeout(2500)
         except Exception as e:
             logger.warning("pinnacle blank page reload failed attempt=%s: %s", attempt, e)
-            # reload 失败（ERR_ABORTED/frame detached）→ goto 兜底
-            if venue_url:
-                try:
-                    logger.info("pinnacle blank page goto fallback url=%s", venue_url[:120])
-                    await page.goto(venue_url, wait_until="domcontentloaded", timeout=45000)
-                    await page.wait_for_timeout(3000)
-                except Exception as e2:
-                    logger.warning("pinnacle blank page goto also failed: %s", e2)
         if not await pinnacle_page_is_blank(page):
             logger.info("pinnacle blank page recovered attempt=%s", attempt)
             return True
+
+        # reload 可能返回成功但 SPA 仍然只有空 root。此时必须主动 goto，不能
+        # 只在 reload 抛异常时才兜底。
+        if recovery_urls:
+            dest = recovery_urls[min(attempt - 1, len(recovery_urls) - 1)]
+            try:
+                logger.warning(
+                    "pinnacle blank page persists after reload, goto fallback url=%s",
+                    dest[:120],
+                )
+                await page.goto(dest, wait_until="domcontentloaded", timeout=45000)
+                await page.wait_for_timeout(3000)
+            except Exception as e:
+                logger.warning("pinnacle blank page goto failed attempt=%s: %s", attempt, e)
+            if not await pinnacle_page_is_blank(page):
+                logger.info("pinnacle blank page recovered by goto attempt=%s", attempt)
+                return True
 
     logger.error("pinnacle blank page persists after %s reloads", total_attempts)
     return False
@@ -151,13 +175,73 @@ async def page_shows_maintenance(page) -> bool:
     except Exception:
         return False
     try:
-        t = await page.evaluate(
-            "() => ((document.body && document.body.innerText) || '')"
+        state = await page.evaluate(
+            r"""() => {
+              // PINNACLE_MAINTENANCE_STATE
+              const text = String((document.body && document.body.innerText) || '')
+                .replace(/\s+/g, ' ').trim();
+              const maintenance = /(?:Pinnacle\s*888|平博).{0,80}(?:正在维护|维护中).{0,120}(?:暂时不可用|目前正在进行维护|深表歉意)|(?:currently\s+under\s+maintenance|temporarily\s+unavailable)/i.test(text)
+                || /(?:正在维护|维护中).{0,100}(?:暂时不可用|深表歉意|获取更多资讯)/.test(text);
+              return {maintenance, text: text.slice(0, 240)};
+            }"""
         )
     except Exception:
         return False
-    t = t or ""
-    return ("正在维护" in t) or ("维护中" in t) or ("系统维护" in t)
+    return bool(isinstance(state, dict) and state.get("maintenance"))
+
+
+async def recover_pinnacle_maintenance_page(
+    page, *, attempts: int = 2, venue_url: str = ""
+) -> bool:
+    """维护页自动刷新；仍维护时 goto 同站滚球入口，返回页面是否恢复。"""
+    if not await page_shows_maintenance(page):
+        return True
+
+    current_url = ""
+    try:
+        current_url = str(page.url or "")
+    except Exception:
+        pass
+    recovery_urls: list[str] = []
+    for candidate in (venue_url, current_url):
+        value = str(candidate or "").strip()
+        if value and "/compact/sports/" in value.lower() and value not in recovery_urls:
+            recovery_urls.append(value)
+    for candidate in pinnacle_live_sport_urls(page_url=venue_url or current_url):
+        if candidate not in recovery_urls:
+            recovery_urls.append(candidate)
+
+    total_attempts = max(1, int(attempts))
+    for attempt in range(1, total_attempts + 1):
+        logger.warning(
+            "pinnacle maintenance page detected, refresh attempt=%s/%s url=%s",
+            attempt, total_attempts, current_url[:120],
+        )
+        try:
+            await page.reload(wait_until="domcontentloaded", timeout=45000)
+            await page.wait_for_timeout(3000)
+        except Exception as e:
+            logger.warning("pinnacle maintenance reload failed attempt=%s: %s", attempt, e)
+        if not await page_shows_maintenance(page):
+            if await recover_pinnacle_blank_page(page, attempts=1, venue_url=venue_url):
+                logger.info("pinnacle maintenance page recovered by refresh attempt=%s", attempt)
+                return True
+
+        if recovery_urls:
+            dest = recovery_urls[min(attempt - 1, len(recovery_urls) - 1)]
+            try:
+                logger.warning("pinnacle maintenance persists, goto fallback url=%s", dest[:120])
+                await page.goto(dest, wait_until="domcontentloaded", timeout=45000)
+                await page.wait_for_timeout(3000)
+            except Exception as e:
+                logger.warning("pinnacle maintenance goto failed attempt=%s: %s", attempt, e)
+            if not await page_shows_maintenance(page):
+                if await recover_pinnacle_blank_page(page, attempts=1, venue_url=dest):
+                    logger.info("pinnacle maintenance page recovered by goto attempt=%s", attempt)
+                    return True
+
+    logger.error("pinnacle maintenance page persists after %s attempts", total_attempts)
+    return False
 
 
 async def clear_pinnacle_maintenance(page) -> bool:
@@ -168,32 +252,37 @@ async def clear_pinnacle_maintenance(page) -> bool:
     """
     if not await page_shows_maintenance(page):
         return False
-    logger.warning("pinnacle maintenance banner detected, auto refresh url=%s", (page.url or "")[:100])
-    try:
-        await page.reload(wait_until="domcontentloaded", timeout=45000)
-        await page.wait_for_timeout(3000)
-    except Exception as e:
-        logger.warning("pinnacle maintenance reload failed: %s, fallback goto", e)
-        try:
-            raw = page.url or ""
-            pu = urlparse(raw if "://" in raw else f"https://{raw}")
-            origin = f"{pu.scheme}://{pu.netloc}" if pu.netloc else ""
-            if origin:
-                for dest in pinnacle_live_sport_urls(origin=origin)[:2]:
-                    try:
-                        await page.goto(dest, wait_until="domcontentloaded", timeout=45000)
-                        await page.wait_for_timeout(2500)
-                        break
-                    except Exception:
-                        continue
-        except Exception:
-            pass
-    still = await page_shows_maintenance(page)
-    logger.warning(
-        "pinnacle maintenance auto-refresh done still_banner=%s url=%s",
-        still, (page.url or "")[:100],
-    )
+    await recover_pinnacle_maintenance_page(page, attempts=2)
     return True
+
+
+async def ensure_pinnacle_page_ready(
+    page, *, attempts: int = 2, venue_url: str = ""
+) -> bool:
+    """统一清遮挡并恢复维护/白屏；正常页面不 reload、不导航。"""
+    try:
+        from app.services.bookmakers.plugins.pinnacle.modals import (
+            dismiss_pinnacle_blocking_modals,
+        )
+
+        await dismiss_pinnacle_blocking_modals(page)
+    except Exception:
+        pass
+
+    if not await recover_pinnacle_maintenance_page(
+        page, attempts=attempts, venue_url=venue_url
+    ):
+        return False
+    if not await recover_pinnacle_blank_page(
+        page, attempts=attempts, venue_url=venue_url
+    ):
+        return False
+
+    try:
+        await dismiss_pinnacle_blocking_modals(page)
+    except Exception:
+        pass
+    return not await page_shows_maintenance(page) and not await pinnacle_page_is_blank(page)
 
 
 

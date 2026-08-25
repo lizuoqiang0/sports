@@ -173,16 +173,16 @@ async def _keep_sessions_refresh_loop() -> None:
                     if code == "pinnacle" and sess.page and not sess.page.is_closed():
                         try:
                             from app.services.bookmakers.plugins.pinnacle.venue import (
-                                recover_pinnacle_blank_page,
+                                ensure_pinnacle_page_ready,
                             )
 
-                            blank_ok = await recover_pinnacle_blank_page(
+                            page_ok = await ensure_pinnacle_page_ready(
                                 sess.page, attempts=2,
                                 venue_url=sess.venue_url or (sess.page.url if sess.page else ""),
                             )
-                            if not blank_ok:
+                            if not page_ok:
                                 logger.error(
-                                    "keep-alive: pinnacle blank page persists, skip balance site=%s",
+                                    "keep-alive: pinnacle page recovery failed, skip balance site=%s",
                                     base[:40],
                                 )
                                 continue
@@ -1968,18 +1968,18 @@ async def fetch_balance(req: BalanceRequest):
     if site_code == "pinnacle":
         try:
             from app.services.bookmakers.plugins.pinnacle.venue import (
-                pinnacle_page_is_blank,
-                recover_pinnacle_blank_page,
+                ensure_pinnacle_page_ready,
             )
 
-            if await pinnacle_page_is_blank(sess.page):
-                await recover_pinnacle_blank_page(sess.page, attempts=1,
-                    venue_url=sess.venue_url or (sess.page.url if sess.page else ""))
+            if not await ensure_pinnacle_page_ready(
+                sess.page, attempts=1,
+                venue_url=sess.venue_url or (sess.page.url if sess.page else ""),
+            ):
                 cached = float(sess.last_balance or 0)
                 return {
                     "ok": cached > 0,
                     "balance": cached,
-                    "message": "平博页面白屏（已触发恢复），返回场馆余额缓存",
+                    "message": "平博页面遮挡/白屏/维护状态恢复中，返回场馆余额缓存",
                     "lane": lane.key,
                     "site_code": sess.site_code or site_code,
                     "url": (getattr(sess.page, "url", "") or "")[:160],

@@ -204,6 +204,21 @@ async def ui_place_pinnacle_total(
         except Exception:
             sport_l = "football"
 
+    # 下单前必须确认页面不是维护页/白屏且所有安全推广遮挡已关闭。
+    # 恢复失败时 fail-closed，绝不继续点击任何赔率或确认按钮。
+    try:
+        from app.services.bookmakers.plugins.pinnacle.venue import (
+            ensure_pinnacle_page_ready,
+        )
+
+        if not await ensure_pinnacle_page_ready(
+            page, attempts=2, venue_url=str(page.url or "")
+        ):
+            return False, "pinnacle_page_recovery_failed", Decimal("0"), ""
+    except Exception as e:
+        logger.warning("pinnacle ui: page readiness check failed: %s", e)
+        return False, "pinnacle_page_readiness_error", Decimal("0"), ""
+
     # 队名 token：本地合并名 + 平博采盘原生名。原生名优先，避免
     # NowScore/平博翻译不一致导致整页 tokHit=[]。
     tokens = []

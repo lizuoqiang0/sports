@@ -42,18 +42,20 @@ _DISMISS_BLOCKER_JS = r"""() => {
   const protectedBet = /确认投注|您是否想要投注|清空注单|清除注单|您是否想要清空注单/;
   const blocker = /当前选项不适用|选择的注单暂时无效|暂时无效|余额不足|不能低于|无法|失败|已取消|已接受|投注成功|投注已|限额|拒绝|错误|请稍后|公告|活动|优惠|欢迎|提示|消息|更新|维护|版权|专有|保留所有权利|copyright|cookie|隐私|条款/i;
   const tradePwd = /交易密码|支付密码|资金密码|提款密码|fund\s*password|pay\s*password/i;
+  // 安全推广弹窗只能选择「暂不/关闭」，绝不能误点启用 2FA 的主按钮。
+  const securityPrompt = /为您的账户添加额外保护|双重验证|二次验证|登录时启用.*验证|\b2FA\b|two[ -]?factor authentication/i;
   const safeClose = /^(好的|好|知道了|我知道了|关闭|暂不|稍后|跳过|继续|同意|接受|OK|确定|Close|Cancel|I agree|Accept|Continue|×|X)$/i;
-  const cancelOnly = /^(关闭|取消|暂不|稍后|Close|Cancel|×|X)$/i;
+  const cancelOnly = /^(关闭|取消|暂不|稍后|不，谢谢|Close|Cancel|Not now|Maybe later|No thanks|×|X)$/i;
   for (const root of roots) {
     const body = textOf(root);
     if (!body || body.length > 900 || protectedBet.test(body)) continue;
-    if (!blocker.test(body) && !tradePwd.test(body)) continue;
+    if (!blocker.test(body) && !tradePwd.test(body) && !securityPrompt.test(body)) continue;
     const nodes = Array.from(root.querySelectorAll(
       'button, a, [role="button"], input[type="button"], input[type="submit"], [class*="close" i]'
     )).filter(visible);
     for (const el of nodes) {
       const label = textOf(el);
-      if (tradePwd.test(body) ? cancelOnly.test(label) : safeClose.test(label)) {
+      if ((tradePwd.test(body) || securityPrompt.test(body)) ? cancelOnly.test(label) : safeClose.test(label)) {
         try { el.click(); return { clicked: label, prompt: body.slice(0, 100) }; } catch (e) {}
       }
     }

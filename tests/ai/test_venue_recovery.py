@@ -17,8 +17,12 @@ from app.services.bookmakers.odds_change import (  # noqa: E402
     odds_meaningfully_changed,
 )
 from app.services.bookmakers.plugins.pinnacle.venue import (  # noqa: E402
+    page_shows_maintenance,
+    pinnacle_page_is_blank,
     pinnacle_live_sport_urls,
     pinnacle_session_expired,
+    recover_pinnacle_blank_page,
+    recover_pinnacle_maintenance_page,
 )
 from app.services.bookmakers.site_profiles import needs_manual_venue  # noqa: E402
 
@@ -108,6 +112,83 @@ class TestPinnacleAuthentication:
 
     async def test_guest_sportsbook_is_expired(self):
         assert await pinnacle_session_expired(self.Page()) is True
+
+
+class TestPinnaclePageRecovery:
+    class BlankPage:
+        url = "https://www.rowilong.com/zh-cn/compact/sports/soccer/live"
+
+        def __init__(self):
+            self.blank = True
+            self.reloads = 0
+            self.gotos: list[str] = []
+
+        def is_closed(self):
+            return False
+
+        async def evaluate(self, script):
+            if "PINNACLE_BLANK_STATE" in script:
+                return {
+                    "ready": "complete",
+                    "textLength": 0 if self.blank else 80,
+                    "hasVisibleControl": not self.blank,
+                }
+            raise AssertionError("unexpected script")
+
+        async def reload(self, **_kwargs):
+            self.reloads += 1
+            # 模拟真实故障：reload 成功返回，但 SPA 仍是空 root。
+
+        async def goto(self, url, **_kwargs):
+            self.gotos.append(url)
+            self.url = url
+            self.blank = False
+
+        async def wait_for_timeout(self, _milliseconds):
+            return None
+
+    async def test_blank_reload_success_but_still_blank_uses_goto(self):
+        page = self.BlankPage()
+        assert await pinnacle_page_is_blank(page) is True
+        assert await recover_pinnacle_blank_page(page, attempts=1) is True
+        assert page.reloads == 1
+        assert page.gotos and "/compact/sports/" in page.gotos[0]
+        assert await pinnacle_page_is_blank(page) is False
+
+    class MaintenancePage:
+        url = "https://www.rowilong.com/zh-cn/compact/sports/soccer/live"
+
+        def __init__(self):
+            self.maintenance = True
+            self.reloads = 0
+
+        def is_closed(self):
+            return False
+
+        async def evaluate(self, script):
+            if "PINNACLE_MAINTENANCE_STATE" in script:
+                return {"maintenance": self.maintenance, "text": "Pinnacle888正在维护中，暂时不可用"}
+            if "PINNACLE_BLANK_STATE" in script:
+                return {"ready": "complete", "textLength": 80, "hasVisibleControl": True}
+            raise AssertionError("unexpected script")
+
+        async def reload(self, **_kwargs):
+            self.reloads += 1
+            self.maintenance = False
+
+        async def goto(self, url, **_kwargs):
+            self.url = url
+            self.maintenance = False
+
+        async def wait_for_timeout(self, _milliseconds):
+            return None
+
+    async def test_maintenance_page_refreshes_until_normal(self):
+        page = self.MaintenancePage()
+        assert await page_shows_maintenance(page) is True
+        assert await recover_pinnacle_maintenance_page(page, attempts=2) is True
+        assert page.reloads == 1
+        assert await page_shows_maintenance(page) is False
 
 
 class TestRejectCleanupKeywords:

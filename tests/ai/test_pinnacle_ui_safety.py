@@ -252,6 +252,9 @@ def test_modal_handler_protects_bet_and_clear_confirmations():
     assert "&& /好的|OK|确定/.test(body) && /取消|Cancel/i.test(body)" in source
     assert "input, span, div" in source
     assert "PINNACLE_VERIFY_SLIP_EMPTY" in source
+    assert "双重验证|二次验证" in source
+    assert "Not now|Maybe later|No thanks" in source
+    assert "securityPrompt.test(body)" in source
 
 
 class _FakePinnaclePage:
@@ -305,6 +308,35 @@ def test_blocker_handler_repeats_until_all_known_modals_are_closed():
     assert [item.split(":", 1)[0] for item in actions] == ["好的", "关闭", "知道了"]
 
 
+def test_real_2fa_prompt_clicks_defer_never_enable():
+    playwright = __import__("playwright.async_api", fromlist=["async_playwright"])
+
+    async def run():
+        async with playwright.async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
+            await page.set_content(
+                """<!doctype html><html><body>
+                <div role="dialog" id="two-factor" style="position:fixed;width:700px;height:420px">
+                  <h2>为您的账户添加额外保护（双重验证）</h2>
+                  <p>您是否现在想为登录启用双重验证（2FA）？</p>
+                  <button id="enable" onclick="window.enableClicked=true">登录时启用双重验证</button>
+                  <button id="defer" onclick="window.deferClicked=true;this.parentElement.remove()">暂不</button>
+                </div>
+                </body></html>"""
+            )
+            actions = await dismiss_pinnacle_blocking_modals(page)
+            state = await page.evaluate(
+                "() => ({enable: !!window.enableClicked, defer: !!window.deferClicked, modal: !!document.querySelector('#two-factor')})"
+            )
+            await browser.close()
+            return actions, state
+
+    actions, state = asyncio.run(run())
+    assert actions and actions[0].startswith("暂不:")
+    assert state == {"enable": False, "defer": True, "modal": False}
+
+
 def test_no_debit_path_cleans_failed_slip_before_returning_failure():
     source = Path("app/services/bookmakers/site_bet.py").read_text(encoding="utf-8")
     no_debit_pos = source.index('"%s UI bet no debit')
@@ -335,6 +367,17 @@ def test_gate_keep_alive_continuously_dismisses_pinnacle_blockers():
     source = Path("scripts/browser_gate.py").read_text(encoding="utf-8")
     keepalive = source.split("async def _keep_sessions_refresh_loop", 1)[1]
     assert "await dismiss_pinnacle_blocking_modals(sess.page)" in keepalive
+    assert "await ensure_pinnacle_page_ready(" in keepalive
+
+
+def test_pinnacle_bet_fails_closed_when_page_recovery_fails():
+    source = Path(
+        "app/services/bookmakers/plugins/pinnacle/bet_ui.py"
+    ).read_text(encoding="utf-8")
+    ready = source.index("if not await ensure_pinnacle_page_ready(")
+    fail = source.index('return False, "pinnacle_page_recovery_failed"', ready)
+    first_click = source.index("result, last_miss = await _try_click_all_frames()", fail)
+    assert ready < fail < first_click
 
 
 def test_preview_route_bypasses_plugin_bet_implementation():
