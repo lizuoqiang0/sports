@@ -10,6 +10,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Optional
 
 from app.core.convert import to_float as _as_float, to_int as _as_int
+from app.ai.precision_profile import FOOTBALL_UNDER_PROFILE
 
 from pydantic import BaseModel
 from app.config import settings
@@ -32,21 +33,22 @@ class StrategyConfig(BaseModel):
     min_confidence: float = settings.AI_MIN_CONFIDENCE    # 最低AI置信度
     min_odds: float = settings.AI_MIN_ODDS                  # 最低赔率
     max_odds: Optional[float] = settings.AI_MAX_ODDS        # 最高赔率
+    high_precision_mode: bool = False
 
 
-DEFAULT_STRATEGY = StrategyConfig(name="simple")
+DEFAULT_STRATEGY = StrategyConfig(name="simple", high_precision_mode=True)
 AI_MIN_STAKE = 1.0
 
 # ── 运动类型风控参数（单一配置源：闸门2.7 双向风控 + 闸门2.9 under余量）──
 SPORT_RISK: dict[str, dict] = {
     "basketball": {
         # ── under 小球链（高赢单率配置）──
-        "under_min_conf": 0.65,            # 0.58→0.65：与足球对齐，提高胜率
-        "under_min_conf_no_fund": 0.68,    # 无基本面时加严
+        "under_min_conf": 0.65,
+        "under_min_conf_no_fund": 0.68,
         "under_min_line": 130.0,           # 篮球小球盘线区间下限（低于此线不投）
         "under_max_line": 205.0,           # 208→205：高线小分容错极低
-        "under_min_played_mins": 14.0,     # 首节/次节早段样本太小，不做小分
-        "under_late_block_mins": 44.0,     # 末节最后 4 分钟犯规/罚球波动极大
+        "under_min_played_mins": 14.0,
+        "under_late_block_mins": 44.0,
         # under 余量（全场48分钟按盘口线等比折算剩余期望）
         "margin_min_mins": 14.0,           # 与 B1 早段衔接，14' 起即检查余量
         "margin_full_mins": 48.0,
@@ -55,37 +57,37 @@ SPORT_RISK: dict[str, dict] = {
         "late_margin_floor": 4.0,          # 末节/加时余量过薄时一波罚球就破盘
         "ev_conf_edge": 0.04,              # 小分必须明显高于盈亏平衡概率
         # ═══ 大球 over 组（独立闸门参数，与小球互不参与）═══
-        "over_min_conf": 0.65,             # 0.58→0.65：与 under 对等
-        "over_min_conf_no_fund": 0.68,     # 无基本面时加严
+        "over_min_conf": 0.65,
+        "over_min_conf_no_fund": 0.68,
         "over_min_line": 140.0,            # 130→140：低线=市场极度看小，别硬刚
         "over_max_line": 165.0,            # 190→165：高线大分残余空间不足（194.5线/177球输单教训）
-        "over_min_played_mins": 14.0,      # 早段样本小（独立于 under 配置）
-        "over_late_block_mins": 40.0,      # 末节后段时间不够追分，经典送钱场景
+        "over_min_played_mins": 14.0,
+        "over_late_block_mins": 40.0,
         "over_pace_factor": 1.05,          # 1.20→1.05：线性 pace 低估后段得分，放宽
         "over_min_remaining_goals": 80.0,  # 55→80：半场 needed 普遍 80-90，原值全拒
     },
     "football": {
         # ── under 小球链（高赢单率配置）──
-        "under_min_conf": 0.65,            # 0.58→0.65：实盘 5 单 3 负，低 conf 注单亏损严重
-        "under_min_conf_no_fund": 0.68,    # 无基本面时进一步加严
-        "under_min_line": 2.0,            # 2.5→2.0：2.5 是最常见盘线，0-0 时 margin=2.5 并非一球破盘
-        "under_max_line": 5.0,             # 6.5→5.0：低级联赛高线（8.5）波动极大，8球破盘
+        "under_min_conf": 0.65,
+        "under_min_conf_no_fund": 0.68,
+        "under_min_line": 2.0,
+        "under_max_line": 5.0,
         "under_min_played_mins": 20.0,
         "under_late_block_mins": 90.0,
         # under 余量（全场90分钟折算剩余期望）
-        "margin_min_mins": 20.0,           # 40→20：与 B1 早段衔接，消除 20'-40' 保护盲区
+        "margin_min_mins": 20.0,
         "margin_full_mins": 90.0,
         "margin_avg_goals": 2.55,          # 联赛均值偏高估，压低基准
         "margin_factor": 1.05,             # 线性折算高估前段，放宽中段
         "late_margin_floor": 0.5,
         "ev_conf_edge": 0.0,
         # ═══ 大球 over 组（独立闸门参数，与小球互不参与）═══
-        "over_min_conf": 0.68,             # 0.65→0.68：over方向8/23-24合计胜率仅43%，3.0+线更差至22%
-        "over_min_conf_no_fund": 0.68,     # 保持0.68：配合线距加严0.03，无基本面时required=0.71仍可被高conf通过
+        "over_min_conf": 0.68,
+        "over_min_conf_no_fund": 0.68,
         "over_min_line": 2.5,              # 2.0→2.5：低线=市场极度看小
         "over_max_line": 3.0,              # 3.5→3.0：历史3.0-3.5线胜率33%，直接禁投高线over
         "over_min_played_mins": 20.0,
-        "over_late_block_mins": 85.0,      # 85'后追大球时间不够
+        "over_late_block_mins": 85.0,
         "over_pace_factor": 1.05,          # 与 under margin_factor 对称，不过度要求速率
         "over_min_remaining_goals": 3.5,   # 还差≥3.5球时基本无解；2.5球以内(如0:0追3球)仍可下单
     },
@@ -188,6 +190,7 @@ def ai_config_response_payload(ai_config: Any | None) -> dict[str, Any]:
             "scan_interval_sec": scan_interval_sec,
             "scan_interval_min": round(scan_interval_sec / 60, 2),
             "stream_bet_mode": True,
+            "high_precision_mode": bool(effective.high_precision_mode),
         },
     }
 
@@ -418,19 +421,47 @@ class StrategyEngine:
         if not has_fundamentals:
             base_req = max(base_req, floor_no_fund)
 
-        # 胜率自适应按方向隔离：under 链只看 under 结算、over 链只看 over 结算
-        # （by_selection 由 recent_betting_stats 提供；样本<5 不加成不放宽，
-        # over 上线初期即按硬地板运行）。
+        # 高精度表现闸门使用 30 天窗口。样本充分但胜率显著偏低的运动/方向
+        # 暂停自动下注，仍保留分析日志；窗口滚动后会自动重新评估。
         adaptive_bump = 0.0
         try:
             if self._cached_stats is None:
                 from app.services.bet_settlement import recent_betting_stats
 
-                self._cached_stats = await recent_betting_stats(days=7, user_id=self.user_id)
+                self._cached_stats = await recent_betting_stats(days=30, user_id=self.user_id)
             stats = self._cached_stats
             sel_stats = (stats.get("by_selection") or {}).get(prediction) or {}
             settled_n = int(sel_stats.get("settled") or 0)
             win_rate = sel_stats.get("win_rate")
+            sport_stats = (stats.get("by_sport") or {}).get(sport_l) or {}
+            sport_n = int(sport_stats.get("settled") or 0)
+            sport_wr = sport_stats.get("win_rate")
+
+            # 至少2个运动样本且胜率<50%：说明当前运动尚未验证（当前篮球0/2）。
+            if (self.config.high_precision_mode and sport_n >= 2
+                    and isinstance(sport_wr, (int, float)) and sport_wr < 0.50):
+                logger.info(
+                    "[A3/高精度表现] ❌ 拒绝 match=%s | %s近30天%d注胜率%.1f%%<50%%，暂停自动下注",
+                    mid, sport_l, sport_n, sport_wr * 100,
+                )
+                return self._reject(
+                    match_info, analysis,
+                    f"高精度模式暂停{sport_l}自动下注（近{sport_n}注胜率{sport_wr:.1%}）",
+                )
+
+            # 至少20个方向样本且胜率<60%：暂停该方向（当前over 66注50%）。
+            if (self.config.high_precision_mode and settled_n >= 20
+                    and isinstance(win_rate, (int, float)) and win_rate < 0.60):
+                logger.info(
+                    "[A3/高精度表现] ❌ 拒绝 match=%s | %s近30天%d注胜率%.1f%%<60%%，暂停自动下注",
+                    mid, prediction, settled_n, win_rate * 100,
+                )
+                return self._reject(
+                    match_info, analysis,
+                    f"高精度模式暂停{prediction}自动下注（近{settled_n}注胜率{win_rate:.1%}）",
+                )
+
+            # 胜率自适应按方向隔离；小样本不放宽。
             if settled_n >= 5 and isinstance(win_rate, (int, float)):
                 if win_rate < 0.35:
                     adaptive_bump = 0.10
@@ -441,7 +472,7 @@ class StrategyEngine:
                 # 高胜率是高门槛的结果，放宽门槛即摧毁胜率。
             if adaptive_bump:
                 logger.info(
-                    "[A3/置信度] 胜率自适应 match=%s | 近7天%d结算胜率%.1f%%<45%% | 门槛+%.2f",
+                    "[A3/置信度] 胜率自适应 match=%s | 近30天%d结算胜率%.1f%%<45%% | 门槛+%.2f",
                     mid, settled_n, win_rate * 100, adaptive_bump,
                 )
             else:
@@ -778,10 +809,6 @@ class StrategyEngine:
             except Exception:
                 pass
             if sport_l == "football" and played_mins is not None and played_mins < float(RISK.get("under_min_played_mins", 20.0)):
-                    # 近7天本地已结算样本（2026-08-10~2026-08-17）：
-                    # - 足球 under 全样本 13胜11负，WR 54.2%
-                    # - 加上现有 line>2.0 过滤后，若再去掉 20' 前早段单，提升到 8胜2负，WR 80.0%
-                    # 早段 under 最大问题：样本太小，1次快攻/点球/红牌就能把小球彻底打穿。
                     logger.info(
                         "[B1/under风控] ❌ 拒绝 match=%s | 足球under早段不下 mins=%.1f<20",
                         mid, played_mins,
@@ -1199,6 +1226,40 @@ class StrategyEngine:
             "[E2/EV平衡] ✅ 通过 match=%s | conf=%.2f ≥ 要求%.3f (盈亏平衡%.3f edge=%.3f odds=%.2f) | EV=%+.3f",
             mid, conf_f, required_ev_conf, breakeven_conf, ev_conf_edge, odds, conf_f * odds - 1.0,
         )
+
+        # ── E3：高精度自动投注档位 ──
+        # 110 笔真实结算的可复现区间为 11 中 9（81.8%）：足球 under、
+        # 最终校准概率≥0.70、线(2.0,4.5)、赔率[1.70,2.00)、45'~85'。
+        # 这是历史点估计而非承诺；完整 A-E 闸门仍须全部通过。
+        if self.config.high_precision_mode:
+            from app.ai.precision_profile import high_precision_history_eligible
+
+            if not high_precision_history_eligible(
+                sport=sport_l,
+                selection=prediction,
+                confidence=conf_f,
+                line=total_line,
+                odds=odds,
+                played_minutes=played_mins,
+            ):
+                p = FOOTBALL_UNDER_PROFILE
+                logger.info(
+                    "[E3/高精度档位] ❌ 拒绝 match=%s | sport=%s sel=%s conf=%.2f line=%s odds=%.2f mins=%s",
+                    mid, sport_l, prediction, conf_f, total_line, odds, played_mins,
+                )
+                return self._reject(
+                    match_info,
+                    analysis,
+                    "高精度档位仅自动执行足球under："
+                    f"conf≥{p['min_confidence']:.2f}、线({p['min_line_exclusive']:.1f},"
+                    f"{p['max_line_exclusive']:.1f})、赔率[{p['min_odds']:.2f},"
+                    f"{p['max_odds_exclusive']:.2f})、时间{p['min_played_minutes']:.0f}'-"
+                    f"{p['max_played_minutes_exclusive']:.0f}'",
+                )
+            logger.info(
+                "[E3/高精度档位] ✅ 通过 match=%s | football under conf=%.2f line=%.2f odds=%.2f mins=%.1f",
+                mid, conf_f, float(total_line), odds, float(played_mins),
+            )
 
         # 投注金额：动态仓位 = 单笔上限 × 置信度缩放 × 风险折扣
         # - 置信度缩放：以 A3 实际门槛为起点（conf_lo=base_req），conf≥0.65 接近满仓（0.90 封顶）

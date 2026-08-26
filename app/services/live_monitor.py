@@ -155,10 +155,10 @@ async def _check_strategy_gates():
 
     bk = SPORT_RISK.get("basketball", {})
     fb = SPORT_RISK.get("football", {})
-    if bk.get("under_min_line") != 120.0:
-        issues.append({"level": "warn", "tag": "[SPORT_RISK]", "match": "", "issue": f"篮球 under_min_line={bk.get('under_min_line')} (应为120)"})
-    if fb.get("under_max_line") != 6.5:
-        issues.append({"level": "warn", "tag": "[SPORT_RISK]", "match": "", "issue": f"足球 under_max_line={fb.get('under_max_line')} (应为6.5)"})
+    if bk.get("under_min_line") != 130.0:
+        issues.append({"level": "warn", "tag": "[SPORT_RISK]", "match": "", "issue": f"篮球 under_min_line={bk.get('under_min_line')} (应为130)"})
+    if fb.get("under_max_line") != 5.0:
+        issues.append({"level": "warn", "tag": "[SPORT_RISK]", "match": "", "issue": f"足球 under_max_line={fb.get('under_max_line')} (应为5.0)"})
 
     if "友谊赛" not in LEAGUE_BLACKLIST_KEYWORDS:
         issues.append({"level": "error", "tag": "[黑名单]", "match": "", "issue": "缺'友谊赛'"})

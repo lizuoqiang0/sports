@@ -308,7 +308,8 @@ class MatchAnalyzer:
         _hs = match_info.get("home_score")
         _as = match_info.get("away_score")
         _total_goals = int((_hs or 0) + (_as or 0)) if _hs is not None or _as is not None else "x"
-        cache_key = f"ai:deepseek:v2:{fk}:{sport}:{line_tag}:g{_total_goals}"
+        # v3: 最终置信度与 under/over 方向置信度统一，旧缓存不可复用。
+        cache_key = f"ai:deepseek:v3:{fk}:{sport}:{line_tag}:g{_total_goals}"
         # 缓存策略：滚球（有比分）禁用缓存强制实时分析，赛前（无比分）允许缓存
         # 滚球比分/盘口变化快，旧缓存的 reasoning 会过时；赛前数据稳定可复用
         is_live = _hs is not None or _as is not None
@@ -591,6 +592,7 @@ class MatchAnalyzer:
 
             # ── 历史结果校准：基于实际投注胜率校准 DeepSeek 置信度 ──
             analysis = await self._apply_historical_calibration(analysis, match_info)
+            analysis = self._synchronize_direction_confidences(analysis)
 
             # 单模型模式：DeepSeek 返回 under/over 即为最终共识。
 
@@ -606,8 +608,8 @@ class MatchAnalyzer:
             _as = match_info.get("away_score")
             _score = f"{_hs}:{_as}" if _hs is not None else "?"
             _clock = str(match_info.get("clock") or "?")
-            _uc = float(under_conf) if under_conf is not None else 0.0
-            _oc = float(over_conf) if over_conf is not None else 0.0
+            _uc = float(analysis.get("under_confidence") or 0.0)
+            _oc = float(analysis.get("over_confidence") or 0.0)
             _odds_str = ""
             try:
                 _od = float(analysis.get("odds") or 0)
@@ -738,6 +740,7 @@ class MatchAnalyzer:
                     analysis = self._apply_market_odds_constraint(analysis, match_info)
                     analysis = self._apply_line_up_constraint(analysis, match_info, market_odds)
                     analysis = await self._apply_historical_calibration(analysis, match_info)
+                    analysis = self._synchronize_direction_confidences(analysis)
                     return analysis
                 elif pred == "skip":
                     logger.info(
@@ -1284,6 +1287,44 @@ class MatchAnalyzer:
         except Exception as e:
             logger.debug("[历史校准] 跳过(异常): %s", e)
 
+        return analysis
+
+    @staticmethod
+    def _synchronize_direction_confidences(analysis: dict) -> dict:
+        """以完成所有约束/校准后的 confidence 作为唯一可执行概率。
+
+        DeepSeek 会分别返回 prediction confidence 和 under/over confidence。
+        过去只校准前者，自动循环却可能使用更高的方向概率，造成 UI 显示
+        68%/72%、实际校准仅 53% 仍进入后续闸门。现在预测方向严格等于
+        最终概率，反方向最多为其补集，不能绕过质量/盘口/历史校准。
+        """
+        pred = str(analysis.get("prediction") or "").strip().lower()
+        if pred not in ("under", "over"):
+            return analysis
+        try:
+            final_conf = max(0.0, min(0.99, float(analysis.get("confidence") or 0.0)))
+        except (TypeError, ValueError):
+            final_conf = 0.0
+        other = "over" if pred == "under" else "under"
+        pred_key = f"{pred}_confidence"
+        other_key = f"{other}_confidence"
+        try:
+            old_pred = float(analysis.get(pred_key) or 0.0)
+        except (TypeError, ValueError):
+            old_pred = 0.0
+        try:
+            old_other = max(0.0, float(analysis.get(other_key) or 0.0))
+        except (TypeError, ValueError):
+            old_other = 0.0
+
+        analysis["direction_confidence_before_sync"] = {
+            "prediction": pred,
+            pred: round(old_pred, 4),
+            other: round(old_other, 4),
+        }
+        analysis[pred_key] = round(final_conf, 4)
+        analysis[other_key] = round(min(old_other, max(0.0, 1.0 - final_conf)), 4)
+        analysis["confidence"] = round(final_conf, 4)
         return analysis
 
     @staticmethod

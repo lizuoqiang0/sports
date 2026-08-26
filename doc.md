@@ -296,10 +296,10 @@ under/over 双向独立闸门参数，足球和篮球各自一套：
 
 | 参数 | 足球 under | 篮球 under | 足球 over | 篮球 over |
 |------|-----------|-----------|----------|----------|
-| min_conf | 0.65 | 0.65 | 0.65 | 0.65 |
+| min_conf | 0.65 | 0.65 | 0.68 | 0.65 |
 | min_conf_no_fund | 0.68 | 0.68 | 0.68 | 0.68 |
 | min_line | 2.0 | 130.0 | 2.5 | 140.0 |
-| max_line | 5.0 | 205.0 | 4.5 | 165.0 |
+| max_line | 5.0 | 205.0 | 3.0 | 165.0 |
 | min_played_mins | 20.0 | 14.0 | 20.0 | 14.0 |
 | late_block_mins | 90.0 | 44.0 | 85.0 | 40.0 |
 | margin_min_mins | 20.0 | 14.0 | — | — |
@@ -310,6 +310,14 @@ under/over 双向独立闸门参数，足球和篮球各自一套：
 | ev_conf_edge | 0.0 | 0.04 | max(0,0.02) | max(0.04,0.02) |
 | over_pace_factor | — | — | 1.05 | 1.05 |
 | over_min_remaining_goals | — | — | 3.5 | 80.0 |
+
+生产自动引擎额外启用 E3 高精度档位。它不会用用户设置的 60% 覆盖硬门槛，
+而是在 A-E 全部通过后，仅执行以下历史可验证区间：足球 `under`、最终校准概率
+`≥0.70`、盘口 `(2.0,4.5)`、赔率 `[1.70,2.00)`、比赛时间 `[45',85')`。
+2026-08-21~24 的 110 笔已结算样本中，该区间为 11 笔 9 赢（81.8%）；这只是
+小样本历史点估计，不构成未来胜率或收益保证。近 30 天运动胜率低于 50%（至少
+2 笔）或方向胜率低于 60%（至少 20 笔）时，自动下注暂停该运动/方向，但继续分析。
+使用 `python3 scripts/backtest_precision_profile.py` 可执行只读复核。
 
 ### 5.3 环境变量 (`.env`)
 
@@ -484,6 +492,7 @@ CMD ["/app/scripts/docker_entrypoint_backend.sh"]
 | `test_venue_recovery.py` | 平博页面状态恢复 | 15 |
 | `test_integration.py` | 集成测试（全链路/竞态/热更新/玩法白名单） | 16 |
 | `test_sync_live_odds_versions.py` | 滚球赔率版本收敛（每站/玩法仅最新有效行） | 1 |
+| `test_precision_profile.py` | 最终概率一致性 + 高精度档位边界/方向暂停 | 6 |
 | `test_over_gates.py` | 大小球双闸门链（under/over 互不参与） | 12 |
 | `test_one_click_bet.py` | 一键投注端到端 | 12 |
 | `test_handicap_exclusion.py` | 让球盘排除 + 赔率匹配 | 60+ |
@@ -638,7 +647,7 @@ StrategyEngine.evaluate_bet() 五阶段闸门链：
   B 结构性风控    B1盘线区间(under/over独立) → P1/P4/P10 → B1b余量/P5/P8 → B2联赛黑名单 → B3高赔率 → B3b赔率一致性
   C 市场一致性    C1 盘口变化方向 vs 预测方向
   D 滚球余量      D1-under余量/D1-over速率(加权模型) → D1b已进球接近度
-  E 赔率有效性    E1区间 → E2 EV盈亏平衡
+  E 赔率有效性    E1区间 → E2 EV盈亏平衡 → E3高精度自动档位
 
   → 仓位计算: max_bet × conf_scale(under×1.10/over×0.8) × risk_factor × prov_factor × 余额锚定(25%) × 日亏递减
 ```
