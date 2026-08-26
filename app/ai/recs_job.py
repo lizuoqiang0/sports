@@ -297,7 +297,7 @@ async def list_live_match_ids(
     hi = float(hi)
 
     from app.ai.strategy_gates import sport_is_preferred, team_is_excluded
-    from app.models.user import BetType, Match, MatchStatus, Odds
+    from app.models.user import BetType, Match, MatchStatus, Odds, SportType
     from app.services.bookmakers.china_match import is_china_match
     from app.services.bookmakers.plugins.ob.odds import is_virtual_match
     from app.services.bookmakers.sport_classify import normalize_sport
@@ -317,7 +317,7 @@ async def list_live_match_ids(
         result = await db.execute(
             select(Match)
             .where(
-                Match.sport == sport_norm,
+                Match.sport == SportType(sport_norm),
                 Match.status == MatchStatus.LIVE,
                 Match.start_time >= now - timedelta(hours=8),
             )
@@ -684,7 +684,7 @@ async def _run_recs_job(
         # 与自动引擎一致：关闭 LLM 时跳过赛前上下文
         skip_ctx = not bool(getattr(job_strat, "use_llm_analysis", True))
 
-        conc = max(2, int(getattr(settings, "AI_ANALYZE_CONCURRENCY", 8) or 8))
+        conc = max(2, int(getattr(settings, "AI_ANALYZE_CONCURRENCY", 12) or 12))
         sem = asyncio.Semaphore(conc)
         all_recs: list[dict] = []
         done = 0

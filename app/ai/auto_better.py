@@ -74,7 +74,7 @@ _LIVE_SCAN_LIMIT = max(
     60, int(getattr(settings, "AI_LIVE_SCAN_LIMIT", 120) or 120)
 )
 _LIVE_ANALYZE_CONCURRENCY = max(
-    1, int(getattr(settings, "AI_ANALYZE_CONCURRENCY", 8) or 8)
+    1, int(getattr(settings, "AI_ANALYZE_CONCURRENCY", 12) or 12)
 )
 # 空轮快速重扫：无候选赛事时缩短等待（刚开赛/滚球上新是时间敏感窗口，
 # 死等完整间隔会错过黄金分析期）。有候选走正常 AI_SCAN_INTERVAL_SEC。

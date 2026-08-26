@@ -67,6 +67,14 @@ class SportType(str, Enum):
     AMERICAN_FOOTBALL = "american_football"
     OTHER = "other"
 
+    @classmethod
+    def _missing_(cls, value):
+        """兼容数据库枚举名和外部接口的大小写差异。"""
+        normalized = str(value or "").strip().lower()
+        if normalized == "soccer":
+            normalized = cls.FOOTBALL.value
+        return next((member for member in cls if member.value == normalized), None)
+
 
 class BetType(str, Enum):
     MONEYLINE = "moneyline"        # 胜负

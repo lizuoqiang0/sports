@@ -184,12 +184,21 @@ async def list_matches(
     _: object = Depends(get_current_user),
 ):
     """获取赛事列表；可按站点分类（OB / 平博）筛选。"""
+    sport_filter = None
+    if sport:
+        try:
+            sport_filter = SportType(sport)
+        except ValueError:
+            raise HTTPException(status_code=422, detail="仅支持 football / basketball")
+        if sport_filter not in _SUPPORTED_SPORTS:
+            raise HTTPException(status_code=422, detail="仅支持 football / basketball")
+
     provider_code = (provider or "").strip().lower()
     if provider_code and provider_code not in ("ob", "pinnacle"):
         provider_code = ""
 
     cache_key = (
-        f"matches:list:v6finishedtime:{sport}:{status_filter}:{league}:{provider_code}:{page}:{page_size}"
+        f"matches:list:v6finishedtime:{sport_filter}:{status_filter}:{league}:{provider_code}:{page}:{page_size}"
     )
     cached = await cache.get_json(cache_key)
     if cached:
@@ -199,8 +208,8 @@ async def list_matches(
     query = select(Match)
 
     filters = [Match.sport.in_(_SUPPORTED_SPORTS), _not_virtual_filters()]
-    if sport:
-        filters.append(Match.sport == sport)
+    if sport_filter:
+        filters.append(Match.sport == sport_filter)
     if status_filter:
         filters.append(Match.status == status_filter)
     if league:
