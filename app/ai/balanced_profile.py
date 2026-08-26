@@ -1,4 +1,4 @@
-"""足球/篮球70%–80%滚动目标的平衡自动投注档位。"""
+"""足球/篮球按联赛等级和 under/over 方向区分的自动投注门槛。"""
 from __future__ import annotations
 
 from typing import Optional
@@ -6,8 +6,10 @@ from typing import Optional
 from app.ai.league_focus import basketball_regulation_minutes, league_focus_level
 
 
-TARGET_WIN_RATE_LOW = 0.70
-TARGET_WIN_RATE_HIGH = 0.80
+FOCUS_UNDER_MIN = 0.58
+FOCUS_OVER_MIN = 0.68
+OTHER_UNDER_MIN = 0.62
+OTHER_OVER_MIN = 0.78
 
 
 def balanced_min_confidence(sport: str, selection: str, league: str) -> float:
@@ -16,14 +18,14 @@ def balanced_min_confidence(sport: str, selection: str, league: str) -> float:
     focus = league_focus_level(sport_l, league)
     if sport_l in ("football", "soccer"):
         if selection_l == "under":
-            return 0.68 if focus >= 1 else 0.70
+            return FOCUS_UNDER_MIN if focus >= 1 else OTHER_UNDER_MIN
         if selection_l == "over":
-            return 0.72 if focus >= 1 else 0.78
+            return FOCUS_OVER_MIN if focus >= 1 else OTHER_OVER_MIN
     if sport_l == "basketball":
         if selection_l == "under":
-            return 0.68 if focus >= 2 else 0.70
+            return FOCUS_UNDER_MIN if focus >= 2 else OTHER_UNDER_MIN
         if selection_l == "over":
-            return 0.72 if focus >= 2 else 0.78
+            return FOCUS_OVER_MIN if focus >= 2 else OTHER_OVER_MIN
     return 1.0
 
 

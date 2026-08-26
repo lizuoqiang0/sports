@@ -186,6 +186,7 @@ services:
       AI_MATCH_CONTEXT_TTL_SEC: ${AI_MATCH_CONTEXT_TTL_SEC:-21600}
       NOWSCORE_PROXY_URL: ${NOWSCORE_PROXY_URL:-}
       AI_ENABLED: ${AI_ENABLED:-true}
+      AI_MIN_CONFIDENCE: ${AI_MIN_CONFIDENCE:-0.58}
       DEFAULT_BET_MODE: ${DEFAULT_BET_MODE:-manual}
       ALLOW_PUBLIC_REGISTER: ${ALLOW_PUBLIC_REGISTER:-false}
       MIN_BET_AMOUNT: ${MIN_BET_AMOUNT:-100}
@@ -276,6 +277,7 @@ services:
       AI_MATCH_CONTEXT_TTL_SEC: ${AI_MATCH_CONTEXT_TTL_SEC:-21600}
       NOWSCORE_PROXY_URL: ${NOWSCORE_PROXY_URL:-}
       AI_ENABLED: ${AI_ENABLED:-true}
+      AI_MIN_CONFIDENCE: ${AI_MIN_CONFIDENCE:-0.58}
     healthcheck:
       test: ["CMD", "python", "-c", "from pathlib import Path; import sys; sys.exit(0 if b'ai_betting_engine.py' in Path('/proc/1/cmdline').read_bytes() else 1)"]
       interval: 10s

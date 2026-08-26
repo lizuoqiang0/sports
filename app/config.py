@@ -111,7 +111,7 @@ class Settings(BaseSettings):
     H2H_MAX_MATCHES: int = 3               # 历史交锋最多保留场次
     FORM_MAX_MATCHES: int = 3               # 近况最多保留场次
     # 下单门槛（从 settings 读取，不写死）
-    AI_MIN_CONFIDENCE: float = 0.47        # 下单最低置信度（含纯盘口模式）
+    AI_MIN_CONFIDENCE: float = 0.58        # 通用下限；其他方向由联赛/方向硬门槛自动抬高
     AI_MIN_ODDS: float = 1.65              # 下单最低赔率
     AI_MAX_ODDS: float = 5.00              # 下单最高赔率
     LIVE_ODDS_MAX_AGE_SEC: int = 90        # 滚球下单允许的赔率最大年龄

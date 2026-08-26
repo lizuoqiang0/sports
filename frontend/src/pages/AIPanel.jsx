@@ -42,7 +42,7 @@ const DEFAULT_FORM_DATA = {
   excluded_teams: [],
   stop_loss: 500,
   take_profit: 1000,
-  min_confidence: 0.6,
+  min_confidence: 0.58,
   min_odds: 1.6,
   max_odds: 5.5,
 }
