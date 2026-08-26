@@ -293,6 +293,155 @@ class StrategyEngine:
         daily_loss: Decimal,
         active_bets_count: int,
     ) -> BetDecision:
+        """生产平衡档走单一组合闸门；其他配置走兼容链。"""
+        if self.config.balanced_target_mode:
+            # 显式导入保留在公共入口，实时监控可审计生产路径未被旁路。
+            from app.ai.balanced_gate import evaluate_balanced_gate  # noqa: F401
+
+            return self._evaluate_balanced_bet(
+                match_info=match_info,
+                analysis=analysis,
+                user_balance=user_balance,
+                daily_loss=daily_loss,
+                active_bets_count=active_bets_count,
+            )
+        return await self._evaluate_legacy_bet(
+            match_info=match_info,
+            analysis=analysis,
+            user_balance=user_balance,
+            daily_loss=daily_loss,
+            active_bets_count=active_bets_count,
+        )
+
+    def _evaluate_balanced_bet(
+        self,
+        *,
+        match_info: dict,
+        analysis: dict,
+        user_balance: Decimal,
+        daily_loss: Decimal,
+        active_bets_count: int,
+    ) -> BetDecision:
+        """生产组合闸门：固定五项检查，不读取小样本胜率调整门槛。"""
+        from app.ai.balanced_gate import evaluate_balanced_gate
+        from app.services.bookmakers.match_live import (
+            match_elapsed_seconds,
+            parse_match_clock_minutes,
+        )
+
+        prediction = str(analysis.get("prediction") or "").lower()
+        raw_bet_type = str(analysis.get("bet_type") or "total").lower()
+        if raw_bet_type != "total":
+            return self._reject(match_info, analysis, f"组合闸门[data]: 仅允许全场大小球，收到{raw_bet_type}")
+        if prediction not in ("under", "over"):
+            return self._reject(match_info, analysis, f"组合闸门[data]: 非法方向{prediction or 'empty'}")
+        reasoning = str(analysis.get("reasoning") or "")
+        if (not bool(analysis.get("consensus_reached", False))
+                or "[不投注]" in reasoning or "不可下单" in reasoning):
+            return self._reject(match_info, analysis, "组合闸门[data]: AI共识不足或已标记不可下单")
+
+        sport = str(match_info.get("sport") or "").lower()
+        league = str(match_info.get("league") or "")
+        line = _as_float(
+            analysis.get("line", match_info.get("total_line", match_info.get("line"))), None,
+        )
+        confidence = max(0.0, min(0.99, _as_float(analysis.get("confidence"), 0.0)))
+        odds_data = match_info.get("odds") if isinstance(match_info.get("odds"), dict) else {}
+        odds = _as_float(odds_data.get(prediction) or analysis.get("odds"), 0.0)
+        elapsed = match_elapsed_seconds(
+            sport=sport,
+            period=str(match_info.get("period") or ""),
+            clock=str(match_info.get("clock") or ""),
+            league=league,
+        )
+        if elapsed is not None:
+            played = elapsed / 60.0
+        else:
+            played = parse_match_clock_minutes(
+                str(match_info.get("clock") or ""), allow_countdown=False,
+            )
+
+        combo = evaluate_balanced_gate(
+            match_info=match_info,
+            analysis=analysis,
+            selection=prediction,
+            confidence=confidence,
+            odds=odds,
+            line=line,
+            played_minutes=played,
+            configured_min_confidence=float(self.config.min_confidence or 0.0),
+        )
+        analysis["required_confidence"] = combo.required_confidence
+        analysis["remaining_score_probability"] = combo.remaining_score_probability
+        analysis["balanced_gate"] = {
+            "allowed": combo.allowed,
+            "gate": combo.gate,
+            "reason": combo.reason,
+            "required_confidence": combo.required_confidence,
+            "remaining_score_probability": combo.remaining_score_probability,
+        }
+        if not combo.allowed:
+            logger.info(
+                "[组合闸门/%s] ❌ match=%s | sel=%s final=%.2f required=%.2f remaining=%s | %s",
+                combo.gate, match_info.get("id"), prediction, confidence,
+                combo.required_confidence,
+                (f"{combo.remaining_score_probability:.1%}" if combo.remaining_score_probability is not None else "n/a"),
+                combo.reason,
+            )
+            return self._reject(match_info, analysis, f"组合闸门[{combo.gate}]: {combo.reason}")
+
+        edge_span = max(0.01, 0.90 - combo.required_confidence)
+        confidence_factor = 0.55 + 0.35 * min(
+            1.0, max(0.0, confidence - combo.required_confidence) / edge_span,
+        )
+        suggested_stake = (
+            Decimal(str(self.config.max_bet_amount or 1.0))
+            * Decimal(str(round(confidence_factor, 3)))
+        ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        balance = Decimal(str(user_balance or 0))
+        if balance > 0:
+            suggested_stake = min(suggested_stake, balance * Decimal("0.25"))
+        stop_loss = float(self.config.stop_loss or 0)
+        if stop_loss > 0 and float(daily_loss or 0) > 0:
+            loss_ratio = min(float(daily_loss) / stop_loss, 1.0)
+            suggested_stake *= Decimal(str(round(1.0 - 0.5 * loss_ratio, 3)))
+        suggested_stake = min(
+            suggested_stake.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+            Decimal(str(self.config.max_bet_amount or 1.0)),
+        )
+        risk_score = self._calc_risk_score(confidence, odds, active_bets_count)
+        logger.info(
+            "[组合闸门/pass] ✅ match=%s | sel=%s final=%.2f required=%.2f remaining=%.1f%% odds=%.2f stake=%.2f",
+            match_info.get("id"), prediction, confidence, combo.required_confidence,
+            float(combo.remaining_score_probability or 0) * 100, odds, float(suggested_stake),
+        )
+        return BetDecision(
+            match_id=int(match_info.get("id") or 0),
+            selection=prediction,
+            confidence=confidence,
+            suggested_stake=max(Decimal("0"), suggested_stake),
+            reasoning=str(analysis.get("reasoning") or combo.reason),
+            risk_score=risk_score,
+            should_bet=suggested_stake >= Decimal(str(AI_MIN_STAKE)),
+            bet_type="total",
+            provider_code=str(analysis.get("provider_code") or match_info.get("provider_code") or ""),
+            odds=float(odds),
+            line=line,
+            sport=sport,
+            period=str(match_info.get("period") or ""),
+            clock=str(match_info.get("clock") or ""),
+            home_score=int(_as_float(match_info.get("home_score"), 0)),
+            away_score=int(_as_float(match_info.get("away_score"), 0)),
+        )
+
+    async def _evaluate_legacy_bet(
+        self,
+        match_info: dict,
+        analysis: dict,
+        user_balance: Decimal,
+        daily_loss: Decimal,
+        active_bets_count: int,
+    ) -> BetDecision:
         """
         综合评估一场赛事，决定是否投注。
 
@@ -1259,32 +1408,6 @@ class StrategyEngine:
             "[E2/EV平衡] ✅ 通过 match=%s | conf=%.2f ≥ 要求%.3f (盈亏平衡%.3f edge=%.3f odds=%.2f) | EV=%+.3f",
             mid, conf_f, required_ev_conf, breakeven_conf, ev_conf_edge, odds, conf_f * odds - 1.0,
         )
-
-        # ── E3：70%–80%平衡自动投注档位 ──
-        if self.config.balanced_target_mode:
-            from app.ai.balanced_profile import balanced_auto_eligible
-
-            eligible, profile_reason = balanced_auto_eligible(
-                sport=sport_l,
-                league=league,
-                selection=prediction,
-                confidence=conf_f,
-                line=total_line,
-                odds=odds,
-                played_minutes=played_mins,
-            )
-            if not eligible:
-                logger.info(
-                    "[E3/平衡档位] ❌ 拒绝 match=%s | league=%s sport=%s sel=%s conf=%.2f line=%s odds=%.2f mins=%s reason=%s",
-                    mid, league, sport_l, prediction, conf_f, total_line, odds,
-                    played_mins, profile_reason,
-                )
-                return self._reject(match_info, analysis, f"70%-80%平衡档位: {profile_reason}")
-            logger.info(
-                "[E3/平衡档位] ✅ 通过 match=%s | league=%s %s %s conf=%.2f line=%.2f odds=%.2f mins=%.1f %s",
-                mid, league, sport_l, prediction, conf_f, float(total_line), odds,
-                float(played_mins), profile_reason,
-            )
 
         # ── E3兼容：旧高精度历史回测档位 ──
         # 110 笔真实结算的可复现区间为 11 中 9（81.8%）：足球 under、

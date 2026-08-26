@@ -311,7 +311,7 @@ under/over 双向独立闸门参数，足球和篮球各自一套：
 | over_pace_factor | — | — | 1.05 | 1.05 |
 | over_min_remaining_goals | — | — | 3.5 | 80.0 |
 
-生产自动引擎启用 E3「70%–80%滚动目标平衡档」。70%–80%是策略目标，不是未来
+生产自动引擎启用「70%–80%滚动目标组合闸门」。70%–80%是策略目标，不是未来
 胜率保证；最终校准概率、A-E全闸门和有效赔率仍必须同时通过。
 
 - 足球明确重点：五大联赛、沙特职业/超级联赛、美职联、巴甲、葡超、荷甲、阿超、
@@ -329,6 +329,19 @@ under/over 双向独立闸门参数，足球和篮球各自一套：
 `python3 scripts/backtest_balanced_profile.py` 可只读回放平衡档；
 `python3 scripts/backtest_precision_profile.py` 保留旧高精度档作为对照。历史重点联赛
 样本目前不足，不能把小样本胜率当作未来承诺，需要继续按结算结果滚动评估。
+
+生产平衡档不再叠加旧 A/P/B/C/D/E 的数十条独立规则，而是收敛为五个组合检查：
+
+1. 数据与方向一致性：NowScore、亚洲盘口、比赛节奏形成同向共识且无硬冲突。
+2. 最终概率：只使用完成质量约束和历史校准后的唯一概率；用户配置只能加严门槛。
+3. 市场窗口：按联赛、球类、方向检查比赛时间、盘口线和赔率。
+4. 剩余得分概率：足球使用“实时盘口隐含剩余进球 + 节奏投影”的收缩泊松模型；
+   篮球使用NBA 48分钟或FIBA 40分钟口径的剩余得分正态模型。足球under不再使用
+   几乎不拦截的线性 `remaining/full × league_average` 余量公式。
+5. EV与仓位：最终概率覆盖赔率盈亏平衡后才放行；仓位只依赖最终概率、余额和当日
+   亏损，不再让小样本方向胜率或短期连胜连败调整门槛/仓位。
+
+旧细粒度闸门链仅保留给兼容模式和回归测试；生产 `balanced_target_mode` 不执行它们。
 
 ### 5.3 环境变量 (`.env`)
 
@@ -504,6 +517,7 @@ CMD ["/app/scripts/docker_entrypoint_backend.sh"]
 | `test_integration.py` | 集成测试（全链路/竞态/热更新/玩法白名单） | 16 |
 | `test_sync_live_odds_versions.py` | 滚球赔率版本收敛（每站/玩法仅最新有效行） | 1 |
 | `test_precision_profile.py` | 最终概率一致性 + 联赛优先级 + NBA/FIBA计时 + 平衡档边界 | 14 |
+| `test_balanced_gate.py` | 组合闸门一致性 + 足球under剩余进球概率 + 用户门槛 + 旧链隔离 | 5 |
 | `test_over_gates.py` | 大小球双闸门链（under/over 互不参与） | 12 |
 | `test_one_click_bet.py` | 一键投注端到端 | 12 |
 | `test_handicap_exclusion.py` | 让球盘排除 + 赔率匹配 | 60+ |
@@ -652,7 +666,12 @@ cp data/redis/dump.rdb backup_redis_$(date +%Y%m%d).rdb
 ### 10.6 闸门策略架构速查
 
 ```
-StrategyEngine.evaluate_bet() 五阶段闸门链：
+StrategyEngine.evaluate_bet() 生产组合闸门：
+
+  G1 数据/方向共识 → G2 最终概率 → G3 联赛/时间/盘口/赔率窗口
+  → G4 剩余得分概率 → G5 EV → 单一仓位公式
+
+兼容模式保留旧五阶段链：
 
   A 信号有效性    A0玩法白名单 → A1方向 → A2共识 → A3置信度(含P7/P9封顶/EV豁免) → A4篮球三重 → A5历史模式
   B 结构性风控    B1盘线区间(under/over独立) → P1/P4/P10 → B1b余量/P5/P8 → B2联赛黑名单 → B3高赔率 → B3b赔率一致性

@@ -169,6 +169,8 @@ async def _check_strategy_gates():
         src = inspect.getsource(StrategyEngine.evaluate_bet)
         if "if False" in src and "TEMP: bypass" in src:
             issues.append({"level": "error", "tag": "[A2闸门]", "match": "", "issue": "仍被 if False 旁路!"})
+        if "evaluate_balanced_gate" not in src:
+            issues.append({"level": "error", "tag": "[组合闸门]", "match": "", "issue": "生产策略缺 evaluate_balanced_gate"})
     except (OSError, TypeError):
         pass
 

@@ -116,6 +116,14 @@ def _evaluate(engine: StrategyEngine, *, selection: str, confidence: float):
         "context_source": "nowscore",
         "consensus_reached": True,
         "reasoning": "结构化证据完整",
+        "total_feature_matrix": {
+            "gates": {"analysis_ready": True, "hard_failures": []},
+            "directional_summary": {
+                "consensus_direction": selection,
+                "conflicts": [],
+            },
+            "pace": {"adjusted_projection": 2.0 if selection == "under" else 3.4},
+        },
     }
     with patch(
         "app.ai.calibration.load_risk_patterns", new=AsyncMock(return_value=[])
@@ -273,6 +281,14 @@ def test_balanced_strategy_can_execute_nba_total_after_all_gates():
             "market_points": 5,
             "fundamental_points": 5,
             "conflict_points": 0,
+        },
+        "total_feature_matrix": {
+            "gates": {"analysis_ready": True, "hard_failures": []},
+            "directional_summary": {
+                "consensus_direction": "over",
+                "conflicts": [],
+            },
+            "pace": {"adjusted_projection": 232.0},
         },
     }
     with patch(
