@@ -166,7 +166,10 @@ def skip_reason_for_match(
 def elapsed_sort_key(m: Any) -> tuple:
     """刚开赛优先：已进行秒数升序；同秒按开球时间升序。"""
     sport, period, clock = local_match_clock_period(m)
-    elapsed = match_elapsed_seconds(sport=sport, period=period, clock=clock)
+    league = getattr(m, "league", None) or (m.get("league") if isinstance(m, dict) else "") or ""
+    elapsed = match_elapsed_seconds(
+        sport=sport, period=period, clock=clock, league=str(league),
+    )
     el = int(elapsed) if elapsed is not None else 10**8
     st = getattr(m, "start_time", None)
     st_ts = st.timestamp() if st is not None and hasattr(st, "timestamp") else 0.0
@@ -175,6 +178,21 @@ def elapsed_sort_key(m: Any) -> tuple:
 
 def sort_just_started_first(matches: list[Any]) -> list[Any]:
     return sorted(matches or [], key=elapsed_sort_key)
+
+
+def focused_league_sort_key(m: Any) -> tuple:
+    """重点联赛优先，同一优先级内保持刚开赛优先。"""
+    from app.ai.league_focus import league_focus_level
+
+    sport = getattr(m, "sport", None) or (m.get("sport") if isinstance(m, dict) else "") or ""
+    if hasattr(sport, "value"):
+        sport = sport.value
+    league = getattr(m, "league", None) or (m.get("league") if isinstance(m, dict) else "") or ""
+    return (-league_focus_level(str(sport), str(league)), *elapsed_sort_key(m))
+
+
+def sort_focused_leagues_first(matches: list[Any]) -> list[Any]:
+    return sorted(matches or [], key=focused_league_sort_key)
 
 
 def _rec_primary_odds(rec: dict) -> Optional[float]:

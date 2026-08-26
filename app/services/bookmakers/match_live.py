@@ -240,6 +240,7 @@ def match_elapsed_seconds(
     sport: str = "",
     period: str = "",
     clock: str = "",
+    league: str = "",
 ) -> Optional[int]:
     """估算已进行秒数（越小越「刚开赛」）。无法解析返回 None。"""
     sport_l = (sport or "").lower().strip()
@@ -250,17 +251,20 @@ def match_elapsed_seconds(
     # 篮球：时钟是节内倒计时（如 Q4 剩 8:30），必须在足球粗分档之前处理，
     # 否则「第4节」会落入足球下半场分档（70min）超出篮球48min常规时间。
     if sport_l == "basketball":
+        from app.ai.league_focus import basketball_quarter_minutes, basketball_regulation_minutes
+
+        quarter_len = basketball_quarter_minutes(league)
+        regulation_len = basketball_regulation_minutes(league)
         mins_cd = parse_match_clock_minutes(clock, allow_countdown=True)
         if mins_cd is not None:
-            quarter_len = 12.0
             if any(x in period_l for x in ("第4节", "Q4")) or re.search(r"\bq4\b", pl):
-                return int((36 + max(0.0, quarter_len - mins_cd)) * 60)
+                return int((quarter_len * 3 + max(0.0, quarter_len - mins_cd)) * 60)
             if any(x in period_l for x in ("加时", "OT")) or re.search(r"\bot\b", pl):
-                return int((48 + max(0.0, 5.0 - mins_cd)) * 60)
+                return int((regulation_len + max(0.0, 5.0 - mins_cd)) * 60)
             if any(x in period_l for x in ("第3节", "Q3")) or re.search(r"\bq3\b", pl):
-                return int((24 + max(0.0, quarter_len - mins_cd)) * 60)
+                return int((quarter_len * 2 + max(0.0, quarter_len - mins_cd)) * 60)
             if any(x in period_l for x in ("第2节", "Q2")) or re.search(r"\bq2\b", pl):
-                return int((12 + max(0.0, quarter_len - mins_cd)) * 60)
+                return int((quarter_len + max(0.0, quarter_len - mins_cd)) * 60)
             if any(x in period_l for x in ("第1节", "Q1")) or re.search(r"\bq1\b", pl):
                 return int(max(0.0, quarter_len - mins_cd) * 60)
             # 节次无法识别时，尝试从 period 字符串提取数字（如 "4" / "第4" / "4th"）
@@ -268,24 +272,24 @@ def match_elapsed_seconds(
             if q_match:
                 q_num = int(q_match.group(1))
                 if 1 <= q_num <= 4:
-                    return int(((q_num - 1) * 12 + max(0.0, quarter_len - mins_cd)) * 60)
+                    return int(((q_num - 1) * quarter_len + max(0.0, quarter_len - mins_cd)) * 60)
             # 篮球节次完全未知时无法计算已进行时间，返回 None 让闸门跳过时间检查
             return None
-        # 无时钟：按节次中点粗估（12 分钟一节）
+        # 无时钟：按该联赛节长的中点粗估。
         if any(x in pl for x in ("完场", "finished", "ft")):
             return 10**9
         if any(x in period_l for x in ("加时", "OT")) or re.search(r"\bot\b", pl):
-            return 50 * 60
+            return int((regulation_len + 2.5) * 60)
         if any(x in period_l for x in ("第4节", "Q4")) or re.search(r"\bq4\b", pl):
-            return 42 * 60
+            return int((quarter_len * 3.5) * 60)
         if any(x in period_l for x in ("第3节", "Q3")) or re.search(r"\bq3\b", pl):
-            return 36 * 60
+            return int((quarter_len * 2.5) * 60)
         if any(x in period_l for x in ("中场", "HT", "节间")):
-            return 12 * 60
+            return int((quarter_len * 2) * 60)
         if any(x in period_l for x in ("第2节", "Q2")) or re.search(r"\bq2\b", pl):
-            return 18 * 60
+            return int((quarter_len * 1.5) * 60)
         if any(x in period_l for x in ("第1节", "Q1")) or re.search(r"\bq1\b", pl):
-            return 6 * 60
+            return int((quarter_len * 0.5) * 60)
         return None
 
     if mins is None:

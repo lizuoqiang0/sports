@@ -308,8 +308,8 @@ class MatchAnalyzer:
         _hs = match_info.get("home_score")
         _as = match_info.get("away_score")
         _total_goals = int((_hs or 0) + (_as or 0)) if _hs is not None or _as is not None else "x"
-        # v3: 最终置信度与 under/over 方向置信度统一，旧缓存不可复用。
-        cache_key = f"ai:deepseek:v3:{fk}:{sport}:{line_tag}:g{_total_goals}"
+        # v5: 足球/篮球70%-80%平衡档与联赛重点提示生效，旧缓存不可复用。
+        cache_key = f"ai:deepseek:v5:{fk}:{sport}:{line_tag}:g{_total_goals}"
         # 缓存策略：滚球（有比分）禁用缓存强制实时分析，赛前（无比分）允许缓存
         # 滚球比分/盘口变化快，旧缓存的 reasoning 会过时；赛前数据稳定可复用
         is_live = _hs is not None or _as is not None
@@ -1334,7 +1334,12 @@ class MatchAnalyzer:
         sport = str(match_info.get("sport") or "").strip().lower()
         period = str(match_info.get("period") or "").strip()
         clock = str(match_info.get("clock") or "").strip()
-        secs = match_elapsed_seconds(sport=sport, period=period, clock=clock)
+        secs = match_elapsed_seconds(
+            sport=sport,
+            period=period,
+            clock=clock,
+            league=str(match_info.get("league") or ""),
+        )
         if secs is not None and secs > 0:
             return round(secs / 60.0, 2)
         # 足球回退到直接解析
@@ -1501,7 +1506,12 @@ class MatchAnalyzer:
             return {"supportive": False, "conflict": False, "points": 0, "reason": ""}
         current_total = _to_float(hs, 0.0) + _to_float(aws, 0.0)
         sport = str(info.get("sport") or "").strip().lower()
-        full_minutes = 48.0 if sport == "basketball" else 90.0
+        if sport == "basketball":
+            from app.ai.league_focus import basketball_regulation_minutes
+
+            full_minutes = basketball_regulation_minutes(str(info.get("league") or ""))
+        else:
+            full_minutes = 90.0
         expected_total = float(line) * min(mins, full_minutes) / full_minutes
         delta = current_total - expected_total
         if sport == "basketball":
@@ -2040,10 +2050,14 @@ class MatchAnalyzer:
                 supportive = True
                 reason = "65分钟后进入进球高发期"
         elif sport == "basketball":
-            if selection == "under" and mins >= 44:
+            from app.ai.league_focus import basketball_regulation_minutes
+
+            full = basketball_regulation_minutes(str(match_info.get("league") or ""))
+            late = full * 0.9167
+            if selection == "under" and mins >= late:
                 conflict = True
-                reason = "篮球最后4分钟犯规与罚球波动大，不利于小分"
-            elif selection == "over" and mins >= 44:
+                reason = "篮球常规时间最后阶段犯规与罚球波动大，不利于小分"
+            elif selection == "over" and mins >= late:
                 # 对称提示：Q4 末段罚球刷分利大分，但领先方压节奏利小分，双向波动
                 supportive = True
                 reason = "篮球末节犯规战术+罚球易刷分，利大分"
@@ -2169,6 +2183,12 @@ class MatchAnalyzer:
         )
         historical_data = self._compact_historical_data(historical_data)
         sport = str(match_info.get("sport") or "football").lower()
+        basketball_full = 48.0
+        if sport == "basketball":
+            from app.ai.league_focus import basketball_regulation_minutes
+
+            basketball_full = basketball_regulation_minutes(str(match_info.get("league") or ""))
+        basketball_late = basketball_full * 0.9167
 
         prompt = f"""你是一位顶级体育赛事分析师，拥有20年从业经验。请分析以下赛事并给出专业预测。
 
@@ -2367,6 +2387,7 @@ class MatchAnalyzer:
                     sport=sport,
                     period=str(match_info.get("period") or ""),
                     clock=str(match_info.get("clock") or "").strip(),
+                    league=str(match_info.get("league") or ""),
                 )
                 if elapsed_secs is not None:
                     played_mins_calc = elapsed_secs / 60.0
@@ -2553,11 +2574,13 @@ class MatchAnalyzer:
                 "3) 基本面支持 under（交锋场均<160/近况得分低/防守型球队）\n"
                 "4) 低分走势占优\n"
                 "盘口强信号（降盘≥5分）+任一其他同向证据 -> 可给 conf 0.55-0.65\n"
-                "5) 注意：Q4后段犯规战术+罚球易刷分，44分钟后 under 默认更谨慎，弱信号必须 skip\n\n"
+                f"5) 注意：本联赛常规时间{basketball_full:.0f}分钟；Q4后段犯规战术+罚球易刷分，"
+                f"{basketball_late:.0f}分钟后 under 默认更谨慎，弱信号必须 skip\n\n"
                 "### 通用规则\n"
                 "- 无基本面数据时，篮球小球不能给高置信度；弱信号直接 skip\n"
                 "- 若初指、实时盘口、基本面三者未形成同向支持，under 优先 skip\n"
                 "- 三类信号全矛盾 -> 必须 skip\n"
+                "- NBA/ACB/欧篮联自动档要求最终校准概率≥0.72；只有盘口、节奏、基本面强一致时才可给到0.72以上\n"
                 "- confidence 必须与信号强度匹配，不得虚高\n"
             )
         else:
@@ -2610,6 +2633,7 @@ class MatchAnalyzer:
                 "### 通用规则\n"
                 "- 无基本面数据时，小球需 conf>=0.40 且双信号一致\n"
                 "- 三类信号（初指/实时盘口/基本面）全矛盾 -> 必须 skip\n"
+                "- 重点/合规超级甲级联赛under自动档要求最终校准概率≥0.70；只有强一致证据才可给到该区间\n"
                 "- confidence 必须与信号强度匹配，不得虚高\n"
             )
 
@@ -2628,7 +2652,8 @@ class MatchAnalyzer:
                 "3) 基本面支持 over（交锋场均>170/近况得分高/进攻型球队）\n"
                 "4) 高分走势占优\n"
                 "盘口强信号（资金推动型升盘≥5分+水位下降）+任一其他同向证据 -> 可给 conf 0.55-0.65\n"
-                "5) 注意：Q4后段若落后方犯规战术+罚球更利刷分，但领先方控节奏压时间利小分；44分钟后 over 默认更谨慎，弱信号必须 skip\n\n"
+                f"5) 注意：本联赛常规时间{basketball_full:.0f}分钟；Q4后段若落后方犯规战术+罚球更利刷分，"
+                f"但领先方控节奏压时间利小分；{basketball_late:.0f}分钟后 over 默认更谨慎，弱信号必须 skip\n\n"
                 "### 进球速率衰减规则\n"
                 "- 篮球Q4后段：pace波动大，领先方控节奏压时间→得分减速；落后方犯规罚球→可能加速\n"
                 "- 不能线性外推Q1-Q3的pace到Q4\n\n"
@@ -2636,6 +2661,7 @@ class MatchAnalyzer:
                 "- 无基本面数据时，篮球大球不能给高置信度；弱信号直接 skip\n"
                 "- 若初指、实时盘口、基本面三者未形成同向支持，over 优先 skip\n"
                 "- 三类信号全矛盾 -> 必须 skip\n"
+                "- NBA/ACB/欧篮联自动档要求最终校准概率≥0.72；只有盘口、节奏、基本面强一致时才可给到0.72以上\n"
                 "- confidence 必须与信号强度匹配，不得虚高\n"
             )
         else:
@@ -2674,10 +2700,9 @@ class MatchAnalyzer:
                 "### 通用规则\n"
                 "- 无基本面数据时，大球需 conf>=0.40 且双信号一致\n"
                 "- 三类信号（初指/实时盘口/基本面）全矛盾 -> 必须 skip\n"
+                "- 明确重点联赛over自动档要求最终校准概率≥0.72；其他合规超级/甲级联赛要求≥0.75\n"
                 "- confidence 必须与信号强度匹配，不得虚高\n"
-                "- **over置信度上限0.72**：高conf over存在反向风险（conf≥0.73实盘仅33%胜率），\n"
-                "  升盘+快节奏三项同向时容易过度自信，但足球后段进球不确定性高。\n"
-                "  不得给出≥0.73的over置信度。信号再强也封顶0.72。\n\n"
+                "- 不得因升盘或快节奏单一信号虚增概率；0.75以上必须有盘口、节奏、基本面三项一致且无冲突。\n\n"
             )
 
         # Few-shot 示例：正确分析 vs 错误分析对比
@@ -3120,6 +3145,7 @@ class MatchAnalyzer:
                             sport=sport,
                             period=str(match_info.get("period") or ""),
                             clock=clock,
+                            league=str(match_info.get("league") or ""),
                         )
                         if elapsed_secs is not None:
                             played_mins = elapsed_secs / 60.0
@@ -3134,7 +3160,12 @@ class MatchAnalyzer:
                         "margin": round(tl - current_total, 2),
                     }
                     if played_mins and played_mins > 0:
-                        full_mins = 90.0 if sport != "basketball" else 48.0
+                        if sport == "basketball":
+                            from app.ai.league_focus import basketball_regulation_minutes
+
+                            full_mins = basketball_regulation_minutes(str(match_info.get("league") or ""))
+                        else:
+                            full_mins = 90.0
                         remain_mins = max(0.0, full_mins - played_mins)
                         pace = current_total / played_mins
                         projection = pace * full_mins
@@ -3148,7 +3179,7 @@ class MatchAnalyzer:
                         if sport == "basketball":
                             # 篮球四节得分权重
                             quarter_weights = [0.22, 0.23, 0.25, 0.30]
-                            quarter_mins = full_mins / 4  # 12分钟/节
+                            quarter_mins = full_mins / 4
                             # 已完成节的权重总和
                             completed_quarters = int(played_mins / quarter_mins)
                             completed_weight = sum(quarter_weights[:completed_quarters])

@@ -63,6 +63,7 @@ def _elapsed_minutes(match_info: dict) -> Optional[float]:
             sport=str(match_info.get("sport") or ""),
             period=str(match_info.get("period") or ""),
             clock=str(match_info.get("clock") or "").strip(),
+            league=str(match_info.get("league") or ""),
         )
         if seconds is not None:
             return round(max(0.0, seconds / 60.0), 3)
@@ -74,19 +75,20 @@ def _elapsed_minutes(match_info: dict) -> Optional[float]:
         return None
 
 
-def _phase(sport: str, played: Optional[float], is_live: bool) -> str:
+def _phase(sport: str, played: Optional[float], is_live: bool, full_minutes: float = 90.0) -> str:
     if not is_live:
         return "pregame"
     if played is None:
         return "unknown_live"
     if sport == "basketball":
-        if played < 12:
+        quarter = full_minutes / 4.0
+        if played < quarter:
             return "q1"
-        if played < 24:
+        if played < quarter * 2:
             return "q2"
-        if played < 36:
+        if played < quarter * 3:
             return "q3"
-        if played < 44:
+        if played < full_minutes * 0.9167:
             return "q4"
         return "q4_final"
     if played < 20:
@@ -136,7 +138,12 @@ def build_total_feature_matrix(
     info = match_info if isinstance(match_info, dict) else {}
     ctx = historical_data if isinstance(historical_data, dict) else {}
     sport = "basketball" if "basket" in str(info.get("sport") or "").lower() else "football"
-    full_minutes = 48.0 if sport == "basketball" else 90.0
+    if sport == "basketball":
+        from app.ai.league_focus import basketball_regulation_minutes
+
+        full_minutes = basketball_regulation_minutes(str(info.get("league") or ""))
+    else:
+        full_minutes = 90.0
     line_value = _float(line)
 
     market = _total_market(market_odds)
@@ -251,7 +258,7 @@ def build_total_feature_matrix(
                     factor = 0.75
                 elif played >= 50:
                     factor = 0.85
-            elif played >= 44:
+            elif played >= full_minutes * 0.9167:
                 factor = 1.05
             adjusted_projection = current_total + actual_rate * max(0.0, full_minutes - played) * factor
             pace["remaining_rate_factor"] = factor
@@ -327,7 +334,7 @@ def build_total_feature_matrix(
         "dimensions": _dimension_matrix(ctx),
         "match_state": {
             "is_live": is_live,
-            "phase": _phase(sport, played, is_live),
+            "phase": _phase(sport, played, is_live, full_minutes),
             "period": str(info.get("period") or ""),
             "clock": str(info.get("clock") or ""),
             "played_minutes": played,

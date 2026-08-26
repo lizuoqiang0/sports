@@ -791,7 +791,7 @@ class AIBettingEngine:
                 return True
             return any(same_fixture(m, bm) for bm in bet_matches)
 
-        from app.ai.analysis_filters import skip_reason_for_match, sort_just_started_first
+        from app.ai.analysis_filters import skip_reason_for_match, sort_focused_leagues_first
 
         from app.ai.strategy_gates import team_is_excluded
 
@@ -804,8 +804,8 @@ class AIBettingEngine:
 
         excluded = list(getattr(ai_config, "excluded_teams", None) or [])
 
-        # 刚开赛优先扫描
-        matches = sort_just_started_first(matches)
+        # 用户指定的主流联赛优先；同级内刚开赛优先。
+        matches = sort_focused_leagues_first(matches)
         candidates = []
         pre_filtered: list = []
         for m in matches:

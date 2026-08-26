@@ -71,9 +71,14 @@ def _line_range(line: float, sport: str) -> str:
             return "xhigh(≥4.5)"
 
 
-def _time_range(played_mins: float, sport: str) -> str:
+def _time_range(played_mins: float, sport: str, league: str = "") -> str:
     """将已进行分钟映射到时段。"""
-    full = 48.0 if sport == "basketball" else 90.0
+    if sport == "basketball":
+        from app.ai.league_focus import basketball_regulation_minutes
+
+        full = basketball_regulation_minutes(league)
+    else:
+        full = 90.0
     ratio = played_mins / full if full > 0 else 0
     if ratio < 0.25:
         return "early(0-25%)"
@@ -318,7 +323,12 @@ async def load_risk_patterns(user_id: Optional[int] = None) -> list[dict]:
             period = str(extra.get("period") or "")
             try:
                 from app.services.bookmakers.match_live import match_elapsed_seconds
-                secs = match_elapsed_seconds(sport=sport, period=period, clock=clock)
+                secs = match_elapsed_seconds(
+                    sport=sport,
+                    period=period,
+                    clock=clock,
+                    league=str(getattr(match, "league", "") or ""),
+                )
                 if secs is not None:
                     played_mins = secs / 60.0
             except Exception:
@@ -331,7 +341,7 @@ async def load_risk_patterns(user_id: Optional[int] = None) -> list[dict]:
         dim_stats[k1]["meta"] = {"sport": sport, "selection": sel, "line_range": lr}
 
         # 维度2: sport + selection + time_range
-        tr = _time_range(played_mins, sport) if played_mins > 0 else "unknown"
+        tr = _time_range(played_mins, sport, str(match.league or "")) if played_mins > 0 else "unknown"
         k2 = f"{sport}|{sel}|time:{tr}"
         _acc(k2, won)
         dim_stats[k2]["meta"] = {"sport": sport, "selection": sel, "time_range": tr}
@@ -393,6 +403,7 @@ def check_risk_patterns(
     odds: Optional[float],
     confidence: Optional[float],
     patterns: list[dict],
+    league: str = "",
 ) -> Optional[str]:
     """检查当前比赛是否命中已知高风险模式。
 
@@ -410,7 +421,7 @@ def check_risk_patterns(
 
     # 预计算当前比赛的各维度值
     cur_line_range = _line_range(line_val, sport_l) if line_val > 0 else None
-    cur_time_range = _time_range(mins_val, sport_l) if mins_val > 0 else None
+    cur_time_range = _time_range(mins_val, sport_l, league) if mins_val > 0 else None
     cur_odds_range = _odds_range(odds_val) if odds_val > 0 else None
     cur_conf_range = _conf_bucket(conf_val) if conf_val > 0 else None
 

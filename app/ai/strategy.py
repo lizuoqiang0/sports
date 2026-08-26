@@ -10,7 +10,6 @@ from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Optional
 
 from app.core.convert import to_float as _as_float, to_int as _as_int
-from app.ai.precision_profile import FOOTBALL_UNDER_PROFILE
 
 from pydantic import BaseModel
 from app.config import settings
@@ -33,10 +32,11 @@ class StrategyConfig(BaseModel):
     min_confidence: float = settings.AI_MIN_CONFIDENCE    # 最低AI置信度
     min_odds: float = settings.AI_MIN_ODDS                  # 最低赔率
     max_odds: Optional[float] = settings.AI_MAX_ODDS        # 最高赔率
-    high_precision_mode: bool = False
+    high_precision_mode: bool = False  # 兼容历史/回测
+    balanced_target_mode: bool = False
 
 
-DEFAULT_STRATEGY = StrategyConfig(name="simple", high_precision_mode=True)
+DEFAULT_STRATEGY = StrategyConfig(name="simple", balanced_target_mode=True)
 AI_MIN_STAKE = 1.0
 
 # ── 运动类型风控参数（单一配置源：闸门2.7 双向风控 + 闸门2.9 under余量）──
@@ -191,6 +191,7 @@ def ai_config_response_payload(ai_config: Any | None) -> dict[str, Any]:
             "scan_interval_min": round(scan_interval_sec / 60, 2),
             "stream_bet_mode": True,
             "high_precision_mode": bool(effective.high_precision_mode),
+            "balanced_target_mode": bool(effective.balanced_target_mode),
         },
     }
 
@@ -371,7 +372,14 @@ class StrategyEngine:
 
         # ── A3：置信度（用户 AI 配置主导 + 无基本面加严 + 胜率自适应）──
         sport_l = str(sport or "").lower().strip()
-        RISK = SPORT_RISK.get(sport_l, SPORT_RISK["default"])
+        league = str(match_info.get("league") or analysis.get("league") or "")
+        RISK = dict(SPORT_RISK.get(sport_l, SPORT_RISK["default"]))
+        if sport_l == "basketball":
+            from app.ai.league_focus import basketball_regulation_minutes
+
+            RISK["margin_full_mins"] = basketball_regulation_minutes(league)
+            if self.config.balanced_target_mode:
+                RISK["margin_min_mins"] = RISK["margin_full_mins"] * 0.25
         ctx_source = str(analysis.get("context_source") or "none").strip().lower()
         has_fundamentals = ctx_source not in ("", "none")
         total_line = _as_float(
@@ -394,6 +402,7 @@ class StrategyEngine:
                 sport=sport_l,
                 period=str(match_info.get("period") or ""),
                 clock=str(match_info.get("clock") or "").strip(),
+                league=league,
             )
             if elapsed_secs is not None:
                 played_mins = elapsed_secs / 60.0
@@ -607,7 +616,8 @@ class StrategyEngine:
         # 实盘数据显示高 conf 存在反向相关，但不直接丢弃信号，
         # 而是封顶到安全值，让闸门其余阶段继续评估。
         _REVERSE_CONF_CAP = 0.72
-        if prediction == "under" and conf_f >= 0.74:
+        if (prediction == "under" and conf_f >= 0.74
+                and not self.config.balanced_target_mode):
             logger.info(
                 "[A3/P7] ⚠️ 封顶 match=%s | under conf=%.2f≥0.74 → 封顶%.2f（高conf反向风险）",
                 mid, conf_f, _REVERSE_CONF_CAP,
@@ -615,7 +625,7 @@ class StrategyEngine:
             conf_f = _REVERSE_CONF_CAP
             analysis["confidence"] = round(conf_f, 4)
             analysis["confidence_capped_reason"] = "under高置信度反向风险封顶0.72"
-        elif prediction == "over" and conf_f >= 0.73:
+        elif prediction == "over" and conf_f >= 0.73 and not self.config.balanced_target_mode:
             logger.info(
                 "[A3/P9] ⚠️ 封顶 match=%s | over conf=%.2f≥0.73 → 封顶%.2f（高conf反向风险）",
                 mid, conf_f, _REVERSE_CONF_CAP,
@@ -673,6 +683,7 @@ class StrategyEngine:
                     odds=float(odds_data.get(prediction) or analysis.get("odds") or 0),
                     confidence=conf_f,
                     patterns=patterns,
+                    league=league,
                 )
                 if pattern_hit:
                     logger.info(
@@ -695,6 +706,8 @@ class StrategyEngine:
             # ── B1-over 链（独立参数：over_min_played_mins/over_late_block_mins/
             #    over_min_line/over_max_line）──
             over_min_played = float(RISK.get("over_min_played_mins", 20.0))
+            if self.config.balanced_target_mode and sport_l == "basketball":
+                over_min_played = float(RISK.get("margin_full_mins", 40.0)) * 0.25
             if played_mins is not None and played_mins < over_min_played:
                 logger.info(
                     "[B1/over风控] ❌ 拒绝 match=%s | %s over早段不下 mins=%.1f<%.1f",
@@ -717,6 +730,14 @@ class StrategyEngine:
             if total_line is not None:
                 over_min_line = float(RISK.get("over_min_line", 2.0))
                 over_max_line = float(RISK.get("over_max_line", 4.5))
+                if self.config.balanced_target_mode and sport_l == "football":
+                    over_min_line, over_max_line = 2.25, 3.5
+                if self.config.balanced_target_mode and sport_l == "basketball":
+                    full = float(RISK.get("margin_full_mins", 40.0))
+                    if full >= 48.0:
+                        over_min_line, over_max_line = 185.0, 260.0
+                    else:
+                        over_min_line, over_max_line = 120.0, 200.0
                 # 动态线距调整：基于近期亏损注单的盘口线分布
                 try:
                     from app.ai.calibration import get_dynamic_line_adjustment, load_risk_tuning
@@ -758,7 +779,8 @@ class StrategyEngine:
                         f"{sport_l} 高线over（line={total_line:.2f}）残余进球空间不足",
                     )
                 # ── P4：高置信+大差距over拒绝（conf≥0.70但当前总分远低于线，AI过度自信）──
-                if conf_f >= 0.70 and current_total < total_line - 1.5:
+                if (sport_l == "football" and conf_f >= 0.70
+                        and current_total < total_line - 1.5):
                     logger.info(
                         "[B1/over风控/P4] ❌ 拒绝 match=%s | 高置信大差距over conf=%.2f total=%d line=%.2f gap=%.2f",
                         mid, conf_f, current_total, total_line, total_line - current_total,
@@ -798,6 +820,12 @@ class StrategyEngine:
             # 动态线距调整：基于近期亏损注单的盘口线分布
             _under_min_line_dyn = float(RISK.get("under_min_line", 1.5))
             _under_max_line_dyn = float(RISK.get("under_max_line", 5.0))
+            if self.config.balanced_target_mode and sport_l == "basketball":
+                full = float(RISK.get("margin_full_mins", 40.0))
+                if full >= 48.0:
+                    _under_min_line_dyn, _under_max_line_dyn = 185.0, 260.0
+                else:
+                    _under_min_line_dyn, _under_max_line_dyn = 120.0, 200.0
             try:
                 from app.ai.calibration import get_dynamic_line_adjustment, load_risk_tuning
                 _rt = await load_risk_tuning(user_id=self.user_id)
@@ -837,15 +865,18 @@ class StrategyEngine:
                         analysis,
                         f"足球under进入补时/加时段（{played_mins:.0f}'），保护性跳过",
                     )
-            if sport_l == "basketball" and played_mins is not None and played_mins < float(RISK.get("under_min_played_mins", 14.0)):
+            basketball_under_min = float(RISK.get("under_min_played_mins", 14.0))
+            if self.config.balanced_target_mode and sport_l == "basketball":
+                basketball_under_min = float(RISK.get("margin_full_mins", 40.0)) * 0.25
+            if sport_l == "basketball" and played_mins is not None and played_mins < basketball_under_min:
                     logger.info(
                         "[B1/under风控] ❌ 拒绝 match=%s | 篮球under早段不下 mins=%.1f<%.1f",
-                        mid, played_mins, float(RISK.get("under_min_played_mins", 14.0)),
+                        mid, played_mins, basketball_under_min,
                     )
                     return self._reject(
                         match_info,
                         analysis,
-                        f"篮球under前{int(float(RISK.get('under_min_played_mins', 14.0)))}分钟样本过小，保护性跳过",
+                        f"篮球under前{basketball_under_min:.0f}分钟样本过小，保护性跳过",
                     )
             if sport_l == "basketball" and total_line is not None and total_line >= _under_max_line_dyn:
                     logger.info(
@@ -1027,6 +1058,8 @@ class StrategyEngine:
             # 所需进球 = line - 当前总分（over 需要剩余时间产出这些球）
             needed = max(0.0, total_line - current_total)
             over_min_remaining = float(RISK.get("over_min_remaining_goals", 2.0))
+            if self.config.balanced_target_mode and sport_l == "basketball":
+                over_min_remaining = max(over_min_remaining, float(total_line) * 0.65)
             if needed >= over_min_remaining:
                 logger.info(
                     "[D1/over速率] ❌ 拒绝 match=%s | %s %.0f' 还需%.2f球≥%.2f 基本无解",
@@ -1227,12 +1260,41 @@ class StrategyEngine:
             mid, conf_f, required_ev_conf, breakeven_conf, ev_conf_edge, odds, conf_f * odds - 1.0,
         )
 
-        # ── E3：高精度自动投注档位 ──
+        # ── E3：70%–80%平衡自动投注档位 ──
+        if self.config.balanced_target_mode:
+            from app.ai.balanced_profile import balanced_auto_eligible
+
+            eligible, profile_reason = balanced_auto_eligible(
+                sport=sport_l,
+                league=league,
+                selection=prediction,
+                confidence=conf_f,
+                line=total_line,
+                odds=odds,
+                played_minutes=played_mins,
+            )
+            if not eligible:
+                logger.info(
+                    "[E3/平衡档位] ❌ 拒绝 match=%s | league=%s sport=%s sel=%s conf=%.2f line=%s odds=%.2f mins=%s reason=%s",
+                    mid, league, sport_l, prediction, conf_f, total_line, odds,
+                    played_mins, profile_reason,
+                )
+                return self._reject(match_info, analysis, f"70%-80%平衡档位: {profile_reason}")
+            logger.info(
+                "[E3/平衡档位] ✅ 通过 match=%s | league=%s %s %s conf=%.2f line=%.2f odds=%.2f mins=%.1f %s",
+                mid, league, sport_l, prediction, conf_f, float(total_line), odds,
+                float(played_mins), profile_reason,
+            )
+
+        # ── E3兼容：旧高精度历史回测档位 ──
         # 110 笔真实结算的可复现区间为 11 中 9（81.8%）：足球 under、
         # 最终校准概率≥0.70、线(2.0,4.5)、赔率[1.70,2.00)、45'~85'。
         # 这是历史点估计而非承诺；完整 A-E 闸门仍须全部通过。
         if self.config.high_precision_mode:
-            from app.ai.precision_profile import high_precision_history_eligible
+            from app.ai.precision_profile import (
+                FOOTBALL_UNDER_PROFILE,
+                high_precision_history_eligible,
+            )
 
             if not high_precision_history_eligible(
                 sport=sport_l,

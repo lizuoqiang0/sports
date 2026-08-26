@@ -275,7 +275,7 @@ async def list_live_match_ids(
         DEFAULT_MAX_ODDS,
         DEFAULT_MIN_ODDS,
         skip_reason_for_match,
-        sort_just_started_first,
+        sort_focused_leagues_first,
         total_odds_meet_min,
     )
     lo = min_odds
@@ -434,7 +434,7 @@ async def list_live_match_ids(
                 continue
             kept.append(m)
 
-        kept = sort_just_started_first(kept)
+        kept = sort_focused_leagues_first(kept)
         out = [int(m.id) for m in kept[:limit]]
         if any(skipped.values()):
             logger.info(
@@ -617,12 +617,12 @@ async def _run_recs_job(
                 await db.commit()
             by_id = {int(m.id): m for m in rows}
             ordered = [by_id[i] for i in match_ids if i in by_id]
-            from app.ai.analysis_filters import elapsed_sort_key, sort_just_started_first
+            from app.ai.analysis_filters import focused_league_sort_key, sort_focused_leagues_first
 
-            ordered = sort_just_started_first(ordered)
+            ordered = sort_focused_leagues_first(ordered)
             clustered = group_matches_by_fixture(ordered)
             clustered.sort(
-                key=lambda g: min((elapsed_sort_key(x) for x in g), default=(10**9, 0, 0))
+                key=lambda g: min((focused_league_sort_key(x) for x in g), default=(0, 10**9, 0, 0))
             )
             groups = [[int(m.id) for m in g] for g in clustered][:scan_lim]
 
