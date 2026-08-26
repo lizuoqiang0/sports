@@ -2,6 +2,7 @@
 OB Sports Betting Platform - FastAPI 主入口
 """
 import logging
+import re
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -23,6 +24,31 @@ logging.basicConfig(
     level=getattr(logging, settings.LOG_LEVEL),
     format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
 )
+
+
+class _RedactTokenFilter(logging.Filter):
+    """避免兼容旧客户端的 WebSocket URL Token 进入 Uvicorn 日志。"""
+
+    _pattern = re.compile(r"([?&]token=)[^\s\"']+", re.IGNORECASE)
+
+    @classmethod
+    def _redact(cls, value):
+        if isinstance(value, str):
+            return cls._pattern.sub(r"\1<redacted>", value)
+        return value
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.msg = self._redact(record.msg)
+        if isinstance(record.args, tuple):
+            record.args = tuple(self._redact(value) for value in record.args)
+        elif isinstance(record.args, dict):
+            record.args = {key: self._redact(value) for key, value in record.args.items()}
+        return True
+
+
+_token_log_filter = _RedactTokenFilter()
+logging.getLogger("uvicorn.error").addFilter(_token_log_filter)
+logging.getLogger("uvicorn.access").addFilter(_token_log_filter)
 logger = logging.getLogger("ob.main")
 
 _WEAK_SECRETS = {

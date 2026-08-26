@@ -948,7 +948,7 @@ async def ui_place_pinnacle_total(
                   if (Math.abs(picked.price - Number(odds)) > 0.15) continue;
                   const localText = textItems.slice(Math.max(0, i - 3), Math.min(windowEnd, underAt + 5))
                     .map((x) => x.raw).join(' ');
-                  if (/(主队总|客队总|球队总|team\s*total|角球|corners|罚牌|黄牌|红牌|cards|球员|player)/i.test(localText)) continue;
+                  if (/(主队总|客队总|球队总|team\\s*total|角球|corners|罚牌|黄牌|红牌|cards|球员|player)/i.test(localText)) continue;
                   const clickEl = picked.item.el.closest('button, a, [role="button"]') || picked.item.el;
                   sequenceCandidates.push({
                     clickEl,

@@ -1,5 +1,5 @@
-import { createContext, useContext, useState, useEffect } from 'react'
-import { authAPI } from '../lib/api.js'
+import { createContext, useCallback, useContext, useState, useEffect } from 'react'
+import { authAPI, clearStoredSession, refreshAccessToken } from '../lib/api.js'
 
 const AuthContext = createContext(null)
 
@@ -15,23 +15,54 @@ export function AuthProvider({ children }) {
   const [token, setToken] = useState(localStorage.getItem('access_token'))
   const [loading, setLoading] = useState(true)
 
+  const clearSession = useCallback(() => {
+    localStorage.removeItem('access_token')
+    localStorage.removeItem('refresh_token')
+    setToken(null)
+    setUser(null)
+  }, [])
+
   useEffect(() => {
+    let active = true
+    const handleTokenUpdated = (event) => {
+      if (active) setToken(event.detail?.accessToken || null)
+    }
+    const handleSessionExpired = () => {
+      if (active) clearSession()
+    }
+    window.addEventListener('auth-token-updated', handleTokenUpdated)
+    window.addEventListener('auth-session-expired', handleSessionExpired)
+
     const init = async () => {
       const storedToken = localStorage.getItem('access_token')
       if (storedToken) {
         try {
           const res = await authAPI.me()
-          setUser(normalizeUser(res.data))
+          if (active) setUser(normalizeUser(res.data))
         } catch (err) {
           console.error('Token验证失败:', err)
-          localStorage.removeItem('access_token')
-          localStorage.removeItem('refresh_token')
+          if (active) clearSession()
         }
       }
-      setLoading(false)
+      if (active) setLoading(false)
     }
     init()
-  }, [])
+    return () => {
+      active = false
+      window.removeEventListener('auth-token-updated', handleTokenUpdated)
+      window.removeEventListener('auth-session-expired', handleSessionExpired)
+    }
+  }, [clearSession])
+
+  const refreshSession = useCallback(async () => {
+    try {
+      return await refreshAccessToken()
+    } catch (err) {
+      console.error('Token刷新失败:', err)
+      clearSession()
+      return null
+    }
+  }, [clearSession])
 
   const login = async (username, password) => {
     const res = await authAPI.login(username, password)
@@ -51,10 +82,8 @@ export function AuthProvider({ children }) {
     } catch (e) {
       /* ignore */
     }
-    localStorage.removeItem('access_token')
-    localStorage.removeItem('refresh_token')
-    setToken(null)
-    setUser(null)
+    clearStoredSession()
+    clearSession()
   }
 
   const updateUser = (userData) => {
@@ -62,7 +91,7 @@ export function AuthProvider({ children }) {
   }
 
   return (
-    <AuthContext.Provider value={{ user, token, loading, login, logout, updateUser }}>
+    <AuthContext.Provider value={{ user, token, loading, login, logout, refreshSession, updateUser }}>
       {children}
     </AuthContext.Provider>
   )

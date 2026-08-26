@@ -1,6 +1,48 @@
 import axios from 'axios'
 
 const API_BASE = '/api/v1'
+let refreshPromise = null
+
+function emitAuthEvent(name, detail = {}) {
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent(name, { detail }))
+  }
+}
+
+export function clearStoredSession() {
+  localStorage.removeItem('access_token')
+  localStorage.removeItem('refresh_token')
+  emitAuthEvent('auth-session-expired')
+}
+
+export async function refreshAccessToken() {
+  if (refreshPromise) return refreshPromise
+
+  const storedRefreshToken = localStorage.getItem('refresh_token')
+  if (!storedRefreshToken) {
+    clearStoredSession()
+    throw new Error('缺少刷新令牌')
+  }
+
+  refreshPromise = axios
+    .post(`${API_BASE}/auth/refresh`, { refresh_token: storedRefreshToken })
+    .then((res) => {
+      const { access_token: accessToken, refresh_token: refreshToken } = res.data.data
+      localStorage.setItem('access_token', accessToken)
+      localStorage.setItem('refresh_token', refreshToken)
+      emitAuthEvent('auth-token-updated', { accessToken, refreshToken })
+      return accessToken
+    })
+    .catch((err) => {
+      clearStoredSession()
+      throw err
+    })
+    .finally(() => {
+      refreshPromise = null
+    })
+
+  return refreshPromise
+}
 
 // 创建axios实例
 export const api = axios.create({
@@ -22,27 +64,19 @@ api.interceptors.response.use(
   (res) => res.data,  // 直接返回data层
   async (err) => {
     const original = err.config || {}
-    if (err.response?.status === 401 && !original._retry) {
+    const authPath = String(original.url || '')
+    const isCredentialRequest = ['/auth/login', '/auth/register', '/auth/refresh']
+      .some((path) => authPath.endsWith(path))
+    if (err.response?.status === 401 && !original._retry && !isCredentialRequest) {
       original._retry = true
-      const refreshToken = localStorage.getItem('refresh_token')
-      if (refreshToken) {
-        try {
-          // 用裸 axios，避免走 unwrap 拦截器
-          const res = await axios.post(`${API_BASE}/auth/refresh`, { refresh_token: refreshToken })
-          const { access_token, refresh_token } = res.data.data
-          localStorage.setItem('access_token', access_token)
-          localStorage.setItem('refresh_token', refresh_token)
-          original.headers = original.headers || {}
-          original.headers.Authorization = `Bearer ${access_token}`
-          // 重试走同一 api 实例，保持 data 解包
-          return api.request(original)
-        } catch (refreshErr) {
-          localStorage.removeItem('access_token')
-          localStorage.removeItem('refresh_token')
-          window.location.href = '/login'
-        }
-      } else {
-        window.location.href = '/login'
+      try {
+        const accessToken = await refreshAccessToken()
+        original.headers = original.headers || {}
+        original.headers.Authorization = `Bearer ${accessToken}`
+        // 重试走同一 api 实例，保持 data 解包
+        return api.request(original)
+      } catch (refreshErr) {
+        return Promise.reject(refreshErr.response?.data || refreshErr)
       }
     }
     return Promise.reject(err.response?.data || err)

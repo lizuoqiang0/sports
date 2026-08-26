@@ -87,23 +87,38 @@ async def odds_websocket(websocket: WebSocket, token: Optional[str] = None):
         }
     }
     """
+    protocols = [
+        item.strip()
+        for item in (websocket.headers.get("sec-websocket-protocol") or "").split(",")
+        if item.strip()
+    ]
+    protocol_token = protocols[1] if len(protocols) >= 2 and protocols[0] == "access-token" else None
+    selected_subprotocol = "access-token" if protocol_token else None
+    auth_token = protocol_token or token
+
+    async def reject_unauthorized(reason: str) -> None:
+        # 先完成握手再关闭，让浏览器可以读取 4001 并刷新 Token；
+        # 若在 accept 前 close，ASGI 只会返回无法区分原因的 HTTP 403。
+        await websocket.accept(subprotocol=selected_subprotocol)
+        await websocket.close(code=4001, reason=reason)
+
     # Token鉴权
-    if not token:
-        await websocket.close(code=4001, reason="缺少Token")
+    if not auth_token:
+        await reject_unauthorized("缺少Token")
         return
 
     try:
-        payload = decode_token(token)
+        payload = decode_token(auth_token)
         if payload.get("type") != TokenType.ACCESS.value:
-            await websocket.close(code=4001, reason="Token类型错误")
+            await reject_unauthorized("Token类型错误")
             return
         user_id = int(payload.get("sub"))
     except Exception:
-        await websocket.close(code=4001, reason="Token无效")
+        await reject_unauthorized("Token无效")
         return
 
     # 连接管理
-    await manager.connect(websocket, user_id)
+    await manager.connect(websocket, user_id, subprotocol=selected_subprotocol)
 
     try:
         while True:

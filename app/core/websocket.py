@@ -116,8 +116,13 @@ class ConnectionManager:
         elif kind == "all":
             await self._local_broadcast_all(message)
 
-    async def connect(self, websocket: WebSocket, user_id: int):
-        await websocket.accept()
+    async def connect(
+        self,
+        websocket: WebSocket,
+        user_id: int,
+        subprotocol: Optional[str] = None,
+    ):
+        await websocket.accept(subprotocol=subprotocol)
         async with self._lock:
             if user_id not in self.active_connections:
                 self.active_connections[user_id] = set()
