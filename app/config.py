@@ -96,7 +96,7 @@ class Settings(BaseSettings):
     # --- DeepSeek API（唯一模型，OpenAI-compatible 接口） ---
     DEEPSEEK_API_KEY: Optional[str] = None
     DEEPSEEK_BASE_URL: str = "https://api.deepseek.com/v1"
-    DEEPSEEK_MODEL: str = "deepseek-v4-pro-0813"
+    DEEPSEEK_MODEL: str = "deepseek/deepseek-v4-pro-0813"
 
     # --- AI 分析配置 ---
     DEEPSEEK_TIMEOUT_SEC: float = 90.0      # 单次 DeepSeek 分析总超时（含一次降配重试）

@@ -227,7 +227,7 @@ _record_alias_candidate()
 # === DeepSeek API ===
 DEEPSEEK_API_KEY: Optional[str] = None
 DEEPSEEK_BASE_URL: str = "https://api.deepseek.com/v1"
-DEEPSEEK_MODEL: str = "deepseek-v4-pro-0813"
+DEEPSEEK_MODEL: str = "deepseek/deepseek-v4-pro-0813"
 DEEPSEEK_TIMEOUT_SEC: float = 90.0          # 单次 DeepSeek 分析总超时（含一次降配重试）
 LLM_CLIENT_TIMEOUT_SEC: float = 50.0   # OpenAI-compatible 客户端超时（须 ≥ DEEPSEEK_TIMEOUT_SEC）
 LLM_MAX_TOKENS: int = 3072             # DeepSeek 最大输出 tokens
