@@ -458,7 +458,16 @@ class AIBettingEngine:
 
                 # 逐方向评估闸门
                 for direction, dir_conf in directions:
+                    from app.ai.balanced_profile import balanced_min_confidence
+                    from app.ai.league_focus import league_focus_level
+
                     dir_odds = float(odds_map.get(direction) or rec.get("odds") or 0)
+                    required_dir_conf = balanced_min_confidence(
+                        str(best.get("sport") or ""), direction, str(best.get("league") or "")
+                    )
+                    focus_level = league_focus_level(
+                        str(best.get("sport") or ""), str(best.get("league") or "")
+                    )
                     dir_reasoning = str(
                         analysis_obj.get(f"{direction}_reasoning")
                         or analysis_obj.get("reasoning")
@@ -509,6 +518,11 @@ class AIBettingEngine:
                             "should_bet": True,
                             "confidence": float(decision.confidence or dir_conf),
                             "win_rate": round(float(decision.confidence or dir_conf) * 100, 1),
+                            "final_calibrated_confidence": float(decision.confidence or dir_conf),
+                            "final_calibrated_win_rate": round(float(decision.confidence or dir_conf) * 100, 1),
+                            "required_confidence": required_dir_conf,
+                            "required_win_rate": round(required_dir_conf * 100, 1),
+                            "league_focus_level": focus_level,
                             "suggested_stake": float(decision.suggested_stake or 0),
                             "reasoning": decision.reasoning,
                             "selection": decision.selection,
@@ -523,8 +537,15 @@ class AIBettingEngine:
                         "away_team": best.get("away_team", "?"),
                         "selection": direction,
                         "confidence": dir_conf,
+                        "final_calibrated_confidence": dir_conf,
+                        "final_calibrated_win_rate": round(dir_conf * 100, 1),
+                        "required_confidence": required_dir_conf,
+                        "required_win_rate": round(required_dir_conf * 100, 1),
+                        "league_focus_level": focus_level,
                         "odds": dir_odds,
                         "should_bet": bool(decision.should_bet),
+                        "status": "approved" if decision.should_bet else "rejected",
+                        "reasoning": decision.reasoning,
                         "bet_type": bt,
                         "under_conf": under_conf,
                         "over_conf": over_conf,
@@ -1655,6 +1676,15 @@ async def analyze_and_recommend(
         raw_confidence = float(decision.confidence or conf_use or 0)
         raw_win_rate = float(win_rate if win_rate > 0 else round(raw_confidence * 100, 1))
         raw_odds = float(sel_odds or decision.odds or 0)
+        from app.ai.balanced_profile import balanced_min_confidence
+        from app.ai.league_focus import league_focus_level
+
+        final_required_conf = balanced_min_confidence(
+            str(sport_key or ""), sel, str(match_info.get("league") or "")
+        ) if sel in ("under", "over") else 1.0
+        final_focus_level = league_focus_level(
+            str(sport_key or ""), str(match_info.get("league") or "")
+        )
 
         context_meta = {
             "source": ctx.get("source") or "none",
@@ -1693,6 +1723,11 @@ async def analyze_and_recommend(
                 "win_rate": raw_win_rate,
                 "raw_confidence": raw_confidence,
                 "raw_win_rate": raw_win_rate,
+                "final_calibrated_confidence": raw_confidence,
+                "final_calibrated_win_rate": round(raw_confidence * 100, 1),
+                "required_confidence": final_required_conf,
+                "required_win_rate": round(final_required_conf * 100, 1),
+                "league_focus_level": final_focus_level,
                 "suggested_stake": float(sug_stake),
                 "reasoning": decision.reasoning,
                 "risk_score": decision.risk_score,

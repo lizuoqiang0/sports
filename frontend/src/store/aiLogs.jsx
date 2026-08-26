@@ -148,12 +148,17 @@ export function ingestAiEventLog(detail) {
     const sel = skipped ? '跳过' : String(data.selection)
     const market = String(data?.bet_type || 'total')
     const marketLabel = market === 'total' ? '全场大小球' : market || '-'
-    const tag = skipped ? '跳过' : (data?.should_bet ? '✓推荐' : _fmtWinRate(_num(data?.confidence, 0) * 100))
-    const reason = skipped ? _shortReason(data?.reasoning) : ''
+    const finalPct = _num(data?.final_calibrated_win_rate, _num(data?.confidence, 0) * 100)
+    const requiredPct = _num(data?.required_win_rate, 0)
+    const tag = skipped
+      ? '跳过'
+      : (data?.should_bet ? `✓推荐 ${_fmtWinRate(finalPct)}` : _fmtWinRate(finalPct))
+    const threshold = !skipped && requiredPct > 0 ? `/门槛${_fmtWinRate(requiredPct)}` : ''
+    const reason = (skipped || data?.status === 'rejected') ? _shortReason(data?.reasoning) : ''
     pushLogOnce(
       eventKey,
       'analysis',
-      `${data?.home_team || '-'} vs ${data?.away_team || '-'}  ${marketLabel} ${sel}${skipped ? '' : ` @ ${_fmtOdds(data?.odds)}`}  ${tag}${reason ? ` · ${reason}` : ''}`,
+      `${data?.home_team || '-'} vs ${data?.away_team || '-'}  ${marketLabel} ${sel}${skipped ? '' : ` @ ${_fmtOdds(data?.odds)}`}  ${tag}${threshold}${reason ? ` · ${reason}` : ''}`,
       data,
     )
     return

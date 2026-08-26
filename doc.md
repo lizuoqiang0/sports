@@ -315,15 +315,16 @@ under/over 双向独立闸门参数，足球和篮球各自一套：
 胜率保证；最终校准概率、A-E全闸门和有效赔率仍必须同时通过。
 
 - 足球明确重点：五大联赛、沙特职业/超级联赛、美职联、巴甲、葡超、荷甲、阿超、
-  墨超、欧冠。under最终概率≥0.70，over≥0.72。
-- 其他合规超级/甲级联赛：under≥0.70，over≥0.75；普通职业赛事只有under≥0.75、
-  over≥0.78的极强最终信号才可自动执行。预备队、青年、女子、友谊赛、
+  墨超、欧冠，以及其他合规超级/甲级联赛。under最终校准概率≥0.68，over≥0.72。
+- 其他合规足球职业赛事：under≥0.70、over≥0.78。预备队、青年、女子、友谊赛、
   乙/丙/丁级和MLS NEXT不会因名称包含“联赛”而获得优先级。
-- 篮球明确重点：NBA、ACB、欧洲篮球联赛，under/over均≥0.72；其他合规篮球
-  赛事要求最终概率≥0.78。
+- 篮球明确重点：NBA、ACB、欧洲篮球联赛，under≥0.68、over≥0.72；其他合规
+  篮球职业赛事under≥0.70、over≥0.78。
 - 足球窗口：under盘口(2.0,4.5)/30'–85'；over盘口(2.25,3.5)/25'–75'。
 - 篮球窗口：常规时间25%–87.5%；NBA按48分钟、ACB/欧篮联按40分钟计算节奏。
 - 自动赔率统一限制为 `[1.70,2.00)`；重点联赛优先于普通赛事进入分析队列。
+- 前端推荐卡和AI日志显示“最终校准概率 / 自动门槛”，该数值是方向分析、基本面、
+  盘口、比赛时间、节奏、历史校准和全闸门共用的唯一自动下注概率。
 
 `python3 scripts/backtest_balanced_profile.py` 可只读回放平衡档；
 `python3 scripts/backtest_precision_profile.py` 保留旧高精度档作为对照。历史重点联赛
@@ -502,7 +503,7 @@ CMD ["/app/scripts/docker_entrypoint_backend.sh"]
 | `test_venue_recovery.py` | 平博页面状态恢复 | 15 |
 | `test_integration.py` | 集成测试（全链路/竞态/热更新/玩法白名单） | 16 |
 | `test_sync_live_odds_versions.py` | 滚球赔率版本收敛（每站/玩法仅最新有效行） | 1 |
-| `test_precision_profile.py` | 最终概率一致性 + 联赛优先级 + NBA/FIBA计时 + 平衡档边界 | 12 |
+| `test_precision_profile.py` | 最终概率一致性 + 联赛优先级 + NBA/FIBA计时 + 平衡档边界 | 14 |
 | `test_over_gates.py` | 大小球双闸门链（under/over 互不参与） | 12 |
 | `test_one_click_bet.py` | 一键投注端到端 | 12 |
 | `test_handicap_exclusion.py` | 让球盘排除 + 赔率匹配 | 60+ |

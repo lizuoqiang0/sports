@@ -139,10 +139,10 @@ def test_production_balanced_profile_allows_validated_under_window():
 
 
 def test_focus_league_balanced_thresholds_cover_both_directions():
-    assert balanced_min_confidence("football", "under", "英格兰超级联赛") == 0.70
-    assert balanced_min_confidence("football", "under", "瑞典甲级联赛") == 0.70
+    assert balanced_min_confidence("football", "under", "英格兰超级联赛") == 0.68
+    assert balanced_min_confidence("football", "under", "瑞典甲级联赛") == 0.68
     assert balanced_min_confidence("football", "over", "英格兰超级联赛") == 0.72
-    assert balanced_min_confidence("basketball", "under", "NBA") == 0.72
+    assert balanced_min_confidence("basketball", "under", "NBA") == 0.68
     assert balanced_min_confidence("basketball", "over", "欧洲篮球联赛") == 0.72
 
 
@@ -209,6 +209,37 @@ def test_balanced_profile_requires_exceptional_signal_for_non_focus_basketball()
     )
     assert ok is False
     assert "低于平衡档0.78" in why
+
+
+def test_other_professional_under_uses_070_threshold_for_both_sports():
+    assert balanced_min_confidence("football", "under", "芬兰丙级联赛") == 0.70
+    assert balanced_min_confidence("basketball", "under", "墨西哥职业篮球联赛") == 0.70
+    assert balanced_min_confidence("football", "over", "芬兰丙级联赛") == 0.78
+    assert balanced_min_confidence("basketball", "over", "墨西哥职业篮球联赛") == 0.78
+
+
+def test_exact_requested_thresholds_are_inclusive():
+    cases = (
+        ("football", "英格兰超级联赛", "under", 0.68, 2.75, 1.85, 55.0),
+        ("football", "英格兰超级联赛", "over", 0.72, 2.75, 1.85, 45.0),
+        ("football", "芬兰丙级联赛", "under", 0.70, 2.75, 1.85, 55.0),
+        ("football", "芬兰丙级联赛", "over", 0.78, 2.75, 1.85, 45.0),
+        ("basketball", "NBA", "under", 0.68, 220.5, 1.85, 24.0),
+        ("basketball", "NBA", "over", 0.72, 220.5, 1.85, 24.0),
+        ("basketball", "墨西哥职业篮球联赛", "under", 0.70, 164.5, 1.85, 20.0),
+        ("basketball", "墨西哥职业篮球联赛", "over", 0.78, 164.5, 1.85, 20.0),
+    )
+    for sport, league, selection, confidence, line, odds, played in cases:
+        ok, why = balanced_auto_eligible(
+            sport=sport,
+            league=league,
+            selection=selection,
+            confidence=confidence,
+            line=line,
+            odds=odds,
+            played_minutes=played,
+        )
+        assert ok is True, (league, selection, why)
 
 
 def test_balanced_strategy_can_execute_nba_total_after_all_gates():

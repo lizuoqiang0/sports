@@ -20,9 +20,9 @@ export function formatAiRecommendationReason({ recommendation, analysis, strateg
   const raw = cleanReasonText(rec.reasoning || ana.reasoning || '')
   const selection = String(rec.selection || ana.prediction || '').toLowerCase()
   const selectionLabel = SEL_LABEL[selection] || '该方向'
-  const conf = Number(rec.confidence ?? ana.confidence)
+  const conf = Number(rec.final_calibrated_confidence ?? rec.confidence ?? ana.confidence)
   const confPct = Number.isFinite(conf) ? `${(conf * 100).toFixed(0)}%` : null
-  const minConf = Number(strat.min_confidence)
+  const minConf = Number(rec.required_confidence ?? strat.min_confidence)
   const minConfPct = Number.isFinite(minConf) ? `${(minConf * 100).toFixed(0)}%` : null
   const odds = Number(rec.odds)
   const oddsText = Number.isFinite(odds) && odds > 0 ? odds.toFixed(2) : null

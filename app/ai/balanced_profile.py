@@ -16,13 +16,14 @@ def balanced_min_confidence(sport: str, selection: str, league: str) -> float:
     focus = league_focus_level(sport_l, league)
     if sport_l in ("football", "soccer"):
         if selection_l == "under":
-            return 0.70 if focus >= 1 else 0.75
+            return 0.68 if focus >= 1 else 0.70
         if selection_l == "over":
-            # over历史波动较高：明确重点赛事0.72；泛超级/甲级需0.75。
-            return 0.72 if focus >= 2 else 0.75 if focus == 1 else 0.78
+            return 0.72 if focus >= 1 else 0.78
     if sport_l == "basketball":
-        # NBA / ACB / 欧篮联优先；其他合规篮球赛事仅接受极强信号。
-        return 0.72 if focus >= 2 and selection_l in ("under", "over") else 0.78
+        if selection_l == "under":
+            return 0.68 if focus >= 2 else 0.70
+        if selection_l == "over":
+            return 0.72 if focus >= 2 else 0.78
     return 1.0
 
 

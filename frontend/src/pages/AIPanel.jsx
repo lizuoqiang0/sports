@@ -1031,7 +1031,10 @@ export default function AIPanelPage() {
                 strategy: rec.strategy,
               })
               const isManual = (engineStatus?.bet_mode || betMode) !== 'active'
-              const winRate = rec_data.win_rate ?? ((rec_data.confidence || 0) * 100)
+              const winRate = rec_data.final_calibrated_win_rate
+                ?? rec_data.win_rate
+                ?? ((rec_data.final_calibrated_confidence ?? rec_data.confidence ?? 0) * 100)
+              const requiredWinRate = rec_data.required_win_rate
               const visibleMarkets = markets.filter((m) => {
                 return m.key === 'ft_ou' || m.bet_type === 'total'
               })
@@ -1054,8 +1057,13 @@ export default function AIPanelPage() {
                         winRate >= 75 ? 'text-brand-700' :
                         winRate >= 60 ? 'text-amber-600' : 'text-red-600'
                       }`}>
-                        置信度 {Number(winRate).toFixed(0)}%
+                        最终校准 {Number(winRate).toFixed(0)}%
                       </div>
+                      {requiredWinRate != null ? (
+                        <div className="text-[10px] text-ink-400 mt-0.5">
+                          自动门槛 {Number(requiredWinRate).toFixed(0)}%
+                        </div>
+                      ) : null}
                     </div>
                   </div>
 
@@ -1121,7 +1129,7 @@ export default function AIPanelPage() {
                                     </div>
                                     {cell.win_rate != null ? (
                                       <div className={`text-[10px] tabular-nums ${oddsUp ? 'text-brand-700' : 'text-ink-500'}`}>
-                                        置信度 {Number(cell.win_rate).toFixed(0)}%
+                                        方向概率 {Number(cell.win_rate).toFixed(0)}%
                                       </div>
                                     ) : null}
                                     {cell.provider ? (

@@ -308,8 +308,8 @@ class MatchAnalyzer:
         _hs = match_info.get("home_score")
         _as = match_info.get("away_score")
         _total_goals = int((_hs or 0) + (_as or 0)) if _hs is not None or _as is not None else "x"
-        # v5: 足球/篮球70%-80%平衡档与联赛重点提示生效，旧缓存不可复用。
-        cache_key = f"ai:deepseek:v5:{fk}:{sport}:{line_tag}:g{_total_goals}"
+        # v6: 重点/其他赛事双向精确门槛与最终概率反馈生效，旧缓存不可复用。
+        cache_key = f"ai:deepseek:v6:{fk}:{sport}:{line_tag}:g{_total_goals}"
         # 缓存策略：滚球（有比分）禁用缓存强制实时分析，赛前（无比分）允许缓存
         # 滚球比分/盘口变化快，旧缓存的 reasoning 会过时；赛前数据稳定可复用
         is_live = _hs is not None or _as is not None
@@ -2580,7 +2580,7 @@ class MatchAnalyzer:
                 "- 无基本面数据时，篮球小球不能给高置信度；弱信号直接 skip\n"
                 "- 若初指、实时盘口、基本面三者未形成同向支持，under 优先 skip\n"
                 "- 三类信号全矛盾 -> 必须 skip\n"
-                "- NBA/ACB/欧篮联自动档要求最终校准概率≥0.72；只有盘口、节奏、基本面强一致时才可给到0.72以上\n"
+                "- NBA/ACB/欧篮联under自动门槛0.68，其他合规篮球under门槛0.70；只有多维度一致才可达到\n"
                 "- confidence 必须与信号强度匹配，不得虚高\n"
             )
         else:
@@ -2633,7 +2633,7 @@ class MatchAnalyzer:
                 "### 通用规则\n"
                 "- 无基本面数据时，小球需 conf>=0.40 且双信号一致\n"
                 "- 三类信号（初指/实时盘口/基本面）全矛盾 -> 必须 skip\n"
-                "- 重点/合规超级甲级联赛under自动档要求最终校准概率≥0.70；只有强一致证据才可给到该区间\n"
+                "- 重点/合规超级甲级联赛under自动门槛0.68，其他职业赛事0.70；只有强一致证据才可达到\n"
                 "- confidence 必须与信号强度匹配，不得虚高\n"
             )
 
@@ -2661,7 +2661,7 @@ class MatchAnalyzer:
                 "- 无基本面数据时，篮球大球不能给高置信度；弱信号直接 skip\n"
                 "- 若初指、实时盘口、基本面三者未形成同向支持，over 优先 skip\n"
                 "- 三类信号全矛盾 -> 必须 skip\n"
-                "- NBA/ACB/欧篮联自动档要求最终校准概率≥0.72；只有盘口、节奏、基本面强一致时才可给到0.72以上\n"
+                "- NBA/ACB/欧篮联over自动门槛0.72，其他合规篮球over门槛0.78；只有多维度强一致才可达到\n"
                 "- confidence 必须与信号强度匹配，不得虚高\n"
             )
         else:
@@ -2700,7 +2700,7 @@ class MatchAnalyzer:
                 "### 通用规则\n"
                 "- 无基本面数据时，大球需 conf>=0.40 且双信号一致\n"
                 "- 三类信号（初指/实时盘口/基本面）全矛盾 -> 必须 skip\n"
-                "- 明确重点联赛over自动档要求最终校准概率≥0.72；其他合规超级/甲级联赛要求≥0.75\n"
+                "- 重点/合规超级甲级联赛over自动门槛0.72，其他职业赛事0.78\n"
                 "- confidence 必须与信号强度匹配，不得虚高\n"
                 "- 不得因升盘或快节奏单一信号虚增概率；0.75以上必须有盘口、节奏、基本面三项一致且无冲突。\n\n"
             )
