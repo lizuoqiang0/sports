@@ -190,7 +190,7 @@ async def place_bet(
         all_res = await db.execute(
             select(Odds).where(
                 Odds.match_id == req.match_id,
-                Odds.bet_type == _BTEnum(bt),
+                Odds.bet_type == BetType(bt),
                 Odds.valid_to.is_(None),
             )
         )
@@ -279,7 +279,7 @@ async def place_bet(
                     refreshed_odds = await db.execute(
                         select(Odds).where(
                             Odds.match_id == req.match_id,
-                            Odds.bet_type == _BTEnum(bt),
+                            Odds.bet_type == BetType(bt),
                             Odds.provider == provider_label,
                             Odds.valid_to.is_(None),
                         )
