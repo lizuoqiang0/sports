@@ -227,7 +227,7 @@ _record_alias_candidate()
 # === DeepSeek API ===
 DEEPSEEK_API_KEY: Optional[str] = None
 DEEPSEEK_BASE_URL: str = "https://api.deepseek.com/v1"
-DEEPSEEK_MODEL: str = "deepseek-chat"
+DEEPSEEK_MODEL: str = "deepseek-v4-pro-0813"
 DEEPSEEK_TIMEOUT_SEC: float = 90.0          # 单次 DeepSeek 分析总超时（含一次降配重试）
 LLM_CLIENT_TIMEOUT_SEC: float = 50.0   # OpenAI-compatible 客户端超时（须 ≥ DEEPSEEK_TIMEOUT_SEC）
 LLM_MAX_TOKENS: int = 3072             # DeepSeek 最大输出 tokens
@@ -290,26 +290,11 @@ DATA_RETENTION_HOURS: int = 24          # 自动清理超期数据
 
 > **注意**：`docker-compose.yml` 中的环境变量会覆盖上述默认值。生产环境的实际运行值以 `.env` 和 compose 环境变量为准。
 
-### 5.2 闸门风控参数 (`SPORT_RISK` in `app/ai/strategy.py`)
+### 5.2 组合闸门参数
 
-under/over 双向独立闸门参数，足球和篮球各自一套：
-
-| 参数 | 足球 under | 篮球 under | 足球 over | 篮球 over |
-|------|-----------|-----------|----------|----------|
-| min_conf | 0.65 | 0.65 | 0.68 | 0.65 |
-| min_conf_no_fund | 0.68 | 0.68 | 0.68 | 0.68 |
-| min_line | 2.0 | 130.0 | 2.5 | 140.0 |
-| max_line | 5.0 | 205.0 | 3.0 | 165.0 |
-| min_played_mins | 20.0 | 14.0 | 20.0 | 14.0 |
-| late_block_mins | 90.0 | 44.0 | 85.0 | 40.0 |
-| margin_min_mins | 20.0 | 14.0 | — | — |
-| margin_full_mins | 90.0 | 48.0 | — | — |
-| margin_avg_goals | 2.55 | None | — | — |
-| margin_factor | 1.05 | 1.20 | — | — |
-| late_margin_floor | 0.5 | 4.0 | — | — |
-| ev_conf_edge | 0.0 | 0.04 | max(0,0.02) | max(0.04,0.02) |
-| over_pace_factor | — | — | 1.05 | 1.05 |
-| over_min_remaining_goals | — | — | 3.5 | 80.0 |
+生产策略不再维护分散的旧风险参数表。under/over 和足球/篮球统一由
+`app/ai/balanced_gate.py` 与 `app/ai/balanced_profile.py` 管理，最终概率、联赛
+等级、盘口/赔率窗口、比赛时间/节奏、剩余得分概率和EV检查一次完成。
 
 生产自动引擎启用「70%–80%滚动目标组合闸门」。70%–80%是策略目标，不是未来
 胜率保证；最终校准概率、A-E全闸门和有效赔率仍必须同时通过。
@@ -326,9 +311,8 @@ under/over 双向独立闸门参数，足球和篮球各自一套：
 - 前端推荐卡和AI日志显示“最终校准概率 / 自动门槛”，该数值是方向分析、基本面、
   盘口、比赛时间、节奏、历史校准和全闸门共用的唯一自动下注概率。
 
-`python3 scripts/backtest_balanced_profile.py` 可只读回放平衡档；
-`python3 scripts/backtest_precision_profile.py` 保留旧高精度档作为对照。历史重点联赛
-样本目前不足，不能把小样本胜率当作未来承诺，需要继续按结算结果滚动评估。
+生产只保留组合闸门与平衡策略；测试目录、旧回放和测试依赖不属于生产发布内容。
+历史重点联赛样本目前不足，不能把小样本胜率当作未来承诺，需要继续按结算结果滚动评估。
 
 生产平衡档不再叠加旧 A/P/B/C/D/E 的数十条独立规则，而是收敛为五个组合检查：
 
@@ -341,7 +325,7 @@ under/over 双向独立闸门参数，足球和篮球各自一套：
 5. EV与仓位：最终概率覆盖赔率盈亏平衡后才放行；仓位只依赖最终概率、余额和当日
    亏损，不再让小样本方向胜率或短期连胜连败调整门槛/仓位。
 
-旧细粒度闸门链仅保留给兼容模式和回归测试；生产 `balanced_target_mode` 不执行它们。
+旧细粒度闸门链已从生产代码删除。
 
 ### 5.3 环境变量 (`.env`)
 
@@ -494,49 +478,19 @@ CMD ["/app/scripts/docker_entrypoint_backend.sh"]
 
 ---
 
-## 七、测试
+## 七、生产验证
 
-### 7.1 测试文件
+### 7.1 生产验证
 
-| 文件 | 测试内容 | 用例数 |
-|------|----------|--------|
-| `test_gate_strategy.py` | 闸门策略全阶段（A0-E2 + 仓位 + 流程） | 125 |
-| `test_gate_strategy_supplement.py` | 闸门策略补充（篮球全链路/A5/D1衰减/bucket_factor/risk_score） | 38 |
-| `test_strategy.py` | 策略引擎基础（B1/B2/B3/E1/风险评分/SPORT_RISK参数） | 30 |
-| `test_strategy_gates.py` | 策略门禁（球队排除/球类偏好/仓位截断/日风控） | 15 |
-| `test_p7_p9_reverse_risk.py` | P7/P9 高置信度反向风险封顶 | 20 |
-| `test_stake_protection.py` | 仓位保护（小样本连败/站点降仓/min_stake） | 15 |
-| `test_bet_flow_simulation.py` | 下单全流程模拟 | 21 |
-| `test_fixture_bet_limit.py` | 同场投注次数上限去重 | 16 |
-| `test_alias_backend_active.py` | 别名自动生效全链路 | 20 |
-| `test_bet_executor.py` | 下单执行器（跨站比价/provider fallback/切站/重试） | 16 |
-| `test_analysis_filters.py` | 分析过滤（中国赛事/黑名单/排序） | 10 |
-| `test_analyzer.py` | DeepSeek 分析引擎（时钟解析/信号/缓存/重试） | 10 |
-| `test_odds_parsing.py` | 赔率解析（OB/平博盘口；半场盘口仅兼容采集，不进入投注） | 16 |
-| `test_venue_recovery.py` | 平博页面状态恢复 | 15 |
-| `test_integration.py` | 集成测试（全链路/竞态/热更新/玩法白名单） | 16 |
-| `test_sync_live_odds_versions.py` | 滚球赔率版本收敛（每站/玩法仅最新有效行） | 1 |
-| `test_precision_profile.py` | 最终概率一致性 + 联赛优先级 + NBA/FIBA计时 + 平衡档边界 | 14 |
-| `test_balanced_gate.py` | 组合闸门一致性 + 足球under剩余进球概率 + 用户门槛 + 旧链隔离 | 5 |
-| `test_over_gates.py` | 大小球双闸门链（under/over 互不参与） | 12 |
-| `test_one_click_bet.py` | 一键投注端到端 | 12 |
-| `test_handicap_exclusion.py` | 让球盘排除 + 赔率匹配 | 60+ |
-
-### 7.2 运行测试
+生产环境不保留测试文件。发布前只执行 Python 编译、Docker 构建、Compose 配置校验、
+只读组合闸门合成决策和 `/health`、`/ready` 健康检查。
 
 ```bash
-# 运行全部 pytest 测试（数量随覆盖新增变化）
-python3 -m pytest -q --asyncio-mode=auto --disable-warnings
-
-# 运行特定测试文件
-python3 -m pytest tests/ai/test_gate_strategy.py -v
-
-# 运行闸门策略全量测试（主+补充）
-python3 -m pytest tests/ai/test_gate_strategy.py tests/ai/test_gate_strategy_supplement.py -v
-
-# 运行独立脚本测试
-python3 tests/ai/test_over_gates.py
-python3 tests/ai/test_bet_flow_simulation.py
+python3 -m compileall -q app scripts
+docker compose config -q
+docker compose build backend frontend
+curl -fsS http://127.0.0.1:8000/health
+curl -fsS http://127.0.0.1:8000/ready
 ```
 
 ---
@@ -671,15 +625,7 @@ StrategyEngine.evaluate_bet() 生产组合闸门：
   G1 数据/方向共识 → G2 最终概率 → G3 联赛/时间/盘口/赔率窗口
   → G4 剩余得分概率 → G5 EV → 单一仓位公式
 
-兼容模式保留旧五阶段链：
-
-  A 信号有效性    A0玩法白名单 → A1方向 → A2共识 → A3置信度(含P7/P9封顶/EV豁免) → A4篮球三重 → A5历史模式
-  B 结构性风控    B1盘线区间(under/over独立) → P1/P4/P10 → B1b余量/P5/P8 → B2联赛黑名单 → B3高赔率 → B3b赔率一致性
-  C 市场一致性    C1 盘口变化方向 vs 预测方向
-  D 滚球余量      D1-under余量/D1-over速率(加权模型) → D1b已进球接近度
-  E 赔率有效性    E1区间 → E2 EV盈亏平衡 → E3足球/篮球70%-80%目标平衡档
-
-  → 仓位计算: max_bet × conf_scale(under×1.10/over×0.8) × risk_factor × prov_factor × 余额锚定(25%) × 日亏递减
+  → 仓位计算: max_bet × final_conf_factor × 余额锚定(25%) × 日亏递减
 ```
 
-测试覆盖：闸门主测试与补充测试、双站解析、下单执行、别名、数据质量和前端构建均纳入生产发布前检查；以本地 `pytest` 实际输出为准。
+生产发布采用编译、镜像构建、只读组合决策与运行时健康检查；仓库不保留测试环境。

@@ -17,8 +17,6 @@
 ## 运维
 
 - `clean_prod_env.sh`: 清理线上业务数据，只保留指定账号。
-- `backtest_balanced_profile.py`: 只读回放足球/篮球70%–80%滚动目标平衡档。
-- `backtest_precision_profile.py`: 只读回放旧高精度档，作为策略对照。
 
 ## 运行时入口
 
