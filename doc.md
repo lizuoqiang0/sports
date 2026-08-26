@@ -169,7 +169,7 @@ _record_alias_candidate()
 | User | users | balance, ai_enabled, bet_mode(manual/active), role |
 | AIConfig | ai_configs | max_bet_amount, max_daily_bets, stop_loss, take_profit, min/max_odds |
 | Match | matches | sport, home_team, away_team, external_id(ob:/pinnacle:), extra_data.ids |
-| Odds | odds | bet_type, odds_data(JSON), provider, valid_from/to(版本化) |
+| Odds | odds | bet_type, odds_data(JSON), provider, valid_from/to(版本化), last_seen_at(最近采集确认) |
 | Bet | bets | selection, odds, stake, status, is_ai_bet, provider, external_bet_id |
 | BookmakerAccount | bookmaker_accounts | code(ob/pinnacle), session_token_encrypted, balance, status |
 | MatchContextRow | match_contexts | fixture_key, payload(JSON), quality |
@@ -230,7 +230,8 @@ DEEPSEEK_BASE_URL: str = "https://api.deepseek.com/v1"
 DEEPSEEK_MODEL: str = "deepseek/deepseek-v4-pro-0813"
 DEEPSEEK_TIMEOUT_SEC: float = 90.0          # 单次 DeepSeek 分析总超时（含一次降配重试）
 LLM_CLIENT_TIMEOUT_SEC: float = 40.0   # 单次请求超时（两次尝试仍小于 90s 总超时）
-LLM_MAX_TOKENS: int = 2458             # DeepSeek 最大输出 tokens
+LLM_MAX_TOKENS: int = 1200             # JSON 分析输出上限
+PROMPT_MAX_CHARS: int = 6000            # 保留比分/盘口/特征/输出规则的 Prompt 上限
 LLM_DEFAULT_CONFIDENCE: float = 0.33   # DeepSeek 未返回置信度时的默认值
 LLM_TEMPERATURE: float = 0.2           # 降低随机性，减少滚球方向漂移
 LLM_CACHE_TTL: int = 600               # 10分钟正缓存
@@ -246,7 +247,7 @@ AI_SCAN_INTERVAL_SEC: int = 120        # 引擎扫描间隔（有候选时）
 AI_IDLE_RESCAN_SEC: int = 30           # 空轮快扫间隔（无候选时）
 AI_RECS_LIMIT: int = 80                # 推荐页分析上限
 AI_LIVE_SCAN_LIMIT: int = 120          # 自动引擎扫描上限
-AI_ANALYZE_CONCURRENCY: int = 12       # DeepSeek 分析并发数
+AI_ANALYZE_CONCURRENCY: int = 2        # DeepSeek 生产分析并发数
 AI_SKIP_COOLDOWN_SEC: int = 300        # 同场 LLM skip 冷却
 AI_ENABLE_OVER: bool = True            # 大球 over 下单开关（over 与 under 对等参与闸门评估）
 
@@ -445,6 +446,7 @@ CMD ["/app/scripts/docker_entrypoint_backend.sh"]
 > `BASE_IMAGE_REGISTRY=你的企业镜像仓库`，后端、前端、PostgreSQL 和 Redis 会统一切换；
 > `bash scripts/quick.sh --pull` 会预拉同一来源的全部基础镜像。
 > `ai-engine` 容器与 `backend` 共享同一镜像，入口命令不同（`ai_betting_engine.py`）。
+> 两个入口统一通过 Redis 用户引擎锁启动，同一用户任何时刻只有一个 AI 主循环。
 
 ### 6.6 一键部署脚本内部流程
 

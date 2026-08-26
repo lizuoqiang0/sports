@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.database import AsyncSessionLocal, init_db
 from app.models.user import User
-from app.ai.auto_better import AIBettingEngine
+from app.ai.auto_better import start_user_engine, stop_user_engine
 from app.config import settings
 from app.core.cache import cache
 
@@ -46,8 +46,9 @@ async def run_single_user(user_id: int):
             return
         logger.info(f"启动 AI 引擎: user={user.username} (id={user_id})")
 
-    engine = AIBettingEngine(user_id)
-    await engine.start()
+    result = await start_user_engine(user_id)
+    if result.get("status") == "already_running":
+        logger.info("用户 %s 的 AI 引擎已由 backend/其他实例运行，守护进程进入待命", user_id)
 
     stop_event = asyncio.Event()
 
@@ -60,7 +61,8 @@ async def run_single_user(user_id: int):
         loop.add_signal_handler(sig, signal_handler)
 
     await stop_event.wait()
-    await engine.stop()
+    if result.get("status") != "already_running":
+        await stop_user_engine(user_id)
     logger.info("AI 引擎已停止")
 
 
@@ -82,11 +84,15 @@ async def run_all_users():
             return
         logger.info(f"为 {len(users)} 个用户启动 AI 引擎")
 
-        engines = []
+        owned_user_ids = []
         for user_row in users:
-            engine = AIBettingEngine(user_row.id)
-            await engine.start()
-            engines.append(engine)
+            result = await start_user_engine(int(user_row.id))
+            if result.get("status") != "already_running":
+                owned_user_ids.append(int(user_row.id))
+        logger.info(
+            "AI 守护进程获得 %d/%d 个用户引擎锁，其余由 backend/其他实例运行",
+            len(owned_user_ids), len(users),
+        )
 
         stop_event = asyncio.Event()
         loop = asyncio.get_event_loop()
@@ -94,8 +100,8 @@ async def run_all_users():
             loop.add_signal_handler(sig, lambda: stop_event.set())
 
         await stop_event.wait()
-        for eng in engines:
-            await eng.stop()
+        for user_id in owned_user_ids:
+            await stop_user_engine(user_id)
         logger.info("所有 AI 引擎已停止")
 
 

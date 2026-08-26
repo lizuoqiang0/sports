@@ -19,7 +19,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.models.user import (
     User, Match, Bet, BetStatus, BetType, Transaction, TransactionType,
@@ -179,7 +179,7 @@ async def get_odds_row(
             Odds.provider == provider_name_prefer,
             Odds.valid_to.is_(None),
             Odds.is_live.is_(True),
-            Odds.valid_from >= fresh_after,
+            func.coalesce(Odds.last_seen_at, Odds.valid_from) >= fresh_after,
         ).limit(1)
     )
     row = result.scalar_one_or_none()
@@ -191,7 +191,7 @@ async def get_odds_row(
             Odds.bet_type == bet_type,
             Odds.valid_to.is_(None),
             Odds.is_live.is_(True),
-            Odds.valid_from >= fresh_after,
+            func.coalesce(Odds.last_seen_at, Odds.valid_from) >= fresh_after,
         )
     )
     odds_list = list(result.scalars().all())

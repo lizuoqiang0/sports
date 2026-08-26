@@ -222,13 +222,18 @@ class StrategyEngine:
             "remaining_score_probability": result.remaining_score_probability,
         }
         if not result.allowed:
-            logger.info(
-                "[组合闸门/%s] ❌ match=%s final=%.2f required=%.2f remaining=%s | %s",
-                result.gate, match_info.get("id"), confidence, result.required_confidence,
-                f"{result.remaining_score_probability:.1%}" if result.remaining_score_probability is not None else "n/a",
-                result.reason,
+            remaining_text = (
+                f"{result.remaining_score_probability:.1%}"
+                if result.remaining_score_probability is not None
+                else "n/a"
             )
-            return self._reject(match_info, analysis, f"组合闸门[{result.gate}]: {result.reason}")
+            return self._reject(
+                match_info,
+                analysis,
+                f"组合闸门[{result.gate}]: {result.reason}; "
+                f"final={confidence:.2f} required={result.required_confidence:.2f} "
+                f"remaining={remaining_text}",
+            )
 
         stake = self._stake(confidence, result.required_confidence, user_balance, daily_loss)
         risk = self._risk_score(confidence, odds, active_bets_count)

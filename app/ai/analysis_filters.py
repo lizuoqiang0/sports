@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from app.services.bookmakers.match_live import (
@@ -275,7 +276,7 @@ async def enrich_recs_skip_from_db(
     max_odds: float | None = DEFAULT_MAX_ODDS,
 ) -> list[dict]:
     """用库内最新比分/时钟补全推荐，并按配置赔率区间过滤。"""
-    from sqlalchemy import select
+    from sqlalchemy import func, select
 
     from app.database import AsyncSessionLocal
     from app.models.user import BetType, Match, Odds
@@ -299,6 +300,9 @@ async def enrich_recs_skip_from_db(
                         Odds.match_id.in_(ids),
                         Odds.bet_type == BetType.TOTAL,
                         Odds.valid_to.is_(None),
+                        func.coalesce(Odds.last_seen_at, Odds.valid_from) >= (
+                            datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=5)
+                        ),
                     )
                 )
             ).all()

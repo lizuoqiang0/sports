@@ -251,7 +251,7 @@ async def place_bet(
         )
 
     if match.status == MatchStatus.LIVE:
-        fresh_at = match.updated_at or odds_obj.valid_from
+        fresh_at = odds_obj.last_seen_at or match.updated_at or odds_obj.valid_from
         if fresh_at is None:
             # 赔率版本可能来自历史数据但没有时间字段；先仅同步当前站点，
             # 再读取新盘口，不能带着缺失时间的行进入真实下单。
@@ -293,7 +293,7 @@ async def place_bet(
                                 detail="自动同步后未获取到可下注的全场大小球赔率",
                             )
                         current_odds = float(raw_odds)
-                        fresh_at = match.updated_at or odds_obj.valid_from
+                        fresh_at = odds_obj.last_seen_at or match.updated_at or odds_obj.valid_from
             except HTTPException:
                 raise
             except Exception as e:

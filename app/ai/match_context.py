@@ -129,11 +129,11 @@ async def _persist(match_info: dict, fixture_key: str, ctx: dict) -> dict:
         mid_i = int(mid) if mid is not None else None
     except (TypeError, ValueError):
         mid_i = None
-    saved = await save_context(fixture_key=fixture_key, ctx=ctx, match_id=mid_i)
-    for alias in _fixture_key_aliases(match_info):
-        if alias and alias != fixture_key:
-            await save_context(fixture_key=alias, ctx=ctx, match_id=mid_i)
-    return saved
+    # 同场 OB/平博可带不同时间 bucket 后缀。只持久化无后缀的
+    # canonical key；load_from_db 已支持 canonical -> bucket 模糊回退。
+    aliases = _fixture_key_aliases(match_info)
+    canonical = aliases[-1] if aliases else fixture_key
+    return await save_context(fixture_key=canonical, ctx=ctx, match_id=mid_i)
 
 
 async def _load_cached_context(match_info: dict) -> tuple[Optional[dict], str]:

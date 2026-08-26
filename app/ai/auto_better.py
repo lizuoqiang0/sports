@@ -74,7 +74,7 @@ _LIVE_SCAN_LIMIT = max(
     60, int(getattr(settings, "AI_LIVE_SCAN_LIMIT", 120) or 120)
 )
 _LIVE_ANALYZE_CONCURRENCY = max(
-    1, int(getattr(settings, "AI_ANALYZE_CONCURRENCY", 12) or 12)
+    1, int(getattr(settings, "AI_ANALYZE_CONCURRENCY", 2) or 2)
 )
 # 空轮快速重扫：无候选赛事时缩短等待（刚开赛/滚球上新是时间敏感窗口，
 # 死等完整间隔会错过黄金分析期）。有候选走正常 AI_SCAN_INTERVAL_SEC。
@@ -378,7 +378,12 @@ class AIBettingEngine:
                     pass
                 # 1. LLM 分析
                 try:
-                    recs = await analyze_fixture_group(ids, uid, strat_override=strat_cfg)
+                    recs = await analyze_fixture_group(
+                        ids,
+                        uid,
+                        strat_override=strat_cfg,
+                        evaluate_strategy=False,
+                    )
                     best = pick_best_rec_for_fixture(recs)
                 except Exception as e:
                     logger.warning("滚球同场分析失败 ids=%s: %s", ids, e)
@@ -1172,6 +1177,7 @@ async def analyze_and_recommend(
     shared_ctx: dict | None = None,
     skip_match_context: bool | None = None,
     strat_override=None,
+    evaluate_strategy: bool = True,
 ) -> dict:
     """
     AI 推荐：OB / 平博单边 · 足球/篮球仅全场大小球。
@@ -1590,7 +1596,21 @@ async def analyze_and_recommend(
         except Exception:
             pass
 
-        if (
+        if not evaluate_strategy:
+            decision = BetDecision(
+                match_id=match_id,
+                selection=sel or "skip",
+                confidence=conf_use,
+                suggested_stake=Decimal("0"),
+                reasoning=str(analysis.get("reasoning") or "等待自动引擎双向闸门评估"),
+                risk_score=1.0,
+                should_bet=False,
+                bet_type=bet_type,
+                provider_code=provider_code,
+                odds=sel_odds,
+                line=float(line) if line is not None else None,
+            )
+        elif (
             not analysis_pick_allowed
             or not primary
             or sel not in ("under", "over")
@@ -1767,6 +1787,7 @@ async def analyze_fixture_group(
     stake: float | None = None,
     skip_match_context: bool | None = None,
     strat_override: Optional[StrategyConfig] = None,
+    evaluate_strategy: bool = True,
 ) -> list[dict]:
     """
     同场多站点（OB/平博）只跑一次 LLM，盘口/下单决策按各站 match_id 分别生成。
@@ -1808,6 +1829,7 @@ async def analyze_fixture_group(
         stake=stake,
         skip_match_context=bool(skip_match_context),
         strat_override=strat_cfg,
+        evaluate_strategy=evaluate_strategy,
     )
     if primary.get("error"):
         return []
@@ -1841,6 +1863,7 @@ async def analyze_fixture_group(
             shared_analysis=analysis,
             shared_ctx=shared_ctx,
             strat_override=strat_cfg,
+            evaluate_strategy=evaluate_strategy,
         ))
     if sibling_tasks:
         sibling_results = await asyncio.gather(*sibling_tasks, return_exceptions=True)

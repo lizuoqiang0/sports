@@ -87,6 +87,7 @@ def apply_odds_version(
     odds_cls: Any,
 ) -> tuple[Any, bool]:
     """有变化则关闭旧版本并插入新行；无变化则保持。返回 (当前有效行, 是否写入新版本)。"""
+    close_at = now.replace(tzinfo=None) if getattr(now, "tzinfo", None) else now
     if current is not None and not odds_materially_changed(
         old_odds_data=getattr(current, "odds_data", None),
         new_odds_data=odds_data,
@@ -99,9 +100,10 @@ def apply_odds_version(
         # mid/原生队名；只比较公开赔率会令历史行永久缺失这些信息。
         if isinstance(odds_data, dict) and dict(getattr(current, "odds_data", None) or {}) != odds_data:
             current.odds_data = dict(odds_data)
+        # 盘口没有变化也代表本轮采集已确认它仍在场。
+        current.last_seen_at = close_at
         return current, False
 
-    close_at = now.replace(tzinfo=None) if getattr(now, "tzinfo", None) else now
     if current is not None:
         current.valid_to = close_at
 
@@ -114,6 +116,7 @@ def apply_odds_version(
         provider=provider,
         is_live=is_live,
         valid_from=unique_valid_from(now),
+        last_seen_at=close_at,
     )
     db.add(row)
     return row, True

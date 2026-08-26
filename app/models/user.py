@@ -246,6 +246,8 @@ class Odds(Base):
     # 时间戳
     valid_from: Mapped[datetime] = mapped_column(DateTimeUTC, default=lambda: datetime.now(timezone.utc))
     valid_to: Mapped[Optional[datetime]] = mapped_column(DateTimeUTC, nullable=True)
+    # 最近一次从站点采集到该盘口；与“本版本何时开始”的 valid_from 分离。
+    last_seen_at: Mapped[datetime] = mapped_column(DateTimeUTC, default=lambda: datetime.now(timezone.utc), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTimeUTC, default=lambda: datetime.now(timezone.utc))
 
     match: Mapped[Match] = relationship("Match", back_populates="odds")

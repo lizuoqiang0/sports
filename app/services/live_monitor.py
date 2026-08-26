@@ -44,7 +44,8 @@ async def _check_matches(db):
                m.extra_data->>'period' as period,
                m.sport::text, m.league,
                m.extra_data->>'site_code' as site,
-               (SELECT count(*) FROM odds o WHERE o.match_id=m.id AND o.is_live=true) as odds_count
+               (SELECT count(*) FROM odds o
+                WHERE o.match_id=m.id AND o.is_live=true AND o.valid_to IS NULL) as odds_count
         FROM matches m
         WHERE m.status='LIVE' AND m.sport IN ('FOOTBALL','BASKETBALL')
         ORDER BY m.extra_data->>'site_code', m.sport, m.id
@@ -88,17 +89,17 @@ async def _check_odds_quality(db):
                o.odds_data->>'over' as over_odds,
                o.odds_data->>'handicap' as handicap,
                o.total, o.spread,
-               m.extra_data->>'site_code' as site
+               m.extra_data->>'site_code' as site,
+               COALESCE(o.last_seen_at, o.valid_from) as last_seen_at
         FROM odds o JOIN matches m ON o.match_id=m.id
-        WHERE o.is_live=true AND m.status='LIVE'
+        WHERE o.is_live=true AND o.valid_to IS NULL AND m.status='LIVE'
         ORDER BY m.id, o.bet_type, o.valid_from DESC
-        LIMIT 50
     """))
     rows = r.fetchall()
     issues = []
 
     for row in rows:
-        home, away, bt, under, over, hd, tot, sp, site = row
+        home, away, bt, under, over, hd, tot, sp, site, last_seen_at = row
         tag = f"[{site or '?'}] {bt}"
         match_name = f"{home} vs {away}"
 
@@ -123,6 +124,19 @@ async def _check_odds_quality(db):
                         issues.append({"level": "error", "tag": tag, "match": match_name, "issue": f"赔率异常 {label}={val}"})
                 except (ValueError, TypeError):
                     issues.append({"level": "error", "tag": tag, "match": match_name, "issue": f"赔率非数字 {label}={val}"})
+
+        if last_seen_at is not None:
+            seen = last_seen_at
+            if seen.tzinfo is None:
+                seen = seen.replace(tzinfo=timezone.utc)
+            age_sec = (datetime.now(timezone.utc) - seen).total_seconds()
+            if age_sec > 300:
+                issues.append({
+                    "level": "warn",
+                    "tag": tag,
+                    "match": match_name,
+                    "issue": f"盘口超过5分钟未采集确认 ({int(age_sec)}s)",
+                })
 
     return rows, issues
 
@@ -192,8 +206,8 @@ async def monitor_cycle():
         monitor_data["matches"] = {"total": len(matches), "ob": ob_count, "pinnacle": pin_count}
 
         odds, odds_issues = await _check_odds_quality(db)
-        total_ok = sum(1 for r in odds if r[3] and r[4])
-        spread_ok = sum(1 for r in odds if r[7] or r[6])
+        total_ok = sum(1 for r in odds if r[2] == "TOTAL" and r[3] and r[4])
+        spread_ok = sum(1 for r in odds if r[2] == "SPREAD" and (r[7] or r[6]))
         monitor_data["odds"] = {"total": len(odds), "total_complete": total_ok, "spread_complete": spread_ok}
 
     # 监控必须读取实际启用 AI 的用户；固定查 user=1 会把 user=6 的运行状态

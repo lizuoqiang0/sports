@@ -379,6 +379,12 @@ class MatchAnalyzer:
         )
 
         prompt = self._build_analysis_prompt(match_info, historical_data, market_odds)
+        prompt = self._limit_analysis_prompt(
+            prompt,
+            match_info=match_info,
+            market_odds=market_odds,
+            feature_matrix=feature_matrix,
+        )
         logger.info(
             "[AI分析] Prompt 构建完成 match=%s | 长度=%d 字符 | 含analysis=%s 含trend=%s",
             match_info.get("id"), len(prompt),
@@ -854,7 +860,7 @@ class MatchAnalyzer:
             {"role": "user", "content": prompt},
         ]
         started = time.perf_counter()
-        max_retries = 2  # 最多 2 次重试（共 3 次调用），确保总时长可控
+        max_retries = 1  # 最多 1 次重试（共 2 次调用），为外层 90s 超时留出余量
         content = ""
         # 每轮 max_tokens：超时后降配重试，减少输出量缩短响应时间
         tokens_per_attempt = [settings.LLM_MAX_TOKENS, max(512, settings.LLM_MAX_TOKENS // 2)]
@@ -867,6 +873,9 @@ class MatchAnalyzer:
                     temperature=settings.LLM_TEMPERATURE,
                     max_tokens=cur_max_tokens,
                     response_format={"type": "json_object"},
+                    # deepseek-v4-pro 默认隐藏推理会耗尽 max_tokens，导致
+                    # finish_reason=length 且 content 为空。TokenHub 兼容该开关。
+                    extra_body={"thinking": {"type": "disabled"}},
                 )
                 if not response.choices:
                     raise RuntimeError("DeepSeek 返回空 choices（内容可能被安全过滤）")
@@ -887,7 +896,7 @@ class MatchAnalyzer:
                     if attempt == 0:
                         logger.warning(
                             "[DeepSeek] 超时，降配重试 (max_tokens %d→%d) (attempt 1/%d)",
-                            settings.LLM_MAX_TOKENS, cur_max_tokens, max_retries,
+                            settings.LLM_MAX_TOKENS, tokens_per_attempt[1], max_retries,
                         )
                         await asyncio.sleep(0.5)
                         continue
@@ -2754,6 +2763,53 @@ class MatchAnalyzer:
                     f"confidence 必须低于 {0.55}。\n"
                 )
         return prompt
+
+    @staticmethod
+    def _limit_analysis_prompt(
+        prompt: str,
+        *,
+        match_info: dict,
+        market_odds: Optional[dict],
+        feature_matrix: Optional[dict],
+    ) -> str:
+        """超长 Prompt 保留比赛快照、权威盘口、特征矩阵和末尾输出约束。"""
+        max_chars = max(4000, int(getattr(settings, "PROMPT_MAX_CHARS", 6000) or 6000))
+        if len(prompt) <= max_chars:
+            return prompt
+
+        line = _line_for_pick(market_odds, match_info, "total")
+        snapshot = {
+            "match_id": match_info.get("id") or match_info.get("match_id"),
+            "sport": match_info.get("sport"),
+            "league": match_info.get("league"),
+            "home_team": match_info.get("home_team"),
+            "away_team": match_info.get("away_team"),
+            "home_score": match_info.get("home_score"),
+            "away_score": match_info.get("away_score"),
+            "period": match_info.get("period"),
+            "clock": match_info.get("clock"),
+            "total_line": line,
+        }
+        mandatory = (
+            "## 压缩后权威快照（不得改写）\n"
+            + json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))
+            + "\n## 结构化特征矩阵（最高优先级）\n"
+            + json.dumps(feature_matrix or {}, ensure_ascii=False, separators=(",", ":"))[:3200]
+            + "\n## 决策规则\n"
+            + "1. 只分析全场大小球 under/over；其他玩法必须 skip。\n"
+            + "2. 先检查特征矩阵 gates；hard_failures 非空必须 skip。\n"
+            + "3. 亚洲盘口、实时节奏、NowScore基本面至少两个独立维度同向，否则 skip。\n"
+            + "4. 必须区分资金推动型与数学调整型升盘；方向冲突必须 skip。\n"
+            + "5. 必须同时返回 under_confidence/over_confidence；两者都低于0.30则 skip。\n"
+            + "6. line 必须与权威快照 total_line 完全一致，不得用历史中间盘。\n"
+            + "## 输出（只能输出 JSON，不得 markdown）\n"
+            + '{"bet_type":"total","prediction":"under|over|skip","line":0.0,'
+            + '"confidence":0.0,"under_confidence":0.0,"over_confidence":0.0,'
+            + '"under_reasoning":"量化理由","over_reasoning":"量化理由",'
+            + '"reasoning":"当前比分/盘口/节奏/基本面结论","risk_level":"low|medium|high"}\n'
+            + "> 原始明细已压缩；必须以上述快照和特征矩阵为准。\n"
+        )
+        return mandatory[:max_chars]
 
     def _parse_analysis_result(self, raw: str) -> dict:
         text = (raw or "").strip()

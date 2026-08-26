@@ -93,6 +93,10 @@ def _migrate_columns(sync_conn):
         "ALTER TABLE bookmaker_accounts ADD COLUMN IF NOT EXISTS session_token_encrypted TEXT DEFAULT ''",
         "ALTER TABLE bookmaker_accounts ADD COLUMN IF NOT EXISTS profile_json JSONB DEFAULT '{}'::jsonb",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS bet_mode VARCHAR(20) DEFAULT 'manual'",
+        "ALTER TABLE odds ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMP WITHOUT TIME ZONE",
+        "UPDATE odds SET last_seen_at = COALESCE(last_seen_at, valid_from, created_at) WHERE last_seen_at IS NULL",
+        "ALTER TABLE odds ALTER COLUMN last_seen_at SET NOT NULL",
+        "CREATE INDEX IF NOT EXISTS ix_odds_last_seen_at ON odds (last_seen_at)",
         # Postgres 枚举增量
         "DO $$ BEGIN ALTER TYPE sporttype ADD VALUE IF NOT EXISTS 'VOLLEYBALL'; EXCEPTION WHEN duplicate_object THEN NULL; END $$",
         "DO $$ BEGIN ALTER TYPE sporttype ADD VALUE IF NOT EXISTS 'TABLE_TENNIS'; EXCEPTION WHEN duplicate_object THEN NULL; END $$",

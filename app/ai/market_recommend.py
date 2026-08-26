@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Optional
 
-from sqlalchemy import and_, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.user import BetType, Match, Odds
@@ -210,7 +210,7 @@ async def load_market_matrix(
                 # AI 与自动下单必须消费同一轮实时快照；长期悬挂的 valid_to=NULL
                 # 旧行不能继续参与方向判断或跨站比价。
                 Odds.is_live.is_(True),
-                Odds.valid_from >= (
+                func.coalesce(Odds.last_seen_at, Odds.valid_from) >= (
                     datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=5)
                 ),
             )

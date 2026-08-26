@@ -13,7 +13,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.config import settings
 from app.core.cache import cache
@@ -356,6 +356,9 @@ async def list_live_match_ids(
                 Odds.match_id.in_(list(by_id.keys())),
                 Odds.bet_type == BetType.TOTAL,
                 Odds.valid_to.is_(None),
+                func.coalesce(Odds.last_seen_at, Odds.valid_from) >= (
+                    datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=5)
+                ),
             )
         )
         line_by_mid: dict[int, float] = {}
@@ -684,7 +687,7 @@ async def _run_recs_job(
         # 与自动引擎一致：关闭 LLM 时跳过赛前上下文
         skip_ctx = not bool(getattr(job_strat, "use_llm_analysis", True))
 
-        conc = max(2, int(getattr(settings, "AI_ANALYZE_CONCURRENCY", 12) or 12))
+        conc = max(1, int(getattr(settings, "AI_ANALYZE_CONCURRENCY", 2) or 2))
         sem = asyncio.Semaphore(conc)
         all_recs: list[dict] = []
         done = 0

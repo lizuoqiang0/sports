@@ -101,7 +101,8 @@ class Settings(BaseSettings):
     # --- AI 分析配置 ---
     DEEPSEEK_TIMEOUT_SEC: float = 90.0      # 单次 DeepSeek 分析总超时（含一次降配重试）
     LLM_CLIENT_TIMEOUT_SEC: float = 40.0    # 单次 DeepSeek 请求超时（两次尝试须小于总超时）
-    LLM_MAX_TOKENS: int = 2458              # DeepSeek 最大输出 tokens
+    LLM_MAX_TOKENS: int = 1200              # JSON 分析输出上限，避免上游长输出超时
+    PROMPT_MAX_CHARS: int = 6000             # 主 Prompt 最大字符数（保留快照/特征/输出规则）
     LLM_DEFAULT_CONFIDENCE: float = 0.33    # DeepSeek 未返回置信度时的默认值
     LLM_TEMPERATURE: float = 0.2            # 降低随机性，减少滚球分析的方向漂移
     LLM_CACHE_TTL: int = 600               # 10分钟
@@ -118,7 +119,7 @@ class Settings(BaseSettings):
     AI_SCAN_INTERVAL_SEC: int = 120        # AI 引擎扫描间隔（秒，有候选时）
     AI_RECS_LIMIT: int = 80                # 推荐页分析上限
     AI_LIVE_SCAN_LIMIT: int = 120          # 自动引擎扫描上限
-    AI_ANALYZE_CONCURRENCY: int = 12       # DeepSeek 分析并发数
+    AI_ANALYZE_CONCURRENCY: int = 2        # DeepSeek 分析并发数，按生产实测容量限制
     AI_IDLE_RESCAN_SEC: int = 30           # 空轮快扫间隔（无候选时，捕捉刚开赛）
     AI_SKIP_COOLDOWN_SEC: int = 300        # 同场 LLM skip 冷却（避免 TTL 内重复调用）
     AI_ENABLE_OVER: bool = True            # 大球 over 下单开关（已启用：over 与 under 对等参与闸门评估）

@@ -1,9 +1,10 @@
 """站点工具：provider 名称/代码映射与赔率矩阵。"""
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from sqlalchemy import and_, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.user import BetType, Odds
@@ -41,6 +42,9 @@ async def load_odds_matrix(
                 Odds.match_id == match_id,
                 Odds.bet_type == bet_type,
                 Odds.valid_to.is_(None),
+                func.coalesce(Odds.last_seen_at, Odds.valid_from) >= (
+                    datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=5)
+                ),
             )
         )
     )
